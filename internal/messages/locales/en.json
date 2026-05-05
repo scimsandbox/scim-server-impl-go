@@ -1,0 +1,15 @@
+{
+  "error.stdout_writer_required": "a stdout writer is required",
+  "error.config_file_not_found": "config file not found: %s",
+  "error.config_file_stat": "error checking %s",
+  "error.required_config_value_still_set": "required config value %s still has marker value %s",
+  "error.api_bearer_token_required": "bearer token is required",
+  "error.api_body_required": "request body is required",
+  "error.api_invalid_json": "invalid JSON body",
+  "error.api_request_too_large": "request body too large",
+  "log.configuration_loaded": "configuration loaded",
+  "log.configuration_rendered": "configuration rendered",
+  "log.http_server_started": "http server started",
+  "log.http_server_stopped": "http server stopped",
+  "log.http_request_completed": "http request completed"
+}

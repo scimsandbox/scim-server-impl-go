@@ -1,0 +1,190 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Choose the semantic version bump for this release."
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Validate, tag, and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Verify main branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+            echo "This release workflow can only be run manually from main."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Checkout scim-server-db
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository_owner }}/scim-server-db
+          path: scim-server-db
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Link sibling scim-server-db module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ln -s "$GITHUB_WORKSPACE/scim-server-db" ../scim-server-db
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Configure Git
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          VERSION_BUMP: ${{ inputs.version_bump }}
+        run: |
+          set -euo pipefail
+
+          current_version="$(tr -d '[:space:]' < VERSION)"
+
+          if [[ ! "$current_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "VERSION must contain a semantic version in the form x.y.z: ${current_version}" >&2
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+
+          case "$VERSION_BUMP" in
+            patch)
+              patch="$((patch + 1))"
+              ;;
+            minor)
+              minor="$((minor + 1))"
+              patch=0
+              ;;
+            major)
+              major="$((major + 1))"
+              minor=0
+              patch=0
+              ;;
+            *)
+              echo "Unsupported version bump: ${VERSION_BUMP}" >&2
+              exit 1
+              ;;
+          esac
+
+          release_version="${major}.${minor}.${patch}"
+          tag_name="v${release_version}"
+
+          printf '%s\n' "$release_version" > VERSION
+          echo "release_version=${release_version}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure release tag does not exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag_name }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.version.outputs.tag_name }} already exists"
+            exit 1
+          fi
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          go test -count=1 ./...
+
+      - name: Commit version bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add VERSION
+          git commit -m "chore(release): v${{ steps.version.outputs.release_version }} [skip ci]"
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          git archive \
+            --format=tar.gz \
+            --prefix="scim-server-impl-go-${{ steps.version.outputs.release_version }}/" \
+            --output "dist/scim-server-impl-go-${{ steps.version.outputs.release_version }}.source.tar.gz" \
+            HEAD
+
+          for arch in amd64 arm64; do
+            package_dir="dist/scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-${arch}"
+            mkdir -p "$package_dir"
+
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags='-s -w' -o "$package_dir/scim-server-impl-go" ./cmd/server
+
+            cp LICENSE README.md CONTRIBUTING.md SECURITY.md VERSION "$package_dir/"
+            cp -R config "$package_dir/"
+
+            tar -czf "dist/scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-${arch}.tar.gz" \
+              -C dist "scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-${arch}"
+          done
+
+      - name: Create and push git tag
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git tag -a "${{ steps.version.outputs.tag_name }}" -m "Release ${{ steps.version.outputs.tag_name }}"
+          git push origin "HEAD:${TARGET_BRANCH}" --follow-tags
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "${{ steps.version.outputs.tag_name }}" \
+            --verify-tag \
+            --generate-notes \
+            --title "${{ steps.version.outputs.tag_name }}" \
+            "dist/scim-server-impl-go-${{ steps.version.outputs.release_version }}.source.tar.gz#scim-server-impl-go-${{ steps.version.outputs.release_version }}.source.tar.gz" \
+            "dist/scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-amd64.tar.gz#scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-amd64.tar.gz" \
+            "dist/scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-arm64.tar.gz#scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-arm64.tar.gz"

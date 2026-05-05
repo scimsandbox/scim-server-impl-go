@@ -1,0 +1,30 @@
+# Go build artifacts
+/bin/
+*.test
+*.coverprofile
+coverage.out
+/server
+/cmd/server/server
+
+# OS / editor noise
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.vscode/
+.idea/
+*.iml
+*.iws
+*.ipr
+*.swp
+*~
+
+# SOPS / age artifacts
+*.agekey
+*.decrypted.yaml
+*.decrypted.yml
+*.dec.yaml
+*.dec.yml
+/.config/sops/

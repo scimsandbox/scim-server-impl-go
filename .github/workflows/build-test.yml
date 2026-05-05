@@ -1,0 +1,50 @@
+name: Build and Test
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Checkout scim-server-db
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository_owner }}/scim-server-db
+          path: scim-server-db
+
+      - name: Link sibling scim-server-db module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ln -s "$GITHUB_WORKSPACE/scim-server-db" ../scim-server-db
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          go test -count=1 ./...

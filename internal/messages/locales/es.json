@@ -1,0 +1,15 @@
+{
+  "error.stdout_writer_required": "se requiere un escritor para stdout",
+  "error.config_file_not_found": "archivo de configuración no encontrado: %s",
+  "error.config_file_stat": "error al consultar %s",
+  "error.required_config_value_still_set": "el valor de configuración requerido %s todavía tiene el marcador %s",
+  "error.api_bearer_token_required": "se requiere un token de portador",
+  "error.api_body_required": "se requiere un cuerpo de solicitud",
+  "error.api_invalid_json": "cuerpo JSON no válido",
+  "error.api_request_too_large": "cuerpo de solicitud demasiado grande",
+  "log.configuration_loaded": "configuración cargada",
+  "log.configuration_rendered": "configuración renderizada",
+  "log.http_server_started": "servidor http iniciado",
+  "log.http_server_stopped": "servidor http detenido",
+  "log.http_request_completed": "solicitud http completada"
+}

@@ -966,11 +966,16 @@ func (h *GroupHandler) updateDisplayNameTx(ctx context.Context, tx jdbc.Executor
 }
 
 func (h *GroupHandler) addMissingMembersTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, members []map[string]any) error {
+	addedAny := false
+	newlyAdded := make(map[string]bool)
+
 	for _, member := range members {
 		memberValue, _ := member["value"].(string)
 		if memberValue == "" {
 			continue
 		}
+
+		// Check if it's already in the group (from the database)
 		alreadyExists := false
 		for _, existing := range group.Members {
 			if existing.MemberValue.String() == memberValue {
@@ -981,15 +986,27 @@ func (h *GroupHandler) addMissingMembersTx(ctx context.Context, tx jdbc.Executor
 		if alreadyExists {
 			continue
 		}
+
+		// Check if we already added it in this batch
+		if newlyAdded[memberValue] {
+			continue
+		}
+
 		if err := h.addMemberTx(ctx, tx, group.ID, wsID, member); err != nil {
 			return err
 		}
+		newlyAdded[memberValue] = true
+		addedAny = true
+	}
+
+	if addedAny {
 		memberships, err := h.membershipRepo.FindByGroupIDTx(ctx, tx, group.ID)
 		if err != nil {
 			return err
 		}
 		group.Members = memberships
 	}
+
 	return nil
 }
 

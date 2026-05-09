@@ -966,24 +966,35 @@ func (h *GroupHandler) updateDisplayNameTx(ctx context.Context, tx jdbc.Executor
 }
 
 func (h *GroupHandler) addMissingMembersTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, members []map[string]any) error {
+	addedAny := false
+	newlyAdded := make(map[string]bool)
+	existingMembers := make(map[string]bool, len(group.Members))
+	for _, existing := range group.Members {
+		existingMembers[existing.MemberValue.String()] = true
+	}
+
 	for _, member := range members {
 		memberValue, _ := member["value"].(string)
 		if memberValue == "" {
 			continue
 		}
-		alreadyExists := false
-		for _, existing := range group.Members {
-			if existing.MemberValue.String() == memberValue {
-				alreadyExists = true
-				break
-			}
+
+		memberKey := memberValue
+		if memberUUID, err := uuid.Parse(memberValue); err == nil {
+			memberKey = memberUUID.String()
 		}
-		if alreadyExists {
+
+		if existingMembers[memberKey] || newlyAdded[memberKey] {
 			continue
 		}
 		if err := h.addMemberTx(ctx, tx, group.ID, wsID, member); err != nil {
 			return err
 		}
+		newlyAdded[memberKey] = true
+		addedAny = true
+	}
+
+	if addedAny {
 		memberships, err := h.membershipRepo.FindByGroupIDTx(ctx, tx, group.ID)
 		if err != nil {
 			return err

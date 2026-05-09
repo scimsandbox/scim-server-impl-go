@@ -189,6 +189,113 @@ func TestPatchGroupAddRemoveMembers(t *testing.T) {
 	}
 }
 
+func TestPatchGroupAddDuplicateMembersInSingleRequest(t *testing.T) {
+	env := setupTestEnv(t)
+
+	wsID := uuid.New()
+	token := generateToken()
+	seedWorkspaceAndToken(t, env.ctx, wsID, token)
+
+	createUser := func(userName, displayName string) string {
+		body := `{
+			"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+			"userName": "` + userName + `",
+			"displayName": "` + displayName + `",
+			"active": true
+		}`
+		resp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Users"), token, body)
+		respBody := readBody(t, resp)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create user: expected 201, got %d: %s", resp.StatusCode, respBody)
+		}
+		var created map[string]any
+		if err := json.Unmarshal([]byte(respBody), &created); err != nil {
+			t.Fatalf("create user unmarshal: %v", err)
+		}
+		return created["id"].(string)
+	}
+
+	userID1 := createUser("dup1@example.com", "Duplicate One")
+	userID2 := createUser("dup2@example.com", "Duplicate Two")
+
+	groupBody := `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+		"displayName": "Duplicate Patch Group"
+	}`
+	resp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Groups"), token, groupBody)
+	respBody := readBody(t, resp)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create group: expected 201, got %d: %s", resp.StatusCode, respBody)
+	}
+	var createdGroup map[string]any
+	if err := json.Unmarshal([]byte(respBody), &createdGroup); err != nil {
+		t.Fatalf("create group unmarshal: %v", err)
+	}
+	groupID := createdGroup["id"].(string)
+
+	patchAdd := `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+		"Operations": [{
+			"op": "add",
+			"path": "members",
+			"value": [
+				{"value": "` + userID1 + `", "type": "User"},
+				{"value": "` + userID1 + `", "type": "User"},
+				{"value": "` + userID2 + `", "type": "User"}
+			]
+		}]
+	}`
+	resp = doRequest(t, http.MethodPatch, scimURL(env.server.URL, wsID, "/Groups/"+groupID), token, patchAdd)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch add: expected 200, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	var patched map[string]any
+	if err := json.Unmarshal([]byte(respBody), &patched); err != nil {
+		t.Fatalf("patch add unmarshal: %v", err)
+	}
+	members, ok := patched["members"].([]any)
+	if !ok {
+		t.Fatalf("patch add: expected members array, got %T: %s", patched["members"], respBody)
+	}
+	if len(members) != 2 {
+		t.Fatalf("patch add: expected 2 unique members, got %d: %s", len(members), respBody)
+	}
+
+	resp = doRequest(t, http.MethodGet, scimURL(env.server.URL, wsID, "/Groups/"+groupID), token, "")
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get group: expected 200, got %d: %s", resp.StatusCode, respBody)
+	}
+	var gotGroup map[string]any
+	if err := json.Unmarshal([]byte(respBody), &gotGroup); err != nil {
+		t.Fatalf("get group unmarshal: %v", err)
+	}
+	members, ok = gotGroup["members"].([]any)
+	if !ok {
+		t.Fatalf("get group: expected members array, got %T: %s", gotGroup["members"], respBody)
+	}
+	if len(members) != 2 {
+		t.Fatalf("get group: expected 2 unique members, got %d: %s", len(members), respBody)
+	}
+	values := make(map[string]bool, len(members))
+	for _, member := range members {
+		memberMap, ok := member.(map[string]any)
+		if !ok {
+			t.Fatalf("get group: expected member object, got %T: %s", member, respBody)
+		}
+		value, _ := memberMap["value"].(string)
+		values[value] = true
+	}
+	if !values[userID1] {
+		t.Fatalf("get group: missing first member, body: %s", respBody)
+	}
+	if !values[userID2] {
+		t.Fatalf("get group: missing second member, body: %s", respBody)
+	}
+}
+
 func TestDeleteGroup(t *testing.T) {
 	env := setupTestEnv(t)
 

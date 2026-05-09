@@ -227,6 +227,29 @@ func (r *MembershipRepository) FindByGroupID(ctx context.Context, groupID uuid.U
 	return scanMemberships(rows)
 }
 
+func (r *MembershipRepository) FindByGroupIDIn(ctx context.Context, groupIDs []uuid.UUID) ([]model.ScimGroupMembership, error) {
+	if len(groupIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(groupIDs))
+	args := make([]any, len(groupIDs))
+	for i, id := range groupIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(
+		`SELECT id, group_id, workspace_id, member_value, member_type, display
+		 FROM scim_group_memberships WHERE group_id IN (%s)`, strings.Join(placeholders, ","))
+
+	rows, err := jdbc.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMemberships(rows)
+}
+
 func (r *MembershipRepository) FindByMemberValue(ctx context.Context, memberValue uuid.UUID) ([]model.ScimGroupMembership, error) {
 	rows, err := jdbc.QueryContext(ctx,
 		`SELECT m.id, m.group_id, m.workspace_id, m.member_value, m.member_type, m.display

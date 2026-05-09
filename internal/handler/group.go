@@ -248,10 +248,25 @@ func (h *GroupHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
 
 	baseURL := buildBaseURL(r)
 
-	// Load members for all groups
-	for _, g := range groups {
-		memberships, _ := h.membershipRepo.FindByGroupID(r.Context(), g.ID)
-		g.Members = memberships
+	// Load members for all groups efficiently
+	if len(groups) > 0 {
+		groupIDs := make([]uuid.UUID, 0, len(groups))
+		for _, g := range groups {
+			groupIDs = append(groupIDs, g.ID)
+		}
+		allMemberships, err := h.membershipRepo.FindByGroupIDIn(r.Context(), groupIDs)
+		if err == nil {
+			membershipsByGroupID := make(map[uuid.UUID][]model.ScimGroupMembership)
+			for _, m := range allMemberships {
+				membershipsByGroupID[m.GroupID] = append(membershipsByGroupID[m.GroupID], m)
+			}
+			for _, g := range groups {
+				g.Members = membershipsByGroupID[g.ID]
+			}
+		} else {
+			slog.Error("failed to load memberships in batch", "error", err)
+			// Fallback (though probably won't be hit if it fails, maybe log error)
+		}
 	}
 
 	resources := make([]map[string]any, 0, len(groups))

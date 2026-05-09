@@ -303,16 +303,11 @@ func TestNew_RecordsMetricsForThrottledRequests(t *testing.T) {
 
 	path := "/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Users"
 	before := metricValueWithLabels(t, "scim_go_operation_requests_total", map[string]string{
-		"operation":      "listUsers",
-		"resource":       "users",
-		"action":         "list",
-		"workspace_id":   "123e4567-e89b-12d3-a456-426614174000",
-		"user_email":     "unknown",
-		"http_status":    "503",
-		"outcome":        "server_error",
-		"authentication": "unknown",
-		"throttled":      "yes",
+		"operation":   "listUsers",
+		"http_status": "503",
 	})
+	authBefore := metricValueWithLabels(t, "scim_go_operation_authentication_total", map[string]string{"state": "unknown"})
+	throttledBefore := metricValueWithLabels(t, "scim_go_operation_throttled_total", map[string]string{"state": "yes"})
 
 	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
 	rw := httptest.NewRecorder()
@@ -323,18 +318,17 @@ func TestNew_RecordsMetricsForThrottledRequests(t *testing.T) {
 	}
 
 	after := metricValueWithLabels(t, "scim_go_operation_requests_total", map[string]string{
-		"operation":      "listUsers",
-		"resource":       "users",
-		"action":         "list",
-		"workspace_id":   "123e4567-e89b-12d3-a456-426614174000",
-		"user_email":     "unknown",
-		"http_status":    "503",
-		"outcome":        "server_error",
-		"authentication": "unknown",
-		"throttled":      "yes",
+		"operation":   "listUsers",
+		"http_status": "503",
 	})
 	if after-before != 1 {
 		t.Fatalf("counter delta = %v, want 1", after-before)
+	}
+	if after := metricValueWithLabels(t, "scim_go_operation_authentication_total", map[string]string{"state": "unknown"}); after-authBefore != 2 {
+		t.Fatalf("authentication counter delta = %v, want 2", after-authBefore)
+	}
+	if after := metricValueWithLabels(t, "scim_go_operation_throttled_total", map[string]string{"state": "yes"}); after-throttledBefore != 1 {
+		t.Fatalf("throttled counter delta = %v, want 1", after-throttledBefore)
 	}
 }
 
@@ -369,6 +363,9 @@ func metricValueWithLabels(t *testing.T, metricName string, labels map[string]st
 				}
 				if metric.Histogram != nil {
 					return float64(metric.Histogram.GetSampleCount())
+				}
+				if metric.Summary != nil {
+					return float64(metric.Summary.GetSampleCount())
 				}
 			}
 		}

@@ -6,22 +6,33 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 var (
+	scimDurationBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1.0}
+
 	scimOpCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "scim_go_operation_requests_total",
 		Help: "Total SCIM operation requests",
-	}, []string{"operation", "resource", "action", "workspace_id", "user_email", "http_status", "outcome", "authentication", "throttled"})
+	}, []string{"operation", "http_status"})
 
 	scimOpDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "scim_go_operation_duration_seconds",
 		Help:    "SCIM operation duration in seconds",
-		Buckets: prometheus.DefBuckets,
-	}, []string{"operation", "resource", "action", "workspace_id", "user_email", "http_status", "outcome", "authentication", "throttled"})
+		Buckets: scimDurationBuckets,
+	}, []string{"operation", "http_status"})
+
+	scimAuthCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "scim_go_operation_authentication_total",
+		Help: "Total SCIM requests by authentication state",
+	}, []string{"state"})
+
+	scimThrottledCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "scim_go_operation_throttled_total",
+		Help: "Total SCIM requests by throttling state",
+	}, []string{"state"})
 )
 
 type scimOperation struct {
@@ -56,44 +67,19 @@ func ScimMetrics(next http.Handler) http.Handler {
 		duration := time.Since(start).Seconds()
 
 		httpStatus := strconv.Itoa(rc.statusCode)
-		outcome := "success"
-		if rc.statusCode >= 400 {
-			outcome = "client_error"
-		}
-		if rc.statusCode >= 500 {
-			outcome = "server_error"
-		}
-		if rc.statusCode >= 300 && rc.statusCode < 400 {
-			outcome = "redirection"
-		}
-
-		workspaceID := resolveWorkspaceID(r, state)
-		userEmail := resolveUserEmail(state)
 		authentication := resolveAuthenticationOutcome(state.Authentication, rc.statusCode)
 		throttled := resolveThrottledOutcome(state.Throttled, rc)
 
 		scimOpCounter.WithLabelValues(
 			operation.Operation,
-			operation.Resource,
-			operation.Action,
-			workspaceID,
-			userEmail,
 			httpStatus,
-			outcome,
-			authentication,
-			throttled,
 		).Inc()
 		scimOpDuration.WithLabelValues(
 			operation.Operation,
-			operation.Resource,
-			operation.Action,
-			workspaceID,
-			userEmail,
 			httpStatus,
-			outcome,
-			authentication,
-			throttled,
 		).Observe(duration)
+		scimAuthCounter.WithLabelValues(authentication).Inc()
+		scimThrottledCounter.WithLabelValues(throttled).Inc()
 	})
 }
 
@@ -122,37 +108,6 @@ func resolveThrottledOutcome(state string, rc *statusCapture) string {
 	}
 
 	return ThrottledNo
-}
-
-func resolveWorkspaceID(r *http.Request, state *requestMetricsState) string {
-	if state != nil && state.WorkspaceID != "" {
-		return state.WorkspaceID
-	}
-
-	workspaceID, ok := r.Context().Value(WorkspaceIDKey).(uuid.UUID)
-	if ok {
-		return workspaceID.String()
-	}
-
-	segments := strings.Split(r.URL.Path, "/")
-	if len(segments) <= 2 || segments[1] != "ws" {
-		return "unknown"
-	}
-
-	parsedWorkspaceID, err := uuid.Parse(segments[2])
-	if err != nil {
-		return "invalid"
-	}
-
-	return parsedWorkspaceID.String()
-}
-
-func resolveUserEmail(state *requestMetricsState) string {
-	if state != nil && state.UserEmail != "" {
-		return state.UserEmail
-	}
-
-	return "unknown"
 }
 
 func isScimRequest(path string) bool {

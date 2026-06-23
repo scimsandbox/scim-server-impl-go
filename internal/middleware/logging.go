@@ -66,7 +66,7 @@ func RequestResponseLogging(logRepo *repository.RequestLogRepository) func(http.
 				ID:           uuid.New(),
 				WorkspaceID:  workspaceID,
 				HttpMethod:   r.Method,
-				RequestPath:  r.URL.Path,
+				RequestPath:  r.URL.RequestURI(),
 				RequestBody:  ptrOrNil(reqBodyStr),
 				ResponseBody: ptrOrNil(respBodyStr),
 				HttpStatus:   rc.statusCode,

@@ -77,7 +77,7 @@ func requestLoggingMiddleware(logger logging.Logger, localizer messages.Localize
 
 		logger.Info(localizer.Text(messages.KeyHTTPRequestCompleted),
 			logging.String("method", r.Method),
-			logging.String("path", r.URL.Path),
+			logging.String("path", r.URL.RequestURI()),
 			logging.Int("status", capture.statusCode),
 			logging.Duration("duration", duration),
 		)

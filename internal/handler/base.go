@@ -28,8 +28,19 @@ func parseUUID(s string) (uuid.UUID, error) {
 	return uuid.Parse(s)
 }
 
+// buildBaseURL derives the authority stamped into every meta.location and $ref.
+//
+// Only the scheme comes from a forwarded header: the edge terminates TLS and reaches this service
+// over plain http, and it overwrites X-Forwarded-Proto itself. X-Forwarded-Host and X-Forwarded-Port
+// are deliberately NOT read - any client can send them, and they would let a caller choose the host
+// every URL in the response points at. r.Host is authoritative because the proxy routes on it, and it
+// already carries the port whenever that port is non-default.
 func buildBaseURL(r *http.Request) string {
 	scheme := sanitizeHeaderValue(r.Header.Get("X-Forwarded-Proto"))
+	if idx := strings.Index(scheme, ","); idx >= 0 {
+		scheme = scheme[:idx]
+	}
+	scheme = strings.TrimSpace(scheme)
 	if scheme == "" {
 		if r.TLS != nil {
 			scheme = "https"
@@ -38,17 +49,7 @@ func buildBaseURL(r *http.Request) string {
 		}
 	}
 
-	host := sanitizeHeaderValue(r.Header.Get("X-Forwarded-Host"))
-	if host == "" {
-		host = r.Host
-	}
-
-	port := sanitizeHeaderValue(r.Header.Get("X-Forwarded-Port"))
-
-	base := scheme + "://" + host
-	if port != "" && shouldAppendPort(scheme, port) {
-		base += ":" + port
-	}
+	base := scheme + "://" + stripDefaultPort(scheme, sanitizeHeaderValue(r.Host))
 
 	wsIDStr := chi.URLParam(r, "workspaceId")
 	compatStr := chi.URLParam(r, "compat")
@@ -67,14 +68,16 @@ func sanitizeHeaderValue(v string) string {
 	return headerSanitizer.ReplaceAllString(v, "")
 }
 
-func shouldAppendPort(scheme, port string) bool {
-	if scheme == "http" && port == "80" {
-		return false
+// stripDefaultPort keeps the authority canonical when a client spells out the default port.
+func stripDefaultPort(scheme, host string) string {
+	switch scheme {
+	case "http":
+		return strings.TrimSuffix(host, ":80")
+	case "https":
+		return strings.TrimSuffix(host, ":443")
+	default:
+		return host
 	}
-	if scheme == "https" && port == "443" {
-		return false
-	}
-	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -104,6 +104,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 		r.Post("/Groups/.search", groupHandler.SearchGroups)
 
 		r.Post("/Bulk", bulkHandler.ProcessBulk)
+		r.Post("/.search", discoveryHandler.GlobalSearchNotImplemented)
 
 		r.Get("/ServiceProviderConfig", discoveryHandler.GetServiceProviderConfig)
 		r.Get("/Schemas", discoveryHandler.GetSchemas)

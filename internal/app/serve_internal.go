@@ -126,6 +126,7 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		r.Post("/Groups/.search", groupHandler.SearchGroups)
 
 		r.Post("/Bulk", bulkHandler.ProcessBulk)
+		r.Post("/.search", discoveryHandler.GlobalSearchNotImplemented)
 
 		const serviceProviderConfigPath = "/ServiceProviderConfig"
 		r.Get(serviceProviderConfigPath, discoveryHandler.GetServiceProviderConfig)

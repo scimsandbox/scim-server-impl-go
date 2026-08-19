@@ -71,6 +71,10 @@ func (h *DiscoveryHandler) GetResourceTypeByID(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, rt)
 }
 
+func (h *DiscoveryHandler) GlobalSearchNotImplemented(w http.ResponseWriter, _ *http.Request) {
+	scim.WriteScimError(w, scim.NewScimError(http.StatusNotImplemented, "", "Global cross-resource search is not implemented"))
+}
+
 func MethodNotAllowed(w http.ResponseWriter, _ *http.Request) {
 	scim.WriteScimError(w, scim.NewScimError(http.StatusMethodNotAllowed, "", "Method not allowed"))
 }

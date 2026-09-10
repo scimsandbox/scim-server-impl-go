@@ -505,6 +505,267 @@ func TestApplyPatchOperations_FilteredInvalidSyntax(t *testing.T) {
 	}
 }
 
+func TestApplyPatchOperations_ReplaceNameNoPath_RFC7644(t *testing.T) {
+	u := newTestUser()
+	ops := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"name": map[string]any{
+					"familyName": "Jensen",
+					"givenName":  "Barbara",
+				},
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	assertStringPtrEquals(t, "nameFamilyName", u.NameFamilyName, "Jensen")
+	assertStringPtrEquals(t, "nameGivenName", u.NameGivenName, "Barbara")
+}
+
+func TestApplyPatchOperations_UserReportedScenario(t *testing.T) {
+	u := newTestUser()
+	dispOld := "Vinko-Wigbert Roht-Rogner"
+	famOld := "Adams"
+	givOld := "Jans"
+	u.DisplayName = &dispOld
+	u.NameFamilyName = &famOld
+	u.NameGivenName = &givOld
+
+	ops := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"displayName": "Vinko-Wigbert Roht-Rogner TEST CHANGE",
+			},
+		},
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"name": map[string]any{
+					"familyName": "Roht-Rogner TEST CHANGE",
+					"formatted":  "Karan Roht-Rogner TEST CHANGE",
+				},
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	assertStringPtrEquals(t, "displayName", u.DisplayName, "Vinko-Wigbert Roht-Rogner TEST CHANGE")
+	assertStringPtrEquals(t, "nameFamilyName", u.NameFamilyName, "Roht-Rogner TEST CHANGE")
+	assertStringPtrEquals(t, "nameFormatted", u.NameFormatted, "Karan Roht-Rogner TEST CHANGE")
+	// Verify unspecified sub-attribute (givenName) is preserved per RFC 7644 Section 3.5.2.1
+	assertStringPtrEquals(t, "nameGivenName", u.NameGivenName, "Jans")
+}
+
+func TestApplyPatchOperations_NameWithPath(t *testing.T) {
+	u := newTestUser()
+	// Bare path "name"
+	ops := []map[string]any{
+		{
+			"op":   "replace",
+			"path": "name",
+			"value": map[string]any{
+				"familyName": "Doe",
+				"givenName":  "John",
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply bare path name failed: %v", err)
+	}
+	assertStringPtrEquals(t, "nameFamilyName", u.NameFamilyName, "Doe")
+	assertStringPtrEquals(t, "nameGivenName", u.NameGivenName, "John")
+
+	// URN-prefixed path
+	opsURN := []map[string]any{
+		{
+			"op":   "replace",
+			"path": "urn:ietf:params:scim:schemas:core:2.0:User:name",
+			"value": map[string]any{
+				"familyName": "Smith",
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, opsURN); err != nil {
+		t.Fatalf("apply urn path name failed: %v", err)
+	}
+	assertStringPtrEquals(t, "nameFamilyName", u.NameFamilyName, "Smith")
+	assertStringPtrEquals(t, "nameGivenName", u.NameGivenName, "John")
+}
+
+func TestApplyPatchOperations_RemoveName(t *testing.T) {
+	u := newTestUser()
+	f := "Family"
+	g := "Given"
+	fmt := "Formatted"
+	u.NameFamilyName = &f
+	u.NameGivenName = &g
+	u.NameFormatted = &fmt
+
+	ops := []map[string]any{
+		{"op": "remove", "path": "name"},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply remove name failed: %v", err)
+	}
+	if u.NameFamilyName != nil || u.NameGivenName != nil || u.NameFormatted != nil {
+		t.Fatalf("expected all name fields to be nil after remove name")
+	}
+}
+
+func TestApplyPatchOperations_ReplaceNameNull(t *testing.T) {
+	u := newTestUser()
+	f := "Family"
+	u.NameFamilyName = &f
+
+	ops := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"name": nil,
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply replace name null failed: %v", err)
+	}
+	if u.NameFamilyName != nil {
+		t.Fatalf("expected nameFamilyName to be nil after setting name to null")
+	}
+}
+
+func TestApplyPatchOperations_InvalidNameValue(t *testing.T) {
+	u := newTestUser()
+	// Non-map value for name
+	ops := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"name": "not-an-object",
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err == nil {
+		t.Fatalf("expected error for non-map name value")
+	}
+
+	// Unknown sub-attribute
+	opsUnknown := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"name": map[string]any{
+					"unknownField": "bad",
+				},
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, opsUnknown); err == nil {
+		t.Fatalf("expected error for unknown name sub-attribute")
+	}
+}
+
+func TestApplyPatchOperations_ReplaceNoPath_MultiValuedReplaces(t *testing.T) {
+	u := newTestUser()
+	u.Emails = append(u.Emails, model.ScimUserEmail{Value: "old@example.com", Type: "work"})
+
+	ops := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"emails": []any{
+					map[string]any{"value": "new@example.com", "type": "work"},
+				},
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if len(u.Emails) != 1 || u.Emails[0].Value != "new@example.com" {
+		t.Fatalf("expected 1 replaced email, got %v", u.Emails)
+	}
+}
+
+func TestApplyPatchOperations_ReplaceNoPath_EnterpriseExtension(t *testing.T) {
+	u := newTestUser()
+	ops := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber": "EMP-999",
+				"costCenter": "CC-GLOBAL",
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply enterprise replace failed: %v", err)
+	}
+	assertStringPtrEquals(t, "employeeNumber", u.EnterpriseEmployeeNumber, "EMP-999")
+	assertStringPtrEquals(t, "costCenter", u.EnterpriseCostCenter, "CC-GLOBAL")
+}
+
+func TestApplyPatchOperations_ReplaceMultiValued_NullOrEmpty(t *testing.T) {
+	u := newTestUser()
+	u.Emails = append(u.Emails, model.ScimUserEmail{Value: "old@example.com", Type: "work"})
+
+	// Replace with empty array
+	opsEmpty := []map[string]any{
+		{"op": "replace", "path": "emails", "value": []any{}},
+	}
+	if err := ApplyPatchOperations(u, opsEmpty); err != nil {
+		t.Fatalf("apply empty array failed: %v", err)
+	}
+	if len(u.Emails) != 0 {
+		t.Fatalf("expected 0 emails, got %d", len(u.Emails))
+	}
+
+	// Replace with nil
+	u.Emails = append(u.Emails, model.ScimUserEmail{Value: "old@example.com", Type: "work"})
+	opsNil := []map[string]any{
+		{"op": "replace", "value": map[string]any{"emails": nil}},
+	}
+	if err := ApplyPatchOperations(u, opsNil); err != nil {
+		t.Fatalf("apply nil failed: %v", err)
+	}
+	if len(u.Emails) != 0 {
+		t.Fatalf("expected 0 emails after nil replace, got %d", len(u.Emails))
+	}
+}
+
+func TestApplyPatchOperations_ReplaceNoPath_RFC7644_Page46Example(t *testing.T) {
+	u := newTestUser()
+	u.NickName = toStringPtr("OldNick")
+	u.Emails = append(u.Emails, model.ScimUserEmail{Value: "old@example.com", Type: "work"})
+
+	ops := []map[string]any{
+		{
+			"op": "replace",
+			"value": map[string]any{
+				"emails": []any{
+					map[string]any{"value": "bjensen@example.com", "type": "work", "primary": true},
+					map[string]any{"value": "babs@jensen.org", "type": "home"},
+				},
+				"nickname": "Babs",
+			},
+		},
+	}
+	if err := ApplyPatchOperations(u, ops); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	assertStringPtrEquals(t, "nickname", u.NickName, "Babs")
+	if len(u.Emails) != 2 {
+		t.Fatalf("expected 2 emails, got %d", len(u.Emails))
+	}
+	if u.Emails[0].Value != "bjensen@example.com" || u.Emails[1].Value != "babs@jensen.org" {
+		t.Fatalf("emails mismatch: %v", u.Emails)
+	}
+}
+
 func assertStringPtrEquals(t *testing.T, name string, ptr *string, want string) {
 	t.Helper()
 	if ptr == nil {

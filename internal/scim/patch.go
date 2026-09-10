@@ -76,28 +76,33 @@ func stripPatchURNPrefix(path string) string {
 	if path == "" {
 		return path
 	}
-	coreUser := "urn:ietf:params:scim:schemas:core:2.0:User:"
-	if strings.HasPrefix(path, coreUser) {
+	lower := strings.ToLower(path)
+	coreUser := strings.ToLower("urn:ietf:params:scim:schemas:core:2.0:User:")
+	if strings.HasPrefix(lower, coreUser) {
 		return path[len(coreUser):]
 	}
-	if strings.HasPrefix(path, enterpriseSchemaURN+":") {
-		return path[len(enterpriseSchemaURN)+1:]
+	entUser := strings.ToLower(enterpriseSchemaURN + ":")
+	if strings.HasPrefix(lower, entUser) {
+		return path[len(entUser):]
 	}
-	if path == enterpriseSchemaURN {
-		return path
+	if strings.EqualFold(path, enterpriseSchemaURN) {
+		return enterpriseSchemaURN
 	}
 	return path
 }
 
 func applyAdd(user *model.ScimUser, path string, value any) error {
 	if path == "" {
-		return applyValueMap(user, value)
+		return applyValueMap(user, value, false)
 	}
 	m := filteredPathRegex.FindStringSubmatch(path)
 	if m != nil {
 		return applyFilteredAdd(user, m[1], m[2], m[3], value)
 	}
 	lower := strings.ToLower(path)
+	if lower == "name" {
+		return setNameAttribute(user, value)
+	}
 	if strings.HasPrefix(lower, enterpriseSchemaURN) || isEnterpriseAttr(path) {
 		return setEnterpriseAttribute(user, path, value)
 	}
@@ -112,13 +117,16 @@ func applyAdd(user *model.ScimUser, path string, value any) error {
 
 func applyReplace(user *model.ScimUser, path string, value any) error {
 	if path == "" {
-		return applyValueMap(user, value)
+		return applyValueMap(user, value, true)
 	}
 	m := filteredPathRegex.FindStringSubmatch(path)
 	if m != nil {
 		return applyFilteredReplace(user, m[1], m[2], m[3], value)
 	}
 	lower := strings.ToLower(path)
+	if lower == "name" {
+		return setNameAttribute(user, value)
+	}
 	if strings.HasPrefix(lower, enterpriseSchemaURN) || isEnterpriseAttr(path) {
 		return setEnterpriseAttribute(user, path, value)
 	}
@@ -140,6 +148,9 @@ func applyRemove(user *model.ScimUser, path string, _ any) error {
 		return applyFilteredRemove(user, m[1], m[2])
 	}
 	lower := strings.ToLower(path)
+	if lower == "name" {
+		return setNameAttribute(user, nil)
+	}
 	if strings.HasPrefix(lower, enterpriseSchemaURN) || isEnterpriseAttr(path) {
 		return clearEnterpriseAttribute(user, path)
 	}
@@ -230,6 +241,42 @@ func setSubAttribute(user *model.ScimUser, path string, value any) error {
 		user.NameHonorificSuffix = s
 	default:
 		return NewScimError(400, "invalidPath", "Unknown name sub-attribute: "+parts[1])
+	}
+	return nil
+}
+
+func setNameAttribute(user *model.ScimUser, value any) error {
+	if value == nil {
+		user.NameFormatted = nil
+		user.NameFamilyName = nil
+		user.NameGivenName = nil
+		user.NameMiddleName = nil
+		user.NameHonorificPrefix = nil
+		user.NameHonorificSuffix = nil
+		return nil
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return NewScimError(400, "invalidValue", "Attribute 'name' must be an object")
+	}
+	for subAttr, subVal := range m {
+		s := toStringPtr(subVal)
+		switch strings.ToLower(subAttr) {
+		case "formatted":
+			user.NameFormatted = s
+		case "familyname":
+			user.NameFamilyName = s
+		case "givenname":
+			user.NameGivenName = s
+		case "middlename":
+			user.NameMiddleName = s
+		case "honorificprefix":
+			user.NameHonorificPrefix = s
+		case "honorificsuffix":
+			user.NameHonorificSuffix = s
+		default:
+			return NewScimError(400, "invalidPath", "Unknown name sub-attribute: "+subAttr)
+		}
 	}
 	return nil
 }
@@ -326,7 +373,7 @@ func clearEnterpriseAttribute(user *model.ScimUser, path string) error {
 	return setEnterpriseAttribute(user, attr, nil)
 }
 
-func applyValueMap(user *model.ScimUser, value any) error {
+func applyValueMap(user *model.ScimUser, value any, isReplace bool) error {
 	m, ok := value.(map[string]any)
 	if !ok {
 		return NewScimError(400, "invalidValue", "PATCH add/replace without path requires a value object")
@@ -334,7 +381,11 @@ func applyValueMap(user *model.ScimUser, value any) error {
 	for k, v := range m {
 		key := stripPatchURNPrefix(k)
 		lower := strings.ToLower(key)
-		if key == enterpriseSchemaURN || strings.HasPrefix(key, enterpriseSchemaURN) {
+		if lower == "name" {
+			if err := setNameAttribute(user, v); err != nil {
+				return err
+			}
+		} else if key == enterpriseSchemaURN || strings.HasPrefix(key, enterpriseSchemaURN) || isEnterpriseAttr(key) {
 			if err := setEnterpriseAttribute(user, key, v); err != nil {
 				return err
 			}
@@ -343,8 +394,14 @@ func applyValueMap(user *model.ScimUser, value any) error {
 				return err
 			}
 		} else if multiValuedAttrs[lower] {
-			if err := addToMultiValued(user, lower, v); err != nil {
-				return err
+			if isReplace {
+				if err := replaceMultiValued(user, lower, v); err != nil {
+					return err
+				}
+			} else {
+				if err := addToMultiValued(user, lower, v); err != nil {
+					return err
+				}
 			}
 		} else {
 			if err := setSingleAttribute(user, key, v); err != nil {
@@ -399,11 +456,16 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 
 func replaceMultiValued(user *model.ScimUser, attr string, value any) error {
 	clearAttribute(user, attr)
+	if value == nil {
+		return nil
+	}
 	return addToMultiValued(user, attr, value)
 }
 
 func clearAttribute(user *model.ScimUser, attr string) error {
 	switch strings.ToLower(attr) {
+	case "name":
+		return setNameAttribute(user, nil)
 	case "externalid":
 		user.ExternalID = nil
 	case "displayname":

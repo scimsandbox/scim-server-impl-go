@@ -311,6 +311,10 @@ func (h *BulkHandler) createUserInternal(r *http.Request, wsID uuid.UUID, data m
 	scim.ApplyFromScimInput(user, data)
 
 	if err := h.userHandler.userRepo.Create(r.Context(), user); err != nil {
+		if isUserNameConflict(err) {
+			return nil, &scim.ScimError{Status: 409, ScimType: "uniqueness",
+				Detail: "User with userName '" + user.UserName + "' already exists"}
+		}
 		return nil, &scim.ScimError{Status: 500, Detail: "Failed to create user"}
 	}
 
@@ -370,11 +374,26 @@ func (h *BulkHandler) replaceUserInternal(r *http.Request, wsID, userID uuid.UUI
 		return &scim.ScimError{Status: 404, Detail: userNotFoundDetail}
 	}
 
+	newUserName, _ := data["userName"].(string)
+	if newUserName != "" && !strings.EqualFold(newUserName, user.UserName) {
+		exists, err := h.userHandler.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), newUserName, wsID)
+		if err != nil {
+			return &scim.ScimError{Status: 500, Detail: "Internal error"}
+		}
+		if exists {
+			return &scim.ScimError{Status: 409, ScimType: "uniqueness", Detail: "User with userName '" + newUserName + "' already exists"}
+		}
+	}
+
 	scim.ClearMutableAttributes(user)
 	scim.ApplyFromScimInput(user, data)
 	user.LastModified = time.Now()
 
 	if err := h.userHandler.userRepo.Update(r.Context(), user); err != nil {
+		if isUserNameConflict(err) {
+			return &scim.ScimError{Status: 409, ScimType: "uniqueness",
+				Detail: "User with userName '" + user.UserName + "' already exists"}
+		}
 		return &scim.ScimError{Status: 500, Detail: "Failed to update user"}
 	}
 
@@ -431,12 +450,28 @@ func (h *BulkHandler) patchUserInternal(r *http.Request, wsID, userID uuid.UUID,
 		return &scim.ScimError{Status: 404, Detail: userNotFoundDetail}
 	}
 
+	oldUserName := user.UserName
+
 	if err := scim.ApplyPatchOperations(user, operations); err != nil {
 		return err
 	}
 
+	if !strings.EqualFold(user.UserName, oldUserName) {
+		exists, err := h.userHandler.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), user.UserName, wsID)
+		if err != nil {
+			return &scim.ScimError{Status: 500, Detail: "Internal error"}
+		}
+		if exists {
+			return &scim.ScimError{Status: 409, ScimType: "uniqueness", Detail: "User with userName '" + user.UserName + "' already exists"}
+		}
+	}
+
 	user.LastModified = time.Now()
 	if err := h.userHandler.userRepo.Update(r.Context(), user); err != nil {
+		if isUserNameConflict(err) {
+			return &scim.ScimError{Status: 409, ScimType: "uniqueness",
+				Detail: "User with userName '" + user.UserName + "' already exists"}
+		}
 		return &scim.ScimError{Status: 500, Detail: "Failed to update user"}
 	}
 

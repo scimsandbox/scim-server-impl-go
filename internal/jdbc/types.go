@@ -48,9 +48,18 @@ var (
 	ErrNoRows                  = errors.New("jdbc no rows")
 	ErrTableNameRequired       = errors.New("jdbc table name is required")
 	ErrOptimisticLockConflict  = errors.New("jdbc optimistic lock conflict")
+	ErrUniqueViolation         = errors.New("jdbc unique constraint violation")
 	errNilOptimisticLockResult = errors.New("jdbc optimistic lock result is nil")
 )
 
 type OptimisticLockError struct {
 	Resource string
+}
+
+// UniqueViolationError reports a unique constraint violation raised by the database,
+// carrying the constraint name so callers can tell which rule was broken. Backend error
+// codes are translated here rather than in the handlers, matching how ErrNoRows is
+// surfaced, so nothing above this package needs to know the driver.
+type UniqueViolationError struct {
+	Constraint string
 }

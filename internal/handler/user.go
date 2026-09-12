@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/google/uuid"
+	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 	"github.com/scimsandbox/scim-server-impl-go/internal/repository"
 	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
@@ -76,6 +77,11 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	scim.ApplyFromScimInput(user, input)
 
 	if err := h.userRepo.Create(r.Context(), user); err != nil {
+		if isUserNameConflict(err) {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
+				"User with userName '"+user.UserName+"' already exists"))
+			return
+		}
 		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create user"))
 		return
 	}
@@ -303,6 +309,11 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
 			return
 		}
+		if isUserNameConflict(err) {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
+				"User with userName '"+user.UserName+"' already exists"))
+			return
+		}
 		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update user"))
 		return
 	}
@@ -340,6 +351,8 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
 		return
 	}
+
+	oldUserName := user.UserName
 
 	// If-Match check
 	ifMatch := r.Header.Get("If-Match")
@@ -395,11 +408,28 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !strings.EqualFold(user.UserName, oldUserName) {
+		exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), user.UserName, wsID)
+		if err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
+			return
+		}
+		if exists {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+user.UserName+"' already exists"))
+			return
+		}
+	}
+
 	user.LastModified = time.Now()
 
 	if err := h.userRepo.Update(r.Context(), user); err != nil {
 		if errors.Is(err, repository.ErrOptimisticLock) {
 			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
+			return
+		}
+		if isUserNameConflict(err) {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
+				"User with userName '"+user.UserName+"' already exists"))
 			return
 		}
 		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update user"))
@@ -570,4 +600,24 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// userNameConstraints are the unique constraints on scim_users that a client can violate
+// by choosing a userName: the original case-sensitive one and the case-insensitive index
+// that enforces RFC 7643 §7's caseExact:false. A violation of any other constraint (an id
+// collision) is an internal fault, not a client conflict, and must stay a 500.
+var userNameConstraints = map[string]bool{
+	"uk_scim_users_workspace_user_name":    true,
+	"uk_scim_users_workspace_user_name_ci": true,
+}
+
+// isUserNameConflict reports whether err is the database rejecting a duplicate userName.
+// The application pre-checks uniqueness before writing, so this only fires when a
+// concurrent request claimed the name in between — the race the pre-check cannot close.
+func isUserNameConflict(err error) bool {
+	var uniqueErr jdbc.UniqueViolationError
+	if !errors.As(err, &uniqueErr) {
+		return false
+	}
+	return userNameConstraints[uniqueErr.Constraint]
 }

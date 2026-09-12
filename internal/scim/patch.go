@@ -179,6 +179,12 @@ func setSingleAttribute(user *model.ScimUser, path string, value any) error {
 		if s == nil {
 			return NewScimError(400, "invalidValue", "userName cannot be null")
 		}
+		// userName is REQUIRED (RFC 7643 §4.1). Guarding here rather than in the
+		// handlers keeps direct PATCH and bulk PATCH from drifting apart: add,
+		// replace and pathless value-map operations all funnel through this call.
+		if *s == "" {
+			return NewScimError(400, "invalidValue", "userName is required")
+		}
 		user.UserName = *s
 	case "externalid":
 		user.ExternalID = s

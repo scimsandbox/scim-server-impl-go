@@ -18,6 +18,18 @@ func (e OptimisticLockError) Unwrap() error {
 	return ErrOptimisticLockConflict
 }
 
+func (e UniqueViolationError) Error() string {
+	constraint := strings.TrimSpace(e.Constraint)
+	if constraint == "" {
+		return ErrUniqueViolation.Error()
+	}
+	return fmt.Sprintf("%s: %s", ErrUniqueViolation.Error(), constraint)
+}
+
+func (e UniqueViolationError) Unwrap() error {
+	return ErrUniqueViolation
+}
+
 func Init(ctx context.Context, config Config) error {
 	return initBackend(ctx, config)
 }

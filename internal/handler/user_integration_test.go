@@ -299,4 +299,113 @@ func TestUserNameUniqueness(t *testing.T) {
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate create: expected 409, got %d: %s", resp.StatusCode, respBody)
 	}
+
+	// Create another user with a distinct userName
+	user2Body := `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+		"userName": "user2@example.com",
+		"active": true
+	}`
+	resp = doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Users"), token, user2Body)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("second create: expected 201, got %d", resp.StatusCode)
+	}
+	var user2 map[string]any
+	json.Unmarshal([]byte(respBody), &user2)
+	user2ID := user2["id"].(string)
+
+	// PATCH user2 to duplicate@example.com must return 409 Conflict
+	patchBody := `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+		"Operations": [
+			{"op": "replace", "path": "userName", "value": "duplicate@example.com"}
+		]
+	}`
+	resp = doRequest(t, http.MethodPatch, scimURL(env.server.URL, wsID, "/Users/"+user2ID), token, patchBody)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate patch: expected 409, got %d: %s", resp.StatusCode, respBody)
+	}
+}
+
+// TestUserNameRequiredOnPatch asserts that a PATCH clearing userName is rejected
+// identically on the direct and bulk paths. userName is REQUIRED (RFC 7643 §4.1),
+// and the guard lives in scim.ApplyPatchOperations so both handlers inherit it.
+func TestUserNameRequiredOnPatch(t *testing.T) {
+	env := setupTestEnv(t)
+
+	wsID := uuid.New()
+	token := generateToken()
+	seedWorkspaceAndToken(t, env.ctx, wsID, token)
+
+	createUser := func(userName string) string {
+		body := `{
+			"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+			"userName": "` + userName + `",
+			"active": true
+		}`
+		resp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Users"), token, body)
+		respBody := readBody(t, resp)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create %s: expected 201, got %d: %s", userName, resp.StatusCode, respBody)
+		}
+		var created map[string]any
+		if err := json.Unmarshal([]byte(respBody), &created); err != nil {
+			t.Fatalf("unmarshal create response: %v", err)
+		}
+		return created["id"].(string)
+	}
+
+	const patchOp = `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+		"Operations": [
+			{"op": "replace", "path": "userName", "value": ""}
+		]
+	}`
+
+	// Direct PATCH must be rejected outright.
+	directID := createUser("patch-direct@example.com")
+	resp := doRequest(t, http.MethodPatch, scimURL(env.server.URL, wsID, "/Users/"+directID), token, patchOp)
+	respBody := readBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("direct patch: expected 400, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	// Bulk PATCH must report the same failure for the operation, not silently
+	// persist an empty userName.
+	bulkID := createUser("patch-bulk@example.com")
+	bulkBody := `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+		"Operations": [
+			{"method": "PATCH", "path": "/Users/` + bulkID + `", "data": ` + patchOp + `}
+		]
+	}`
+	resp = doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Bulk"), token, bulkBody)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bulk patch: expected 200 envelope, got %d: %s", resp.StatusCode, respBody)
+	}
+	var bulkResult map[string]any
+	if err := json.Unmarshal([]byte(respBody), &bulkResult); err != nil {
+		t.Fatalf("unmarshal bulk response: %v", err)
+	}
+	ops, _ := bulkResult["Operations"].([]any)
+	if len(ops) != 1 {
+		t.Fatalf("bulk patch: expected 1 operation result, got %d: %s", len(ops), respBody)
+	}
+	if status, _ := ops[0].(map[string]any)["status"].(string); status != "400" {
+		t.Fatalf("bulk patch: expected operation status 400, got %v: %s", status, respBody)
+	}
+
+	// The stored resource must still carry its original userName.
+	resp = doRequest(t, http.MethodGet, scimURL(env.server.URL, wsID, "/Users/"+bulkID), token, "")
+	respBody = readBody(t, resp)
+	var fetched map[string]any
+	if err := json.Unmarshal([]byte(respBody), &fetched); err != nil {
+		t.Fatalf("unmarshal fetched user: %v", err)
+	}
+	if fetched["userName"] != "patch-bulk@example.com" {
+		t.Fatalf("bulk patch corrupted userName: got %q", fetched["userName"])
+	}
 }

@@ -214,7 +214,7 @@ func (r pgxRow) Scan(dest ...any) error {
 func (b pgxDatabaseBackend) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
 	tag, err := b.pool.Exec(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, translateExecError(err)
 	}
 	return commandTagResult{tag: tag}, nil
 }
@@ -243,7 +243,7 @@ func (b pgxDatabaseBackend) Close() error {
 func (b pgxTransactionBackend) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
 	tag, err := b.tx.Exec(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, translateExecError(err)
 	}
 	return commandTagResult{tag: tag}, nil
 }
@@ -283,4 +283,17 @@ func isValidIdentifier(name string) bool {
 		}
 	}
 	return true
+}
+
+// pgUniqueViolation is the SQLSTATE for unique_violation.
+const pgUniqueViolation = "23505"
+
+// translateExecError converts driver-specific write failures into this package's own
+// errors so callers can branch on them without importing pgx.
+func translateExecError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+		return UniqueViolationError{Constraint: pgErr.ConstraintName}
+	}
+	return err
 }

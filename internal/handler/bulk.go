@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -167,8 +168,16 @@ func (h *BulkHandler) processOperation(r *http.Request, op map[string]any, wsID 
 	return result
 }
 
-func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, path string, data map[string]any, wsID uuid.UUID, baseURL string, bulkId string, bulkIdMap map[string]string) {
-	if strings.HasPrefix(path, "/Users") {
+func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, rawPath string, data map[string]any, wsID uuid.UUID, baseURL string, bulkId string, bulkIdMap map[string]string) {
+	cleanPath := normalizeBulkPath(rawPath)
+	trimmed := strings.TrimPrefix(cleanPath, "/")
+	segments := strings.Split(trimmed, "/")
+	resourceType := ""
+	if len(segments) > 0 {
+		resourceType = segments[0]
+	}
+
+	if strings.EqualFold(resourceType, "Users") {
 		user, err := h.createUserInternal(r, wsID, data)
 		if err != nil {
 			setBulkError(result, err)
@@ -179,7 +188,7 @@ func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, pat
 		if bulkId != "" {
 			bulkIdMap[bulkId] = user.String()
 		}
-	} else if strings.HasPrefix(path, "/Groups") {
+	} else if strings.EqualFold(resourceType, "Groups") {
 		group, err := h.createGroupInternal(r, wsID, data)
 		if err != nil {
 			setBulkError(result, err)
@@ -192,7 +201,7 @@ func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, pat
 		}
 	} else {
 		result["status"] = "400"
-		result["response"] = buildBulkError("400", "invalidValue", "Unknown resource path: "+path)
+		result["response"] = buildBulkError("400", "invalidValue", "Unknown resource path: "+rawPath)
 	}
 }
 
@@ -220,6 +229,9 @@ func (h *BulkHandler) handleBulkPut(r *http.Request, result map[string]any, path
 		}
 		result["status"] = "200"
 		result["location"] = baseURL + groupCollectionPath + resourceID.String()
+	default:
+		result["status"] = "400"
+		result["response"] = buildBulkError("400", "invalidValue", "Unknown resource path: "+path)
 	}
 }
 
@@ -255,6 +267,9 @@ func (h *BulkHandler) handleBulkPatch(r *http.Request, result map[string]any, pa
 		}
 		result["status"] = "200"
 		result["location"] = baseURL + groupCollectionPath + resourceID.String()
+	default:
+		result["status"] = "400"
+		result["response"] = buildBulkError("400", "invalidValue", "Unknown resource path: "+path)
 	}
 }
 
@@ -280,6 +295,9 @@ func (h *BulkHandler) handleBulkDelete(r *http.Request, result map[string]any, p
 			return
 		}
 		result["status"] = "204"
+	default:
+		result["status"] = "400"
+		result["response"] = buildBulkError("400", "invalidValue", "Unknown resource path: "+path)
 	}
 }
 
@@ -536,19 +554,39 @@ func (h *BulkHandler) deleteGroupInternal(r *http.Request, wsID, groupID uuid.UU
 
 // Helpers
 
-func parseBulkPath(path string) (string, uuid.UUID, error) {
-	cleaned := strings.TrimPrefix(path, "/")
-	parts := strings.SplitN(cleaned, "/", 2)
-	if len(parts) < 2 {
-		return "", uuid.Nil, &scim.ScimError{Status: 400, ScimType: "invalidPath",
-			Detail: "Bulk path must include resource ID: " + path}
+func normalizeBulkPath(rawPath string) string {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return ""
 	}
+	return path.Clean("/" + strings.TrimLeft(trimmed, "/"))
+}
+
+func parseBulkPath(rawPath string) (string, uuid.UUID, error) {
+	cleanPath := normalizeBulkPath(rawPath)
+	trimmed := strings.TrimPrefix(cleanPath, "/")
+	parts := strings.SplitN(trimmed, "/", 2)
+	if len(parts) < 2 || parts[1] == "" {
+		return "", uuid.Nil, &scim.ScimError{Status: 400, ScimType: "invalidPath",
+			Detail: "Bulk path must include resource ID: " + rawPath}
+	}
+
+	var canonicalType string
+	if strings.EqualFold(parts[0], "Users") {
+		canonicalType = "Users"
+	} else if strings.EqualFold(parts[0], "Groups") {
+		canonicalType = "Groups"
+	} else {
+		return "", uuid.Nil, &scim.ScimError{Status: 400, ScimType: "invalidValue",
+			Detail: "Unknown resource path: " + rawPath}
+	}
+
 	id, err := uuid.Parse(parts[1])
 	if err != nil {
 		return "", uuid.Nil, &scim.ScimError{Status: 400, ScimType: "invalidValue",
 			Detail: "Invalid resource ID: " + parts[1]}
 	}
-	return parts[0], id, nil
+	return canonicalType, id, nil
 }
 
 func resolveBulkIdReferences(path string, bulkIdMap map[string]string) string {

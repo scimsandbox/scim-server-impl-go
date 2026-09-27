@@ -553,14 +553,14 @@ type bulkPathTarget struct {
 	id           uuid.UUID
 }
 
-func normalizeBulkPath(rawPath string) (string, []string, error) {
+func normalizeBulkPath(rawPath string) ([]string, error) {
 	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
-		return "", nil, nil
+		return nil, nil
 	}
 	stripped := strings.Trim(trimmed, "/")
 	if stripped == "" {
-		return "/", []string{}, nil
+		return []string{}, nil
 	}
 	rawSegments := strings.Split(stripped, "/")
 	segments := make([]string, 0, len(rawSegments))
@@ -569,7 +569,7 @@ func normalizeBulkPath(rawPath string) (string, []string, error) {
 			continue // collapse multiple consecutive slashes
 		}
 		if seg == "." || seg == ".." {
-			return "", nil, &scim.ScimError{
+			return nil, &scim.ScimError{
 				Status:   http.StatusBadRequest,
 				ScimType: "invalidPath",
 				Detail:   "Path traversal segments ('.' or '..') are not allowed: " + rawPath,
@@ -577,11 +577,11 @@ func normalizeBulkPath(rawPath string) (string, []string, error) {
 		}
 		segments = append(segments, seg)
 	}
-	return "/" + strings.Join(segments, "/"), segments, nil
+	return segments, nil
 }
 
 func parseBulkTarget(rawPath string, isItemRequired bool) (*bulkPathTarget, error) {
-	_, segments, err := normalizeBulkPath(rawPath)
+	segments, err := normalizeBulkPath(rawPath)
 	if err != nil {
 		return nil, err
 	}
@@ -614,6 +614,13 @@ func parseBulkTarget(rawPath string, isItemRequired bool) (*bulkPathTarget, erro
 				Detail:   "Bulk path must include resource ID: " + rawPath,
 			}
 		}
+		if len(segments[1]) != 36 {
+			return nil, &scim.ScimError{
+				Status:   http.StatusBadRequest,
+				ScimType: "invalidValue",
+				Detail:   "Invalid resource ID: " + segments[1],
+			}
+		}
 		id, err := uuid.Parse(segments[1])
 		if err != nil {
 			return nil, &scim.ScimError{
@@ -634,21 +641,6 @@ func parseBulkTarget(rawPath string, isItemRequired bool) (*bulkPathTarget, erro
 	}
 
 	return &bulkPathTarget{resourceType: rType}, nil
-}
-
-func parseBulkPath(rawPath string) (string, uuid.UUID, error) {
-	target, err := parseBulkTarget(rawPath, true)
-	if err != nil {
-		return "", uuid.Nil, err
-	}
-	switch target.resourceType {
-	case bulkResourceUsers:
-		return "Users", target.id, nil
-	case bulkResourceGroups:
-		return "Groups", target.id, nil
-	default:
-		return "", target.id, nil
-	}
 }
 
 func resolveBulkIdReferences(path string, bulkIdMap map[string]string) string {

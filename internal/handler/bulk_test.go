@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -97,7 +98,7 @@ func TestNormalizeBulkPath(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			path, _, err := normalizeBulkPath(tc.input)
+			segments, err := normalizeBulkPath(tc.input)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("normalizeBulkPath(%q) expected error, got nil", tc.input)
@@ -113,6 +114,10 @@ func TestNormalizeBulkPath(t *testing.T) {
 			} else {
 				if err != nil {
 					t.Fatalf("normalizeBulkPath(%q) unexpected error: %v", tc.input, err)
+				}
+				var path string
+				if len(segments) > 0 {
+					path = "/" + strings.Join(segments, "/")
 				}
 				if path != tc.expectedPath {
 					t.Errorf("normalizeBulkPath(%q) = %q; want %q", tc.input, path, tc.expectedPath)
@@ -223,67 +228,67 @@ func TestParseBulkTarget_Post(t *testing.T) {
 	}
 }
 
-func TestParseBulkPath(t *testing.T) {
+func TestParseBulkTarget_Item(t *testing.T) {
 	validUUID := uuid.New()
 	validUUIDStr := validUUID.String()
 
 	tests := []struct {
 		name         string
 		path         string
-		wantType     string
+		wantType     bulkResourceType
 		wantID       uuid.UUID
 		wantErr      bool
 		wantScimType string
 		wantStatus   int
 	}{
 		{
-			name:       "valid Users path canonical",
-			path:       "/Users/" + validUUIDStr,
-			wantType:   "Users",
-			wantID:     validUUID,
-			wantErr:    false,
+			name:     "valid Users path canonical",
+			path:     "/Users/" + validUUIDStr,
+			wantType: bulkResourceUsers,
+			wantID:   validUUID,
+			wantErr:  false,
 		},
 		{
-			name:       "valid Users path double slash",
-			path:       "//Users/" + validUUIDStr,
-			wantType:   "Users",
-			wantID:     validUUID,
-			wantErr:    false,
+			name:     "valid Users path double slash",
+			path:     "//Users/" + validUUIDStr,
+			wantType: bulkResourceUsers,
+			wantID:   validUUID,
+			wantErr:  false,
 		},
 		{
-			name:       "valid Users path no leading slash",
-			path:       "Users/" + validUUIDStr,
-			wantType:   "Users",
-			wantID:     validUUID,
-			wantErr:    false,
+			name:     "valid Users path no leading slash",
+			path:     "Users/" + validUUIDStr,
+			wantType: bulkResourceUsers,
+			wantID:   validUUID,
+			wantErr:  false,
 		},
 		{
-			name:       "valid Users path lowercase",
-			path:       "/users/" + validUUIDStr,
-			wantType:   "Users",
-			wantID:     validUUID,
-			wantErr:    false,
+			name:     "valid Users path lowercase",
+			path:     "/users/" + validUUIDStr,
+			wantType: bulkResourceUsers,
+			wantID:   validUUID,
+			wantErr:  false,
 		},
 		{
-			name:       "valid Groups path canonical",
-			path:       "/Groups/" + validUUIDStr,
-			wantType:   "Groups",
-			wantID:     validUUID,
-			wantErr:    false,
+			name:     "valid Groups path canonical",
+			path:     "/Groups/" + validUUIDStr,
+			wantType: bulkResourceGroups,
+			wantID:   validUUID,
+			wantErr:  false,
 		},
 		{
-			name:       "valid Groups path double slash",
-			path:       "//Groups/" + validUUIDStr,
-			wantType:   "Groups",
-			wantID:     validUUID,
-			wantErr:    false,
+			name:     "valid Groups path double slash",
+			path:     "//Groups/" + validUUIDStr,
+			wantType: bulkResourceGroups,
+			wantID:   validUUID,
+			wantErr:  false,
 		},
 		{
-			name:       "valid Groups path lowercase",
-			path:       "/groups/" + validUUIDStr,
-			wantType:   "Groups",
-			wantID:     validUUID,
-			wantErr:    false,
+			name:     "valid Groups path lowercase",
+			path:     "/groups/" + validUUIDStr,
+			wantType: bulkResourceGroups,
+			wantID:   validUUID,
+			wantErr:  false,
 		},
 		{
 			name:         "missing ID in Users path",
@@ -328,6 +333,20 @@ func TestParseBulkPath(t *testing.T) {
 			wantStatus:   400,
 		},
 		{
+			name:         "UUID with braces rejected",
+			path:         "/Users/{" + validUUIDStr + "}",
+			wantErr:      true,
+			wantScimType: "invalidValue",
+			wantStatus:   400,
+		},
+		{
+			name:         "URN UUID format rejected",
+			path:         "/Users/urn:uuid:" + validUUIDStr,
+			wantErr:      true,
+			wantScimType: "invalidValue",
+			wantStatus:   400,
+		},
+		{
 			name:         "traversal path rejected",
 			path:         "/Users/../Groups/" + validUUIDStr,
 			wantErr:      true,
@@ -338,31 +357,31 @@ func TestParseBulkPath(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resType, id, err := parseBulkPath(tc.path)
+			target, err := parseBulkTarget(tc.path, true)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("parseBulkPath(%q) expected error, got nil", tc.path)
+					t.Fatalf("parseBulkTarget(%q, true) expected error, got nil", tc.path)
 				}
 				var scimErr *scim.ScimError
 				if errors.As(err, &scimErr) {
 					if scimErr.Status != tc.wantStatus {
-						t.Errorf("parseBulkPath(%q) status = %d; want %d", tc.path, scimErr.Status, tc.wantStatus)
+						t.Errorf("parseBulkTarget(%q, true) status = %d; want %d", tc.path, scimErr.Status, tc.wantStatus)
 					}
 					if scimErr.ScimType != tc.wantScimType {
-						t.Errorf("parseBulkPath(%q) scimType = %q; want %q", tc.path, scimErr.ScimType, tc.wantScimType)
+						t.Errorf("parseBulkTarget(%q, true) scimType = %q; want %q", tc.path, scimErr.ScimType, tc.wantScimType)
 					}
 				} else {
-					t.Errorf("parseBulkPath(%q) error is not a ScimError: %v", tc.path, err)
+					t.Errorf("parseBulkTarget(%q, true) error is not a ScimError: %v", tc.path, err)
 				}
 			} else {
 				if err != nil {
-					t.Fatalf("parseBulkPath(%q) unexpected error: %v", tc.path, err)
+					t.Fatalf("parseBulkTarget(%q, true) unexpected error: %v", tc.path, err)
 				}
-				if resType != tc.wantType {
-					t.Errorf("parseBulkPath(%q) resourceType = %q; want %q", tc.path, resType, tc.wantType)
+				if target.resourceType != tc.wantType {
+					t.Errorf("parseBulkTarget(%q, true) resourceType = %v; want %v", tc.path, target.resourceType, tc.wantType)
 				}
-				if id != tc.wantID {
-					t.Errorf("parseBulkPath(%q) id = %v; want %v", tc.path, id, tc.wantID)
+				if target.id != tc.wantID {
+					t.Errorf("parseBulkTarget(%q, true) id = %v; want %v", tc.path, target.id, tc.wantID)
 				}
 			}
 		})

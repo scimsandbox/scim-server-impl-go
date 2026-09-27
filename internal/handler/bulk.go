@@ -122,7 +122,7 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 func (h *BulkHandler) processOperation(r *http.Request, op map[string]any, wsID uuid.UUID, bulkIdMap map[string]string) map[string]any {
 	rawMethod, _ := op["method"].(string)
 	method := strings.ToUpper(rawMethod)
-	path, _ := op["path"].(string)
+	opPath, _ := op["path"].(string)
 	bulkId, _ := op["bulkId"].(string)
 	data, _ := op["data"].(map[string]any)
 
@@ -134,15 +134,15 @@ func (h *BulkHandler) processOperation(r *http.Request, op map[string]any, wsID 
 
 	defer func() {
 		if rv := recover(); rv != nil {
-			slog.Error("panic in bulk operation", "method", method, "path", path, "error", rv)
+			slog.Error("panic in bulk operation", "method", method, "path", opPath, "error", rv)
 			result["status"] = "500"
 			result["response"] = buildBulkError("500", "", "Internal server error")
 		}
 	}()
 
 	// Resolve bulkId references
-	if path != "" {
-		path = resolveBulkIdReferences(path, bulkIdMap)
+	if opPath != "" {
+		opPath = resolveBulkIdReferences(opPath, bulkIdMap)
 	}
 	if data != nil {
 		data = resolveBulkIdInData(data, bulkIdMap)
@@ -152,13 +152,13 @@ func (h *BulkHandler) processOperation(r *http.Request, op map[string]any, wsID 
 
 	switch method {
 	case "POST":
-		h.handleBulkPost(r, result, path, data, wsID, baseURL, bulkId, bulkIdMap)
+		h.handleBulkPost(r, result, opPath, data, wsID, baseURL, bulkId, bulkIdMap)
 	case "PUT":
-		h.handleBulkPut(r, result, path, data, wsID, baseURL)
+		h.handleBulkPut(r, result, opPath, data, wsID, baseURL)
 	case "PATCH":
-		h.handleBulkPatch(r, result, path, data, wsID, baseURL)
+		h.handleBulkPatch(r, result, opPath, data, wsID, baseURL)
 	case "DELETE":
-		h.handleBulkDelete(r, result, path, wsID)
+		h.handleBulkDelete(r, result, opPath, wsID)
 	default:
 		result["status"] = "400"
 		result["response"] = buildBulkError("400", "invalidValue", "Unsupported method: "+method)
@@ -167,8 +167,15 @@ func (h *BulkHandler) processOperation(r *http.Request, op map[string]any, wsID 
 	return result
 }
 
-func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, path string, data map[string]any, wsID uuid.UUID, baseURL string, bulkId string, bulkIdMap map[string]string) {
-	if strings.HasPrefix(path, "/Users") {
+func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, rawPath string, data map[string]any, wsID uuid.UUID, baseURL string, bulkId string, bulkIdMap map[string]string) {
+	target, err := parseBulkTarget(rawPath, false)
+	if err != nil {
+		setBulkError(result, err)
+		return
+	}
+
+	switch target.resourceType {
+	case bulkResourceUsers:
 		user, err := h.createUserInternal(r, wsID, data)
 		if err != nil {
 			setBulkError(result, err)
@@ -179,7 +186,7 @@ func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, pat
 		if bulkId != "" {
 			bulkIdMap[bulkId] = user.String()
 		}
-	} else if strings.HasPrefix(path, "/Groups") {
+	case bulkResourceGroups:
 		group, err := h.createGroupInternal(r, wsID, data)
 		if err != nil {
 			setBulkError(result, err)
@@ -190,41 +197,38 @@ func (h *BulkHandler) handleBulkPost(r *http.Request, result map[string]any, pat
 		if bulkId != "" {
 			bulkIdMap[bulkId] = group.String()
 		}
-	} else {
-		result["status"] = "400"
-		result["response"] = buildBulkError("400", "invalidValue", "Unknown resource path: "+path)
 	}
 }
 
-func (h *BulkHandler) handleBulkPut(r *http.Request, result map[string]any, path string, data map[string]any, wsID uuid.UUID, baseURL string) {
-	resourceType, resourceID, err := parseBulkPath(path)
+func (h *BulkHandler) handleBulkPut(r *http.Request, result map[string]any, rawPath string, data map[string]any, wsID uuid.UUID, baseURL string) {
+	target, err := parseBulkTarget(rawPath, true)
 	if err != nil {
 		setBulkError(result, err)
 		return
 	}
 
-	switch resourceType {
-	case "Users":
-		err := h.replaceUserInternal(r, wsID, resourceID, data)
+	switch target.resourceType {
+	case bulkResourceUsers:
+		err := h.replaceUserInternal(r, wsID, target.id, data)
 		if err != nil {
 			setBulkError(result, err)
 			return
 		}
 		result["status"] = "200"
-		result["location"] = baseURL + userCollectionPath + resourceID.String()
-	case "Groups":
-		err := h.replaceGroupInternal(r, wsID, resourceID, data)
+		result["location"] = baseURL + userCollectionPath + target.id.String()
+	case bulkResourceGroups:
+		err := h.replaceGroupInternal(r, wsID, target.id, data)
 		if err != nil {
 			setBulkError(result, err)
 			return
 		}
 		result["status"] = "200"
-		result["location"] = baseURL + groupCollectionPath + resourceID.String()
+		result["location"] = baseURL + groupCollectionPath + target.id.String()
 	}
 }
 
-func (h *BulkHandler) handleBulkPatch(r *http.Request, result map[string]any, path string, data map[string]any, wsID uuid.UUID, baseURL string) {
-	resourceType, resourceID, err := parseBulkPath(path)
+func (h *BulkHandler) handleBulkPatch(r *http.Request, result map[string]any, rawPath string, data map[string]any, wsID uuid.UUID, baseURL string) {
+	target, err := parseBulkTarget(rawPath, true)
 	if err != nil {
 		setBulkError(result, err)
 		return
@@ -238,43 +242,43 @@ func (h *BulkHandler) handleBulkPatch(r *http.Request, result map[string]any, pa
 		}
 	}
 
-	switch resourceType {
-	case "Users":
-		err := h.patchUserInternal(r, wsID, resourceID, operations)
+	switch target.resourceType {
+	case bulkResourceUsers:
+		err := h.patchUserInternal(r, wsID, target.id, operations)
 		if err != nil {
 			setBulkError(result, err)
 			return
 		}
 		result["status"] = "200"
-		result["location"] = baseURL + userCollectionPath + resourceID.String()
-	case "Groups":
-		err := h.patchGroupInternal(r, wsID, resourceID, operations)
+		result["location"] = baseURL + userCollectionPath + target.id.String()
+	case bulkResourceGroups:
+		err := h.patchGroupInternal(r, wsID, target.id, operations)
 		if err != nil {
 			setBulkError(result, err)
 			return
 		}
 		result["status"] = "200"
-		result["location"] = baseURL + groupCollectionPath + resourceID.String()
+		result["location"] = baseURL + groupCollectionPath + target.id.String()
 	}
 }
 
-func (h *BulkHandler) handleBulkDelete(r *http.Request, result map[string]any, path string, wsID uuid.UUID) {
-	resourceType, resourceID, err := parseBulkPath(path)
+func (h *BulkHandler) handleBulkDelete(r *http.Request, result map[string]any, rawPath string, wsID uuid.UUID) {
+	target, err := parseBulkTarget(rawPath, true)
 	if err != nil {
 		setBulkError(result, err)
 		return
 	}
 
-	switch resourceType {
-	case "Users":
-		err := h.deleteUserInternal(r, wsID, resourceID)
+	switch target.resourceType {
+	case bulkResourceUsers:
+		err := h.deleteUserInternal(r, wsID, target.id)
 		if err != nil {
 			setBulkError(result, err)
 			return
 		}
 		result["status"] = "204"
-	case "Groups":
-		err := h.deleteGroupInternal(r, wsID, resourceID)
+	case bulkResourceGroups:
+		err := h.deleteGroupInternal(r, wsID, target.id)
 		if err != nil {
 			setBulkError(result, err)
 			return
@@ -536,19 +540,107 @@ func (h *BulkHandler) deleteGroupInternal(r *http.Request, wsID, groupID uuid.UU
 
 // Helpers
 
-func parseBulkPath(path string) (string, uuid.UUID, error) {
-	cleaned := strings.TrimPrefix(path, "/")
-	parts := strings.SplitN(cleaned, "/", 2)
-	if len(parts) < 2 {
-		return "", uuid.Nil, &scim.ScimError{Status: 400, ScimType: "invalidPath",
-			Detail: "Bulk path must include resource ID: " + path}
+type bulkResourceType int
+
+const (
+	bulkResourceUnknown bulkResourceType = iota
+	bulkResourceUsers
+	bulkResourceGroups
+)
+
+type bulkPathTarget struct {
+	resourceType bulkResourceType
+	id           uuid.UUID
+}
+
+func normalizeBulkPath(rawPath string) ([]string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return nil, nil
 	}
-	id, err := uuid.Parse(parts[1])
+	stripped := strings.Trim(trimmed, "/")
+	if stripped == "" {
+		return []string{}, nil
+	}
+	rawSegments := strings.Split(stripped, "/")
+	segments := make([]string, 0, len(rawSegments))
+	for _, seg := range rawSegments {
+		if seg == "" {
+			continue // collapse multiple consecutive slashes
+		}
+		if seg == "." || seg == ".." {
+			return nil, &scim.ScimError{
+				Status:   http.StatusBadRequest,
+				ScimType: "invalidPath",
+				Detail:   "Path traversal segments ('.' or '..') are not allowed: " + rawPath,
+			}
+		}
+		segments = append(segments, seg)
+	}
+	return segments, nil
+}
+
+func parseBulkTarget(rawPath string, isItemRequired bool) (*bulkPathTarget, error) {
+	segments, err := normalizeBulkPath(rawPath)
 	if err != nil {
-		return "", uuid.Nil, &scim.ScimError{Status: 400, ScimType: "invalidValue",
-			Detail: "Invalid resource ID: " + parts[1]}
+		return nil, err
 	}
-	return parts[0], id, nil
+	if len(segments) == 0 {
+		return nil, &scim.ScimError{
+			Status:   http.StatusBadRequest,
+			ScimType: "invalidPath",
+			Detail:   "Bulk path cannot be empty: " + rawPath,
+		}
+	}
+
+	var rType bulkResourceType
+	if strings.EqualFold(segments[0], "Users") {
+		rType = bulkResourceUsers
+	} else if strings.EqualFold(segments[0], "Groups") {
+		rType = bulkResourceGroups
+	} else {
+		return nil, &scim.ScimError{
+			Status:   http.StatusBadRequest,
+			ScimType: "invalidValue",
+			Detail:   "Unknown resource path: " + rawPath,
+		}
+	}
+
+	if isItemRequired {
+		if len(segments) != 2 || segments[1] == "" {
+			return nil, &scim.ScimError{
+				Status:   http.StatusBadRequest,
+				ScimType: "invalidPath",
+				Detail:   "Bulk path must include resource ID: " + rawPath,
+			}
+		}
+		if len(segments[1]) != 36 {
+			return nil, &scim.ScimError{
+				Status:   http.StatusBadRequest,
+				ScimType: "invalidValue",
+				Detail:   "Invalid resource ID: " + segments[1],
+			}
+		}
+		id, err := uuid.Parse(segments[1])
+		if err != nil {
+			return nil, &scim.ScimError{
+				Status:   http.StatusBadRequest,
+				ScimType: "invalidValue",
+				Detail:   "Invalid resource ID: " + segments[1],
+			}
+		}
+		return &bulkPathTarget{resourceType: rType, id: id}, nil
+	}
+
+	if len(segments) != 1 {
+		return nil, &scim.ScimError{
+			Status:   http.StatusBadRequest,
+			ScimType: "invalidPath",
+			Detail:   "Bulk POST must specify a resource type endpoint: " + rawPath,
+		}
+	}
+
+	return &bulkPathTarget{resourceType: rType}, nil
 }
 
 func resolveBulkIdReferences(path string, bulkIdMap map[string]string) string {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -175,9 +176,15 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
 
+	var cleanupWg sync.WaitGroup
+
 	// Workspace cleanup scheduler
 	if cfg.Cleanup.Enabled {
-		go cleanupService.Start(serverCtx, cfg.Cleanup.Interval, cfg.Cleanup.StaleAfter)
+		cleanupWg.Add(1)
+		go func() {
+			defer cleanupWg.Done()
+			cleanupService.Start(serverCtx, cfg.Cleanup.Interval, cfg.Cleanup.StaleAfter)
+		}()
 	}
 
 	// Request log cleanup scheduler
@@ -191,7 +198,11 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		cfg.Cleanup.RequestLogs.MaxCount,
 	)
 	if requestLogsEnabled {
-		go requestLogCleanupService.Start(serverCtx)
+		cleanupWg.Add(1)
+		go func() {
+			defer cleanupWg.Done()
+			requestLogCleanupService.Start(serverCtx)
+		}()
 	}
 
 	apiHandler := httpapi.New(apiRouter, httpapi.Config{
@@ -250,6 +261,7 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	}
 
 	cancelServer()
+	cleanupWg.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()

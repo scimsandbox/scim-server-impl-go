@@ -102,34 +102,34 @@ func TestRequestLogCleanupService_Constructor_And_Defaults(t *testing.T) {
 	if svc == nil {
 		t.Fatal("NewRequestLogCleanupService() returned nil")
 	}
-	if !svc.Enabled() {
-		t.Fatal("svc.Enabled() = false, want true")
+	if !svc.enabled {
+		t.Fatal("svc.enabled = false, want true")
 	}
-	if svc.Interval() != DefaultRequestLogCleanupInterval {
-		t.Fatalf("svc.Interval() = %v, want default %v", svc.Interval(), DefaultRequestLogCleanupInterval)
+	if svc.interval != DefaultRequestLogCleanupInterval {
+		t.Fatalf("svc.interval = %v, want default %v", svc.interval, DefaultRequestLogCleanupInterval)
 	}
-	if svc.MaxCount() != DefaultRequestLogCleanupMaxCount {
-		t.Fatalf("svc.MaxCount() = %d, want default %d", svc.MaxCount(), DefaultRequestLogCleanupMaxCount)
+	if svc.maxCount != DefaultRequestLogCleanupMaxCount {
+		t.Fatalf("svc.maxCount = %d, want default %d", svc.maxCount, DefaultRequestLogCleanupMaxCount)
 	}
 
 	// Test custom values and non-positive overrides via constructor
 	customSvc := NewRequestLogCleanupService(nil, nil, logger, false, 2*time.Hour, 500)
-	if customSvc.Enabled() {
-		t.Fatal("customSvc.Enabled() = true, want false")
+	if customSvc.enabled {
+		t.Fatal("customSvc.enabled = true, want false")
 	}
-	if customSvc.Interval() != 2*time.Hour {
-		t.Fatalf("customSvc.Interval() = %v, want 2h", customSvc.Interval())
+	if customSvc.interval != 2*time.Hour {
+		t.Fatalf("customSvc.interval = %v, want 2h", customSvc.interval)
 	}
-	if customSvc.MaxCount() != 500 {
-		t.Fatalf("customSvc.MaxCount() = %d, want 500", customSvc.MaxCount())
+	if customSvc.maxCount != 500 {
+		t.Fatalf("customSvc.maxCount = %d, want 500", customSvc.maxCount)
 	}
 
 	nonPositiveSvc := NewRequestLogCleanupService(nil, nil, logger, true, -1, -1)
-	if nonPositiveSvc.Interval() != DefaultRequestLogCleanupInterval {
-		t.Fatalf("nonPositiveSvc.Interval() = %v after negative, want default", nonPositiveSvc.Interval())
+	if nonPositiveSvc.interval != DefaultRequestLogCleanupInterval {
+		t.Fatalf("nonPositiveSvc.interval = %v after negative, want default", nonPositiveSvc.interval)
 	}
-	if nonPositiveSvc.MaxCount() != DefaultRequestLogCleanupMaxCount {
-		t.Fatalf("nonPositiveSvc.MaxCount() = %d after negative, want default", nonPositiveSvc.MaxCount())
+	if nonPositiveSvc.maxCount != DefaultRequestLogCleanupMaxCount {
+		t.Fatalf("nonPositiveSvc.maxCount = %d after negative, want default", nonPositiveSvc.maxCount)
 	}
 }
 

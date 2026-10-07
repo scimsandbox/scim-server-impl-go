@@ -67,21 +67,6 @@ func NewRequestLogCleanupService(
 	}
 }
 
-// Enabled returns whether cleanup is enabled.
-func (s *RequestLogCleanupService) Enabled() bool {
-	return s.enabled
-}
-
-// Interval returns the cleanup interval.
-func (s *RequestLogCleanupService) Interval() time.Duration {
-	return s.interval
-}
-
-// MaxCount returns the maximum log count retained per workspace.
-func (s *RequestLogCleanupService) MaxCount() int {
-	return s.maxCount
-}
-
 // Start runs the periodic request log cleanup loop on time.NewTicker(s.interval).
 // An initial cleanup cycle runs immediately on startup. It terminates cleanly when ctx is cancelled.
 func (s *RequestLogCleanupService) Start(ctx context.Context) {

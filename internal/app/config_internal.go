@@ -3,9 +3,13 @@ package app
 import (
 	"fmt"
 	"strings"
+
+	"github.com/scimsandbox/scim-server-impl-go/internal/service"
 )
 
-const defaultManagementPort = 9090
+const (
+	defaultManagementPort = 9090
+)
 
 func resolveDSN(cfg Config) string {
 	dsn := cfg.Storage.DSN
@@ -41,12 +45,31 @@ func printableConfig(cfg Config) Config {
 	return masked
 }
 
+func applyConfigDefaults(cfg *Config) {
+	if cfg.Cleanup.RequestLogs.Enabled == nil {
+		defaultEnabled := true
+		cfg.Cleanup.RequestLogs.Enabled = &defaultEnabled
+	}
+	if cfg.Cleanup.RequestLogs.Interval == 0 {
+		cfg.Cleanup.RequestLogs.Interval = service.DefaultRequestLogCleanupInterval
+	}
+	if cfg.Cleanup.RequestLogs.MaxCount == 0 {
+		cfg.Cleanup.RequestLogs.MaxCount = service.DefaultRequestLogCleanupMaxCount
+	}
+}
+
 func validateConfig(cfg Config) error {
 	if cfg.RateLimit.Enabled && cfg.RateLimit.RequestsPerSecond <= 0 {
 		return fmt.Errorf("rate_limit.requests_per_second must be greater than 0 when rate limiting is enabled")
 	}
 	if cfg.RateLimit.WaitTimeout < 0 {
 		return fmt.Errorf("rate_limit.wait_timeout must be greater than or equal to 0")
+	}
+	if cfg.Cleanup.RequestLogs.Interval <= 0 {
+		return fmt.Errorf("cleanup.request_logs.interval must be greater than 0")
+	}
+	if cfg.Cleanup.RequestLogs.MaxCount <= 0 {
+		return fmt.Errorf("cleanup.request_logs.max_count must be greater than 0")
 	}
 
 	return nil

@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,4 +86,80 @@ func (r *RequestLogRepository) Create(ctx context.Context, log *model.ScimReques
 		log.ID, log.WorkspaceID, log.HttpMethod, log.RequestPath, log.HttpStatus,
 		log.RequestBody, log.ResponseBody, log.CreatedAt)
 	return err
+}
+
+const DefaultPruneBatchSize = 5000
+
+// DeleteOldLogsForWorkspace deletes excess request logs for a workspace beyond the most recent maxCount.
+// It executes in batches of DefaultPruneBatchSize to prevent long-lived locks and large WAL spikes.
+// maxCount must be greater than 0; passing <= 0 returns an error to prevent accidental total deletion.
+func (r *RequestLogRepository) DeleteOldLogsForWorkspace(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
+	if maxCount <= 0 {
+		return 0, fmt.Errorf("maxCount must be greater than 0: %d", maxCount)
+	}
+
+	var totalDeleted int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+
+		tag, err := jdbc.ExecContext(ctx,
+			`DELETE FROM scim_request_logs 
+			 WHERE workspace_id = $1 
+			   AND id IN (
+			     SELECT id FROM scim_request_logs 
+			     WHERE workspace_id = $1 
+			     ORDER BY created_at DESC, id DESC 
+			     OFFSET $2 
+			     LIMIT $3
+			   )`,
+			workspaceID, maxCount, DefaultPruneBatchSize)
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		rows, err := tag.RowsAffected()
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += rows
+
+		if rows < DefaultPruneBatchSize {
+			break
+		}
+	}
+
+	return totalDeleted, nil
+}
+
+// ListWorkspaceIDsExceedingLogCount returns the IDs of all workspaces having more than maxCount request logs.
+// maxCount must be greater than 0; passing <= 0 returns an error.
+func (r *RequestLogRepository) ListWorkspaceIDsExceedingLogCount(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+	if maxCount <= 0 {
+		return nil, fmt.Errorf("maxCount must be greater than 0: %d", maxCount)
+	}
+
+	rows, err := jdbc.QueryContext(ctx,
+		`SELECT workspace_id 
+		 FROM scim_request_logs 
+		 GROUP BY workspace_id 
+		 HAVING count(*) > $1`, maxCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }

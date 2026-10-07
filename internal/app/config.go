@@ -42,9 +42,16 @@ type StorageConfig struct {
 }
 
 type CleanupConfig struct {
-	Enabled    bool          `yaml:"enabled" env:"GO_CLEANUP_ENABLED"`
-	Interval   time.Duration `yaml:"interval" env:"GO_CLEANUP_INTERVAL"`
-	StaleAfter time.Duration `yaml:"stale_after" env:"GO_CLEANUP_STALE_AFTER"`
+	Enabled     bool                     `yaml:"enabled" env:"GO_CLEANUP_ENABLED"`
+	Interval    time.Duration            `yaml:"interval" env:"GO_CLEANUP_INTERVAL"`
+	StaleAfter  time.Duration            `yaml:"stale_after" env:"GO_CLEANUP_STALE_AFTER"`
+	RequestLogs CleanupRequestLogsConfig `yaml:"request_logs"`
+}
+
+type CleanupRequestLogsConfig struct {
+	Enabled  *bool         `yaml:"enabled" env:"GO_CLEANUP_REQUEST_LOGS_ENABLED"`
+	Interval time.Duration `yaml:"interval" env:"GO_CLEANUP_REQUEST_LOGS_INTERVAL"`
+	MaxCount int           `yaml:"max_count" env:"GO_CLEANUP_REQUEST_LOGS_MAX_COUNT"`
 }
 
 type LoggingConfig struct {

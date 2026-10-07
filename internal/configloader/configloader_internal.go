@@ -281,6 +281,20 @@ func setValue(field reflect.Value, raw string) error {
 		return nil
 	}
 
+	if field.Kind() == reflect.Pointer {
+		elemType := field.Type().Elem()
+		if elemType.Kind() == reflect.Bool {
+			value, err := strconv.ParseBool(raw)
+			if err != nil {
+				return err
+			}
+			newVal := reflect.New(elemType)
+			newVal.Elem().SetBool(value)
+			field.Set(newVal)
+			return nil
+		}
+	}
+
 	switch field.Kind() {
 	case reflect.String:
 		field.SetString(raw)

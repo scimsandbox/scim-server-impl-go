@@ -21,6 +21,10 @@ cleanup:
   enabled: true
   interval: 2h
   stale_after: 2160h
+  request_logs:
+    enabled: true
+    interval: 1h
+    max_count: 10000
 logging:
   level: "info"
 messages:

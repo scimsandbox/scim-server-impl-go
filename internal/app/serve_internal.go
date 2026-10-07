@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -172,9 +173,35 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		})
 	})
 
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+
+	var cleanupWg sync.WaitGroup
+
 	// Workspace cleanup scheduler
 	if cfg.Cleanup.Enabled {
-		go cleanupService.Start(context.Background(), cfg.Cleanup.Interval, cfg.Cleanup.StaleAfter)
+		cleanupWg.Add(1)
+		go func() {
+			defer cleanupWg.Done()
+			cleanupService.Start(serverCtx, cfg.Cleanup.Interval, cfg.Cleanup.StaleAfter)
+		}()
+	}
+
+	// Request log cleanup scheduler
+	requestLogsEnabled := cfg.Cleanup.Enabled && (cfg.Cleanup.RequestLogs.Enabled != nil && *cfg.Cleanup.RequestLogs.Enabled)
+	requestLogCleanupService := service.NewRequestLogCleanupService(
+		requestLogRepo,
+		logger,
+		requestLogsEnabled,
+		cfg.Cleanup.RequestLogs.Interval,
+		cfg.Cleanup.RequestLogs.MaxCount,
+	)
+	if requestLogsEnabled {
+		cleanupWg.Add(1)
+		go func() {
+			defer cleanupWg.Done()
+			requestLogCleanupService.Start(serverCtx)
+		}()
 	}
 
 	apiHandler := httpapi.New(apiRouter, httpapi.Config{
@@ -231,6 +258,9 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	case runErr = <-serverErrors:
 		logger.Error("server error", logging.Error(runErr))
 	}
+
+	cancelServer()
+	cleanupWg.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()

@@ -172,9 +172,25 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		})
 	})
 
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+
 	// Workspace cleanup scheduler
 	if cfg.Cleanup.Enabled {
-		go cleanupService.Start(context.Background(), cfg.Cleanup.Interval, cfg.Cleanup.StaleAfter)
+		go cleanupService.Start(serverCtx, cfg.Cleanup.Interval, cfg.Cleanup.StaleAfter)
+	}
+
+	// Request log cleanup scheduler
+	requestLogCleanupService := service.NewRequestLogCleanupService(
+		requestLogRepo,
+		workspaceRepo,
+		logger,
+		cfg.Cleanup.RequestLogs.Enabled,
+		cfg.Cleanup.RequestLogs.Interval,
+		cfg.Cleanup.RequestLogs.MaxCount,
+	)
+	if cfg.Cleanup.RequestLogs.Enabled {
+		go requestLogCleanupService.Start(serverCtx)
 	}
 
 	apiHandler := httpapi.New(apiRouter, httpapi.Config{
@@ -231,6 +247,8 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	case runErr = <-serverErrors:
 		logger.Error("server error", logging.Error(runErr))
 	}
+
+	cancelServer()
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()

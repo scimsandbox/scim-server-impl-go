@@ -38,6 +38,7 @@ func loadConfig(lookupEnv LookupEnvFunc) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	applyConfigDefaults(&cfg)
 	if err := validateConfig(cfg); err != nil {
 		return Config{}, err
 	}

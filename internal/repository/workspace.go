@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,6 +30,27 @@ func (r *WorkspaceRepository) FindByID(ctx context.Context, id uuid.UUID) (*mode
 		return nil, err
 	}
 	return &w, nil
+}
+
+func (r *WorkspaceRepository) ListIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := jdbc.QueryContext(ctx, `SELECT id FROM workspaces`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func (r *WorkspaceRepository) TouchUpdatedAt(ctx context.Context, id uuid.UUID) error {
@@ -85,4 +107,17 @@ func (r *RequestLogRepository) Create(ctx context.Context, log *model.ScimReques
 		log.ID, log.WorkspaceID, log.HttpMethod, log.RequestPath, log.HttpStatus,
 		log.RequestBody, log.ResponseBody, log.CreatedAt)
 	return err
+}
+
+func (r *RequestLogRepository) DeleteOldLogsForWorkspace(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
+	if maxCount < 0 {
+		return 0, fmt.Errorf("maxCount must be non-negative: %d", maxCount)
+	}
+	tag, err := jdbc.ExecContext(ctx,
+		`DELETE FROM scim_request_logs WHERE workspace_id = $1 AND id IN (SELECT id FROM scim_request_logs WHERE workspace_id = $1 ORDER BY created_at DESC, id DESC OFFSET $2)`,
+		workspaceID, maxCount)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected()
 }

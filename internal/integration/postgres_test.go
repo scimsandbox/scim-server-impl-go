@@ -246,6 +246,23 @@ func TestRequestLogPruningSQL(t *testing.T) {
 		t.Fatalf("expected 0 deleted when below threshold, got %d", deleted)
 	}
 
+	// Verify ListWorkspaceIDsExceedingLogCount (HAVING count(*) > maxCount)
+	exceeding, err := requestLogRepo.ListWorkspaceIDsExceedingLogCount(ctx, 10)
+	if err != nil {
+		t.Fatalf("list workspaces exceeding 10: %v", err)
+	}
+	if len(exceeding) != 0 {
+		t.Fatalf("expected 0 workspaces exceeding 10, got %d", len(exceeding))
+	}
+
+	exceeding, err = requestLogRepo.ListWorkspaceIDsExceedingLogCount(ctx, 6)
+	if err != nil {
+		t.Fatalf("list workspaces exceeding 6: %v", err)
+	}
+	if len(exceeding) != 1 || exceeding[0] != wsA {
+		t.Fatalf("expected [wsA] exceeding 6, got %v", exceeding)
+	}
+
 	// Case B: Prune excess logs and verify that newest are kept
 	// We want to keep 6 newest (indices 4..9), deleting the 4 oldest (indices 0..3)
 	deleted, err = requestLogRepo.DeleteOldLogsForWorkspace(ctx, wsA, 6)

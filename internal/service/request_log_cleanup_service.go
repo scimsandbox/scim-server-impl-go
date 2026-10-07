@@ -23,6 +23,7 @@ type WorkspaceLister interface {
 
 // RequestLogDeleter defines the log pruning contract needed for cleanup.
 type RequestLogDeleter interface {
+	ListWorkspaceIDsExceedingLogCount(ctx context.Context, maxCount int) ([]uuid.UUID, error)
 	DeleteOldLogsForWorkspace(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error)
 }
 
@@ -99,9 +100,9 @@ func (s *RequestLogCleanupService) Start(ctx context.Context) {
 	}
 }
 
-// CleanupOnce executes a single pruning cycle across all workspaces.
-// It iterates workspaces from WorkspaceRepository.ListIDs and prunes each workspace
-// via RequestLogRepository.DeleteOldLogsForWorkspace.
+// CleanupOnce executes a single pruning cycle across workspaces with excess logs.
+// It queries workspaces exceeding maxCount via RequestLogRepository.ListWorkspaceIDsExceedingLogCount
+// and prunes each candidate workspace via RequestLogRepository.DeleteOldLogsForWorkspace.
 // Between workspaces and at start, ctx.Done() is checked for clean cancellation.
 // Errors during pruning of one workspace are logged and contained without aborting
 // subsequent workspaces.
@@ -113,15 +114,15 @@ func (s *RequestLogCleanupService) CleanupOnce(ctx context.Context) (int64, erro
 		return 0, ctx.Err()
 	}
 
-	workspaceIDs, err := s.workspaceRepo.ListIDs(ctx)
-	if err != nil {
-		s.logger.Error("failed to list workspaces for request log cleanup", logging.Error(err))
-		return 0, err
-	}
-
 	maxCount := s.maxCount
 	if maxCount <= 0 {
 		maxCount = DefaultRequestLogCleanupMaxCount
+	}
+
+	workspaceIDs, err := s.requestLogRepo.ListWorkspaceIDsExceedingLogCount(ctx, maxCount)
+	if err != nil {
+		s.logger.Error("failed to list workspaces for request log cleanup", logging.Error(err))
+		return 0, err
 	}
 
 	var totalDeleted int64

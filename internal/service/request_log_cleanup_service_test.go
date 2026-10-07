@@ -68,9 +68,19 @@ type deletionCall struct {
 }
 
 type mockRequestLogDeleter struct {
-	mu         sync.Mutex
-	deleteFunc func(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error)
-	calls      []deletionCall
+	mu                sync.Mutex
+	deleteFunc        func(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error)
+	listExceedingFunc func(ctx context.Context, maxCount int) ([]uuid.UUID, error)
+	calls             []deletionCall
+}
+
+func (m *mockRequestLogDeleter) ListWorkspaceIDsExceedingLogCount(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listExceedingFunc != nil {
+		return m.listExceedingFunc(ctx, maxCount)
+	}
+	return nil, nil
 }
 
 func (m *mockRequestLogDeleter) DeleteOldLogsForWorkspace(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
@@ -164,14 +174,13 @@ func TestRequestLogCleanupService_Lifecycle_TickerTrigger(t *testing.T) {
 
 	logger := &safeMockLogger{}
 	wsID := uuid.New()
-	wsRepo := &mockWorkspaceLister{
-		listIDsFunc: func(ctx context.Context) ([]uuid.UUID, error) {
-			return []uuid.UUID{wsID}, nil
-		},
-	}
+	wsRepo := &mockWorkspaceLister{}
 
 	var callCount atomic.Int32
 	logRepo := &mockRequestLogDeleter{
+		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+			return []uuid.UUID{wsID}, nil
+		},
 		deleteFunc: func(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
 			callCount.Add(1)
 			return 1, nil
@@ -213,13 +222,12 @@ func TestRequestLogCleanupService_DisabledToggle(t *testing.T) {
 	t.Parallel()
 
 	logger := &safeMockLogger{}
-	wsRepo := &mockWorkspaceLister{
-		listIDsFunc: func(ctx context.Context) ([]uuid.UUID, error) {
-			t.Fatal("ListIDs should not be called when service is disabled")
+	wsRepo := &mockWorkspaceLister{}
+	logRepo := &mockRequestLogDeleter{
+		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+			t.Fatal("ListWorkspaceIDsExceedingLogCount should not be called when service is disabled")
 			return nil, nil
 		},
-	}
-	logRepo := &mockRequestLogDeleter{
 		deleteFunc: func(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
 			t.Fatal("DeleteOldLogsForWorkspace should not be called when service is disabled")
 			return 0, nil
@@ -257,22 +265,19 @@ func TestRequestLogCleanupService_CleanupOnce_Success(t *testing.T) {
 
 	logger := &safeMockLogger{}
 	ws1 := uuid.New()
-	ws2 := uuid.New()
 
-	wsRepo := &mockWorkspaceLister{
-		listIDsFunc: func(ctx context.Context) ([]uuid.UUID, error) {
-			return []uuid.UUID{ws1, ws2}, nil
-		},
-	}
+	wsRepo := &mockWorkspaceLister{}
 
+	// Only ws1 has excess logs; ws2 is under threshold and omitted by listExceedingFunc
 	logRepo := &mockRequestLogDeleter{
+		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+			return []uuid.UUID{ws1}, nil
+		},
 		deleteFunc: func(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
 			if workspaceID == ws1 {
 				return 15, nil
 			}
-			if workspaceID == ws2 {
-				return 0, nil
-			}
+			t.Fatalf("unexpected deletion call for workspace %v", workspaceID)
 			return 0, nil
 		},
 	}
@@ -288,14 +293,11 @@ func TestRequestLogCleanupService_CleanupOnce_Success(t *testing.T) {
 	}
 
 	calls := logRepo.getCalls()
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 deletion calls, got %d", len(calls))
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 deletion call (only ws1), got %d", len(calls))
 	}
 	if calls[0].WorkspaceID != ws1 || calls[0].MaxCount != 10000 {
 		t.Errorf("call[0] mismatch: %+v", calls[0])
-	}
-	if calls[1].WorkspaceID != ws2 || calls[1].MaxCount != 10000 {
-		t.Errorf("call[1] mismatch: %+v", calls[1])
 	}
 
 	if logger.InfoCount() == 0 {
@@ -314,14 +316,13 @@ func TestRequestLogCleanupService_PerWorkspaceIndependence_And_ErrorContainment(
 	ws2 := uuid.New()
 	ws3 := uuid.New()
 
-	wsRepo := &mockWorkspaceLister{
-		listIDsFunc: func(ctx context.Context) ([]uuid.UUID, error) {
-			return []uuid.UUID{ws1, ws2, ws3}, nil
-		},
-	}
+	wsRepo := &mockWorkspaceLister{}
 
 	dbErr := errors.New("database connection reset")
 	logRepo := &mockRequestLogDeleter{
+		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+			return []uuid.UUID{ws1, ws2, ws3}, nil
+		},
 		deleteFunc: func(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
 			switch workspaceID {
 			case ws1:
@@ -356,21 +357,20 @@ func TestRequestLogCleanupService_PerWorkspaceIndependence_And_ErrorContainment(
 	}
 }
 
-func TestRequestLogCleanupService_ListIDs_Error(t *testing.T) {
+func TestRequestLogCleanupService_ListExceedingWorkspaces_Error(t *testing.T) {
 	t.Parallel()
 
 	logger := &safeMockLogger{}
-	expectedErr := errors.New("failed to query workspaces table")
+	expectedErr := errors.New("failed to query request logs table")
 
-	wsRepo := &mockWorkspaceLister{
-		listIDsFunc: func(ctx context.Context) ([]uuid.UUID, error) {
-			return nil, expectedErr
-		},
-	}
+	wsRepo := &mockWorkspaceLister{}
 
 	logRepo := &mockRequestLogDeleter{
+		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+			return nil, expectedErr
+		},
 		deleteFunc: func(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
-			t.Fatal("DeleteOldLogsForWorkspace should not be called when ListIDs fails")
+			t.Fatal("DeleteOldLogsForWorkspace should not be called when ListWorkspaceIDsExceedingLogCount fails")
 			return 0, nil
 		},
 	}
@@ -401,15 +401,14 @@ func TestRequestLogCleanupService_ContextCancelDuringIteration(t *testing.T) {
 	ws2 := uuid.New()
 	ws3 := uuid.New()
 
-	wsRepo := &mockWorkspaceLister{
-		listIDsFunc: func(ctx context.Context) ([]uuid.UUID, error) {
-			return []uuid.UUID{ws1, ws2, ws3}, nil
-		},
-	}
+	wsRepo := &mockWorkspaceLister{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	logRepo := &mockRequestLogDeleter{
+		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+			return []uuid.UUID{ws1, ws2, ws3}, nil
+		},
 		deleteFunc: func(c context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
 			if workspaceID == ws1 {
 				cancel() // Cancel context during ws1 processing

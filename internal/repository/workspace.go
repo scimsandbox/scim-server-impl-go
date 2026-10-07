@@ -153,3 +153,34 @@ func (r *RequestLogRepository) DeleteOldLogsForWorkspace(ctx context.Context, wo
 
 	return totalDeleted, nil
 }
+
+// ListWorkspaceIDsExceedingLogCount returns the IDs of all workspaces having more than maxCount request logs.
+// maxCount must be greater than 0; passing <= 0 returns an error.
+func (r *RequestLogRepository) ListWorkspaceIDsExceedingLogCount(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+	if maxCount <= 0 {
+		return nil, fmt.Errorf("maxCount must be greater than 0: %d", maxCount)
+	}
+
+	rows, err := jdbc.QueryContext(ctx,
+		`SELECT workspace_id 
+		 FROM scim_request_logs 
+		 GROUP BY workspace_id 
+		 HAVING count(*) > $1`, maxCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}

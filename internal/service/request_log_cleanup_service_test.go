@@ -10,7 +10,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/logging"
-	"github.com/scimsandbox/scim-server-impl-go/internal/repository"
 )
 
 // safeMockLogger is a thread-safe mock implementation of logging.Logger.
@@ -113,28 +112,24 @@ func TestRequestLogCleanupService_Constructor_And_Defaults(t *testing.T) {
 		t.Fatalf("svc.MaxCount() = %d, want default %d", svc.MaxCount(), DefaultRequestLogCleanupMaxCount)
 	}
 
-	// Test setters
-	svc.SetEnabled(false)
-	if svc.Enabled() {
-		t.Fatal("svc.Enabled() = true after SetEnabled(false)")
+	// Test custom values and non-positive overrides via constructor
+	customSvc := NewRequestLogCleanupService(nil, nil, logger, false, 2*time.Hour, 500)
+	if customSvc.Enabled() {
+		t.Fatal("customSvc.Enabled() = true, want false")
+	}
+	if customSvc.Interval() != 2*time.Hour {
+		t.Fatalf("customSvc.Interval() = %v, want 2h", customSvc.Interval())
+	}
+	if customSvc.MaxCount() != 500 {
+		t.Fatalf("customSvc.MaxCount() = %d, want 500", customSvc.MaxCount())
 	}
 
-	svc.SetInterval(2 * time.Hour)
-	if svc.Interval() != 2*time.Hour {
-		t.Fatalf("svc.Interval() = %v, want 2h", svc.Interval())
+	nonPositiveSvc := NewRequestLogCleanupService(nil, nil, logger, true, -1, -1)
+	if nonPositiveSvc.Interval() != DefaultRequestLogCleanupInterval {
+		t.Fatalf("nonPositiveSvc.Interval() = %v after negative, want default", nonPositiveSvc.Interval())
 	}
-	svc.SetInterval(-1)
-	if svc.Interval() != DefaultRequestLogCleanupInterval {
-		t.Fatalf("svc.Interval() = %v after negative, want default", svc.Interval())
-	}
-
-	svc.SetMaxCount(500)
-	if svc.MaxCount() != 500 {
-		t.Fatalf("svc.MaxCount() = %d, want 500", svc.MaxCount())
-	}
-	svc.SetMaxCount(-1)
-	if svc.MaxCount() != DefaultRequestLogCleanupMaxCount {
-		t.Fatalf("svc.MaxCount() = %d after negative, want default", svc.MaxCount())
+	if nonPositiveSvc.MaxCount() != DefaultRequestLogCleanupMaxCount {
+		t.Fatalf("nonPositiveSvc.MaxCount() = %d after negative, want default", nonPositiveSvc.MaxCount())
 	}
 }
 
@@ -460,19 +455,5 @@ func TestRequestLogCleanupService_ContextAlreadyCancelled(t *testing.T) {
 	}
 	if deleted != 0 {
 		t.Fatalf("CleanupOnce() deleted = %d, want 0", deleted)
-	}
-}
-
-func TestRequestLogCleanupService_WithRealRepositoriesTypeCheck(t *testing.T) {
-	t.Parallel()
-
-	// Verifies that concrete repository types from internal/repository are accepted
-	workspaceRepo := repository.NewWorkspaceRepository()
-	requestLogRepo := repository.NewRequestLogRepository()
-	logger := &safeMockLogger{}
-
-	svc := NewRequestLogCleanupService(requestLogRepo, workspaceRepo, logger, true, time.Hour, 10000)
-	if svc == nil {
-		t.Fatal("NewRequestLogCleanupService with concrete repositories returned nil")
 	}
 }

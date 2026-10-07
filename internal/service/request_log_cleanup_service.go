@@ -82,29 +82,8 @@ func (s *RequestLogCleanupService) MaxCount() int {
 	return s.maxCount
 }
 
-// SetEnabled updates the enabled toggle.
-func (s *RequestLogCleanupService) SetEnabled(enabled bool) {
-	s.enabled = enabled
-}
-
-// SetInterval updates the cleanup interval.
-func (s *RequestLogCleanupService) SetInterval(interval time.Duration) {
-	if interval <= 0 {
-		interval = DefaultRequestLogCleanupInterval
-	}
-	s.interval = interval
-}
-
-// SetMaxCount updates the max log count retained per workspace.
-func (s *RequestLogCleanupService) SetMaxCount(maxCount int) {
-	if maxCount <= 0 {
-		maxCount = DefaultRequestLogCleanupMaxCount
-	}
-	s.maxCount = maxCount
-}
-
 // Start runs the periodic request log cleanup loop on time.NewTicker(s.interval).
-// It terminates cleanly when ctx is cancelled.
+// An initial cleanup cycle runs immediately on startup. It terminates cleanly when ctx is cancelled.
 func (s *RequestLogCleanupService) Start(ctx context.Context) {
 	if !s.enabled {
 		return
@@ -112,6 +91,11 @@ func (s *RequestLogCleanupService) Start(ctx context.Context) {
 	interval := s.interval
 	if interval <= 0 {
 		interval = DefaultRequestLogCleanupInterval
+	}
+
+	// Run initial cleanup on startup
+	if _, err := s.CleanupOnce(ctx); err != nil && ctx.Err() != nil {
+		return
 	}
 
 	ticker := time.NewTicker(interval)

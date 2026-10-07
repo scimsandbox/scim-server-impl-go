@@ -49,7 +49,7 @@ type CleanupConfig struct {
 }
 
 type CleanupRequestLogsConfig struct {
-	Enabled  bool          `yaml:"enabled" env:"GO_CLEANUP_REQUEST_LOGS_ENABLED"`
+	Enabled  *bool         `yaml:"enabled" env:"GO_CLEANUP_REQUEST_LOGS_ENABLED"`
 	Interval time.Duration `yaml:"interval" env:"GO_CLEANUP_REQUEST_LOGS_INTERVAL"`
 	MaxCount int           `yaml:"max_count" env:"GO_CLEANUP_REQUEST_LOGS_MAX_COUNT"`
 }

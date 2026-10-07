@@ -329,8 +329,8 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			t.Fatalf("loadConfig() error = %v", err)
 		}
 
-		if !cfg.Cleanup.RequestLogs.Enabled {
-			t.Fatal("cfg.Cleanup.RequestLogs.Enabled = false, want true")
+		if cfg.Cleanup.RequestLogs.Enabled == nil || !*cfg.Cleanup.RequestLogs.Enabled {
+			t.Fatal("cfg.Cleanup.RequestLogs.Enabled = false or nil, want true")
 		}
 		if cfg.Cleanup.RequestLogs.MaxCount != 15000 {
 			t.Fatalf("cfg.Cleanup.RequestLogs.MaxCount = %d, want 15000", cfg.Cleanup.RequestLogs.MaxCount)
@@ -340,7 +340,7 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("applies default interval and max_count when omitted in YAML", func(t *testing.T) {
+	t.Run("applies default enabled, interval and max_count when request_logs omitted in YAML", func(t *testing.T) {
 		t.Parallel()
 
 		configDir := t.TempDir()
@@ -349,8 +349,7 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			"server:",
 			"  port: 8080",
 			"cleanup:",
-			"  request_logs:",
-			"    enabled: true",
+			"  enabled: true",
 		}, "\n") + "\n"
 		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
 			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
@@ -366,11 +365,70 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			t.Fatalf("loadConfig() error = %v", err)
 		}
 
+		if cfg.Cleanup.RequestLogs.Enabled == nil || !*cfg.Cleanup.RequestLogs.Enabled {
+			t.Fatal("cfg.Cleanup.RequestLogs.Enabled should default to true when omitted")
+		}
 		if cfg.Cleanup.RequestLogs.MaxCount != 10000 {
 			t.Fatalf("cfg.Cleanup.RequestLogs.MaxCount = %d, want 10000", cfg.Cleanup.RequestLogs.MaxCount)
 		}
 		if cfg.Cleanup.RequestLogs.Interval != time.Hour {
 			t.Fatalf("cfg.Cleanup.RequestLogs.Interval = %v, want 1h", cfg.Cleanup.RequestLogs.Interval)
+		}
+	})
+
+	t.Run("honors explicit false for request_logs enabled in YAML and via env", func(t *testing.T) {
+		t.Parallel()
+
+		configDir := t.TempDir()
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		config := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"cleanup:",
+			"  enabled: true",
+			"  request_logs:",
+			"    enabled: false",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfg, err := loadConfig(func(key string) (string, bool) {
+			if key == "GO_CONFIG_DIR" {
+				return configDir, true
+			}
+			return "", false
+		})
+		if err != nil {
+			t.Fatalf("loadConfig() error = %v", err)
+		}
+
+		if cfg.Cleanup.RequestLogs.Enabled == nil || *cfg.Cleanup.RequestLogs.Enabled {
+			t.Fatal("cfg.Cleanup.RequestLogs.Enabled = true, want explicit false")
+		}
+
+		// Also test env override to disable when YAML had true
+		configWithTrue := strings.Replace(config, "enabled: false", "enabled: true", 1)
+		if err := os.WriteFile(configPath, []byte(configWithTrue), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfgOverridden, err := loadConfig(func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_CLEANUP_REQUEST_LOGS_ENABLED":
+				return "false", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("loadConfig() error = %v", err)
+		}
+
+		if cfgOverridden.Cleanup.RequestLogs.Enabled == nil || *cfgOverridden.Cleanup.RequestLogs.Enabled {
+			t.Fatal("cfgOverridden.Cleanup.RequestLogs.Enabled = true, want env override to false")
 		}
 	})
 

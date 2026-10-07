@@ -196,6 +196,9 @@ Useful environment overrides:
 - `GO_CLEANUP_ENABLED`
 - `GO_CLEANUP_INTERVAL`
 - `GO_CLEANUP_STALE_AFTER`
+- `GO_CLEANUP_REQUEST_LOGS_ENABLED`
+- `GO_CLEANUP_REQUEST_LOGS_INTERVAL`
+- `GO_CLEANUP_REQUEST_LOGS_MAX_COUNT`
 - `GO_LOGGING_LEVEL`
 - `GO_MESSAGES_LANGUAGE`
 
@@ -214,6 +217,12 @@ these environment variables when they are set:
 
 Workspace cleanup is enabled by default. The shipped defaults run cleanup every
 `2h` and remove stale workspaces older than `2160h` (90 days).
+
+Request log cleanup retains the latest request logs per workspace (default: `10000`,
+ordered by `created_at DESC, id DESC`) and prunes excess records hourly (`1h`) in
+safe batches of `5000` rows. An initial cleanup cycle runs on startup. Disabling
+`GO_CLEANUP_ENABLED` acts as a master switch to disable all cleanup tasks, or request log
+pruning can be individually toggled via `GO_CLEANUP_REQUEST_LOGS_ENABLED`.
 
 ### Token Expiration
 

@@ -3,13 +3,12 @@ package app
 import (
 	"fmt"
 	"strings"
-	"time"
+
+	"github.com/scimsandbox/scim-server-impl-go/internal/service"
 )
 
 const (
-	defaultManagementPort              = 9090
-	defaultCleanupRequestLogsMaxCount = 10000
-	defaultCleanupRequestLogsInterval = time.Hour
+	defaultManagementPort = 9090
 )
 
 func resolveDSN(cfg Config) string {
@@ -47,26 +46,16 @@ func printableConfig(cfg Config) Config {
 }
 
 func applyConfigDefaults(cfg *Config) {
+	if cfg.Cleanup.RequestLogs.Enabled == nil {
+		defaultEnabled := true
+		cfg.Cleanup.RequestLogs.Enabled = &defaultEnabled
+	}
 	if cfg.Cleanup.RequestLogs.Interval == 0 {
-		cfg.Cleanup.RequestLogs.Interval = defaultCleanupRequestLogsInterval
+		cfg.Cleanup.RequestLogs.Interval = service.DefaultRequestLogCleanupInterval
 	}
 	if cfg.Cleanup.RequestLogs.MaxCount == 0 {
-		cfg.Cleanup.RequestLogs.MaxCount = defaultCleanupRequestLogsMaxCount
+		cfg.Cleanup.RequestLogs.MaxCount = service.DefaultRequestLogCleanupMaxCount
 	}
-}
-
-func cleanupRequestLogsMaxCount(cfg Config) int {
-	if cfg.Cleanup.RequestLogs.MaxCount <= 0 {
-		return defaultCleanupRequestLogsMaxCount
-	}
-	return cfg.Cleanup.RequestLogs.MaxCount
-}
-
-func cleanupRequestLogsInterval(cfg Config) time.Duration {
-	if cfg.Cleanup.RequestLogs.Interval <= 0 {
-		return defaultCleanupRequestLogsInterval
-	}
-	return cfg.Cleanup.RequestLogs.Interval
 }
 
 func validateConfig(cfg Config) error {
@@ -76,11 +65,11 @@ func validateConfig(cfg Config) error {
 	if cfg.RateLimit.WaitTimeout < 0 {
 		return fmt.Errorf("rate_limit.wait_timeout must be greater than or equal to 0")
 	}
-	if cfg.Cleanup.RequestLogs.Interval < 0 {
-		return fmt.Errorf("cleanup.request_logs.interval must be greater than or equal to 0")
+	if cfg.Cleanup.RequestLogs.Interval <= 0 {
+		return fmt.Errorf("cleanup.request_logs.interval must be greater than 0")
 	}
-	if cfg.Cleanup.RequestLogs.MaxCount < 0 {
-		return fmt.Errorf("cleanup.request_logs.max_count must be greater than or equal to 0")
+	if cfg.Cleanup.RequestLogs.MaxCount <= 0 {
+		return fmt.Errorf("cleanup.request_logs.max_count must be greater than 0")
 	}
 
 	return nil

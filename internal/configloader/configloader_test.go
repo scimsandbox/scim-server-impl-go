@@ -196,6 +196,30 @@ unknown: value
 	}
 }
 
+func TestLoadPointerBoolOverrides(t *testing.T) {
+	t.Parallel()
+
+	type pointerConfig struct {
+		Feature *bool `yaml:"feature" env:"FEATURE_FLAG"`
+	}
+
+	dir := t.TempDir()
+	configFile := writeTestFile(t, dir, applicationFileName, `
+feature: false
+`)
+
+	cfg, err := Load[pointerConfig](LoadOptions{
+		Files:     []string{configFile},
+		LookupEnv: lookupFromMap(map[string]string{"FEATURE_FLAG": "true"}),
+	})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Feature == nil || !*cfg.Feature {
+		t.Fatalf("expected feature to be true, got %v", cfg.Feature)
+	}
+}
+
 func writeTestFile(t *testing.T, dir, name, contents string) string {
 	t.Helper()
 

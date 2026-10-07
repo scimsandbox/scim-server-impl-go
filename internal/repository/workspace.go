@@ -109,15 +109,47 @@ func (r *RequestLogRepository) Create(ctx context.Context, log *model.ScimReques
 	return err
 }
 
+const DefaultPruneBatchSize = 5000
+
+// DeleteOldLogsForWorkspace deletes excess request logs for a workspace beyond the most recent maxCount.
+// It executes in batches of DefaultPruneBatchSize to prevent long-lived locks and large WAL spikes.
+// maxCount must be greater than 0; passing <= 0 returns an error to prevent accidental total deletion.
 func (r *RequestLogRepository) DeleteOldLogsForWorkspace(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
-	if maxCount < 0 {
-		return 0, fmt.Errorf("maxCount must be non-negative: %d", maxCount)
+	if maxCount <= 0 {
+		return 0, fmt.Errorf("maxCount must be greater than 0: %d", maxCount)
 	}
-	tag, err := jdbc.ExecContext(ctx,
-		`DELETE FROM scim_request_logs WHERE workspace_id = $1 AND id IN (SELECT id FROM scim_request_logs WHERE workspace_id = $1 ORDER BY created_at DESC, id DESC OFFSET $2)`,
-		workspaceID, maxCount)
-	if err != nil {
-		return 0, err
+
+	var totalDeleted int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+
+		tag, err := jdbc.ExecContext(ctx,
+			`DELETE FROM scim_request_logs 
+			 WHERE workspace_id = $1 
+			   AND id IN (
+			     SELECT id FROM scim_request_logs 
+			     WHERE workspace_id = $1 
+			     ORDER BY created_at DESC, id DESC 
+			     OFFSET $2 
+			     LIMIT $3
+			   )`,
+			workspaceID, maxCount, DefaultPruneBatchSize)
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		rows, err := tag.RowsAffected()
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += rows
+
+		if rows < DefaultPruneBatchSize {
+			break
+		}
 	}
-	return tag.RowsAffected()
+
+	return totalDeleted, nil
 }

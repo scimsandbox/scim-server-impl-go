@@ -181,15 +181,16 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	}
 
 	// Request log cleanup scheduler
+	requestLogsEnabled := cfg.Cleanup.Enabled && (cfg.Cleanup.RequestLogs.Enabled != nil && *cfg.Cleanup.RequestLogs.Enabled)
 	requestLogCleanupService := service.NewRequestLogCleanupService(
 		requestLogRepo,
 		workspaceRepo,
 		logger,
-		cfg.Cleanup.RequestLogs.Enabled,
+		requestLogsEnabled,
 		cfg.Cleanup.RequestLogs.Interval,
 		cfg.Cleanup.RequestLogs.MaxCount,
 	)
-	if cfg.Cleanup.RequestLogs.Enabled {
+	if requestLogsEnabled {
 		go requestLogCleanupService.Start(serverCtx)
 	}
 

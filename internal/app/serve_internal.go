@@ -191,7 +191,6 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	requestLogsEnabled := cfg.Cleanup.Enabled && (cfg.Cleanup.RequestLogs.Enabled != nil && *cfg.Cleanup.RequestLogs.Enabled)
 	requestLogCleanupService := service.NewRequestLogCleanupService(
 		requestLogRepo,
-		workspaceRepo,
 		logger,
 		requestLogsEnabled,
 		cfg.Cleanup.RequestLogs.Interval,

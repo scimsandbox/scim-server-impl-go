@@ -46,22 +46,6 @@ func (m *safeMockLogger) InfoCount() int {
 	return len(m.infos)
 }
 
-type mockWorkspaceLister struct {
-	mu          sync.Mutex
-	listIDsFunc func(ctx context.Context) ([]uuid.UUID, error)
-	calls       int
-}
-
-func (m *mockWorkspaceLister) ListIDs(ctx context.Context) ([]uuid.UUID, error) {
-	m.mu.Lock()
-	m.calls++
-	m.mu.Unlock()
-	if m.listIDsFunc != nil {
-		return m.listIDsFunc(ctx)
-	}
-	return nil, nil
-}
-
 type deletionCall struct {
 	WorkspaceID uuid.UUID
 	MaxCount    int
@@ -105,10 +89,9 @@ func TestRequestLogCleanupService_Constructor_And_Defaults(t *testing.T) {
 	t.Parallel()
 
 	logger := &safeMockLogger{}
-	wsRepo := &mockWorkspaceLister{}
 	logRepo := &mockRequestLogDeleter{}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, 0, 0)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, 0, 0)
 	if svc == nil {
 		t.Fatal("NewRequestLogCleanupService() returned nil")
 	}
@@ -123,7 +106,7 @@ func TestRequestLogCleanupService_Constructor_And_Defaults(t *testing.T) {
 	}
 
 	// Test custom values and non-positive overrides via constructor
-	customSvc := NewRequestLogCleanupService(nil, nil, logger, false, 2*time.Hour, 500)
+	customSvc := NewRequestLogCleanupService(nil, logger, false, 2*time.Hour, 500)
 	if customSvc.enabled {
 		t.Fatal("customSvc.enabled = true, want false")
 	}
@@ -134,7 +117,7 @@ func TestRequestLogCleanupService_Constructor_And_Defaults(t *testing.T) {
 		t.Fatalf("customSvc.maxCount = %d, want 500", customSvc.maxCount)
 	}
 
-	nonPositiveSvc := NewRequestLogCleanupService(nil, nil, logger, true, -1, -1)
+	nonPositiveSvc := NewRequestLogCleanupService(nil, logger, true, -1, -1)
 	if nonPositiveSvc.interval != DefaultRequestLogCleanupInterval {
 		t.Fatalf("nonPositiveSvc.interval = %v after negative, want default", nonPositiveSvc.interval)
 	}
@@ -147,9 +130,8 @@ func TestRequestLogCleanupService_Lifecycle_StopOnContextCancel(t *testing.T) {
 	t.Parallel()
 
 	logger := &safeMockLogger{}
-	wsRepo := &mockWorkspaceLister{}
 	logRepo := &mockRequestLogDeleter{}
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, 24*time.Hour, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, 24*time.Hour, 10000)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -174,7 +156,6 @@ func TestRequestLogCleanupService_Lifecycle_TickerTrigger(t *testing.T) {
 
 	logger := &safeMockLogger{}
 	wsID := uuid.New()
-	wsRepo := &mockWorkspaceLister{}
 
 	var callCount atomic.Int32
 	logRepo := &mockRequestLogDeleter{
@@ -187,7 +168,7 @@ func TestRequestLogCleanupService_Lifecycle_TickerTrigger(t *testing.T) {
 		},
 	}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, 15*time.Millisecond, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, 15*time.Millisecond, 10000)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -222,7 +203,6 @@ func TestRequestLogCleanupService_DisabledToggle(t *testing.T) {
 	t.Parallel()
 
 	logger := &safeMockLogger{}
-	wsRepo := &mockWorkspaceLister{}
 	logRepo := &mockRequestLogDeleter{
 		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
 			t.Fatal("ListWorkspaceIDsExceedingLogCount should not be called when service is disabled")
@@ -234,7 +214,7 @@ func TestRequestLogCleanupService_DisabledToggle(t *testing.T) {
 		},
 	}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, false, time.Hour, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, false, time.Hour, 10000)
 
 	// 1. CleanupOnce returns (0, nil) immediately
 	deleted, err := svc.CleanupOnce(context.Background())
@@ -266,8 +246,6 @@ func TestRequestLogCleanupService_CleanupOnce_Success(t *testing.T) {
 	logger := &safeMockLogger{}
 	ws1 := uuid.New()
 
-	wsRepo := &mockWorkspaceLister{}
-
 	// Only ws1 has excess logs; ws2 is under threshold and omitted by listExceedingFunc
 	logRepo := &mockRequestLogDeleter{
 		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
@@ -282,7 +260,7 @@ func TestRequestLogCleanupService_CleanupOnce_Success(t *testing.T) {
 		},
 	}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, time.Hour, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, time.Hour, 10000)
 
 	deleted, err := svc.CleanupOnce(context.Background())
 	if err != nil {
@@ -316,8 +294,6 @@ func TestRequestLogCleanupService_PerWorkspaceIndependence_And_ErrorContainment(
 	ws2 := uuid.New()
 	ws3 := uuid.New()
 
-	wsRepo := &mockWorkspaceLister{}
-
 	dbErr := errors.New("database connection reset")
 	logRepo := &mockRequestLogDeleter{
 		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
@@ -337,7 +313,7 @@ func TestRequestLogCleanupService_PerWorkspaceIndependence_And_ErrorContainment(
 		},
 	}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, time.Hour, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, time.Hour, 10000)
 
 	deleted, err := svc.CleanupOnce(context.Background())
 	if err != nil {
@@ -363,8 +339,6 @@ func TestRequestLogCleanupService_ListExceedingWorkspaces_Error(t *testing.T) {
 	logger := &safeMockLogger{}
 	expectedErr := errors.New("failed to query request logs table")
 
-	wsRepo := &mockWorkspaceLister{}
-
 	logRepo := &mockRequestLogDeleter{
 		listExceedingFunc: func(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
 			return nil, expectedErr
@@ -375,7 +349,7 @@ func TestRequestLogCleanupService_ListExceedingWorkspaces_Error(t *testing.T) {
 		},
 	}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, time.Hour, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, time.Hour, 10000)
 
 	deleted, err := svc.CleanupOnce(context.Background())
 	if err == nil {
@@ -401,8 +375,6 @@ func TestRequestLogCleanupService_ContextCancelDuringIteration(t *testing.T) {
 	ws2 := uuid.New()
 	ws3 := uuid.New()
 
-	wsRepo := &mockWorkspaceLister{}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	logRepo := &mockRequestLogDeleter{
@@ -419,7 +391,7 @@ func TestRequestLogCleanupService_ContextCancelDuringIteration(t *testing.T) {
 		},
 	}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, time.Hour, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, time.Hour, 10000)
 
 	deleted, err := svc.CleanupOnce(ctx)
 	if err == nil {
@@ -437,10 +409,9 @@ func TestRequestLogCleanupService_ContextAlreadyCancelled(t *testing.T) {
 	t.Parallel()
 
 	logger := &safeMockLogger{}
-	wsRepo := &mockWorkspaceLister{}
 	logRepo := &mockRequestLogDeleter{}
 
-	svc := NewRequestLogCleanupService(logRepo, wsRepo, logger, true, time.Hour, 10000)
+	svc := NewRequestLogCleanupService(logRepo, logger, true, time.Hour, 10000)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

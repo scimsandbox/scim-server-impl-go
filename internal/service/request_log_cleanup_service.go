@@ -16,27 +16,18 @@ const (
 	DefaultRequestLogCleanupMaxCount = 10000
 )
 
-// WorkspaceLister defines the workspace enumeration contract needed for cleanup.
-type WorkspaceLister interface {
-	ListIDs(ctx context.Context) ([]uuid.UUID, error)
-}
-
 // RequestLogDeleter defines the log pruning contract needed for cleanup.
 type RequestLogDeleter interface {
 	ListWorkspaceIDsExceedingLogCount(ctx context.Context, maxCount int) ([]uuid.UUID, error)
 	DeleteOldLogsForWorkspace(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error)
 }
 
-// Compile-time assertions verifying repository types satisfy service interfaces.
-var (
-	_ WorkspaceLister   = (*repository.WorkspaceRepository)(nil)
-	_ RequestLogDeleter = (*repository.RequestLogRepository)(nil)
-)
+// Compile-time assertion verifying repository types satisfy service interfaces.
+var _ RequestLogDeleter = (*repository.RequestLogRepository)(nil)
 
 // RequestLogCleanupService periodically cleans up old request logs per workspace.
 type RequestLogCleanupService struct {
 	requestLogRepo RequestLogDeleter
-	workspaceRepo  WorkspaceLister
 	logger         logging.Logger
 	enabled        bool
 	interval       time.Duration
@@ -46,7 +37,6 @@ type RequestLogCleanupService struct {
 // NewRequestLogCleanupService creates a new RequestLogCleanupService.
 func NewRequestLogCleanupService(
 	requestLogRepo RequestLogDeleter,
-	workspaceRepo WorkspaceLister,
 	logger logging.Logger,
 	enabled bool,
 	interval time.Duration,
@@ -60,7 +50,6 @@ func NewRequestLogCleanupService(
 	}
 	return &RequestLogCleanupService{
 		requestLogRepo: requestLogRepo,
-		workspaceRepo:  workspaceRepo,
 		logger:         logger,
 		enabled:        enabled,
 		interval:       interval,

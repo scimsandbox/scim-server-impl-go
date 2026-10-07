@@ -32,27 +32,6 @@ func (r *WorkspaceRepository) FindByID(ctx context.Context, id uuid.UUID) (*mode
 	return &w, nil
 }
 
-func (r *WorkspaceRepository) ListIDs(ctx context.Context) ([]uuid.UUID, error) {
-	rows, err := jdbc.QueryContext(ctx, `SELECT id FROM workspaces`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var ids []uuid.UUID
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return ids, nil
-}
-
 func (r *WorkspaceRepository) TouchUpdatedAt(ctx context.Context, id uuid.UUID) error {
 	_, err := jdbc.ExecContext(ctx,
 		`UPDATE workspaces SET updated_at = $1 WHERE id = $2`, time.Now().UTC(), id)

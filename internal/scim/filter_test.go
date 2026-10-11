@@ -345,9 +345,28 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 		t.Fatalf("expected error for invalid boolean value foo in value path")
 	}
 
+	// Unknown sub-attribute inside value path (isBooleanAttr must not be context-blind)
+	if _, err := ParseUserFilter(`emails[active eq true].value eq "x"`, 1); err == nil {
+		t.Fatalf("expected error for active in emails value path")
+	} else if !strings.Contains(err.Error(), "unknown sub-attribute 'active' for 'emails'") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
 	// Valid value path boolean
 	if _, err := ParseUserFilter(`emails[primary eq true].value eq "x"`, 1); err != nil {
 		t.Fatalf("unexpected error for valid primary eq true in value path: %v", err)
+	}
+
+	// Boolean inner pr must not compile to a primaryFlag:false constraint
+	resInnerPr, err := ParseUserFilter(`emails[primary pr].value eq "x"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for primary pr in value path: %v", err)
+	}
+	if !strings.Contains(resInnerPr.SQL, "(elem->>'primaryFlag') IS NOT NULL") {
+		t.Fatalf("expected '(elem->>'primaryFlag') IS NOT NULL' in SQL, got %s", resInnerPr.SQL)
+	}
+	if len(resInnerPr.Args) != 1 || resInnerPr.Args[0] != "x" {
+		t.Fatalf("expected single arg 'x' for primary pr, got %v", resInnerPr.Args)
 	}
 
 	// Value path boolean ne inside inner filter
@@ -355,8 +374,11 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for primary ne true in value path: %v", err)
 	}
-	if !strings.Contains(resInnerNe.Args[0].(string), `"primaryFlag":false`) {
-		t.Fatalf("expected '\"primaryFlag\":false' for primary ne true, got %v", resInnerNe.Args[0])
+	if !strings.Contains(resInnerNe.SQL, "((elem->>'primaryFlag') != $1 OR (elem->>'primaryFlag') IS NULL)") {
+		t.Fatalf("expected negation clause in SQL, got %s", resInnerNe.SQL)
+	}
+	if len(resInnerNe.Args) != 2 || resInnerNe.Args[0] != "true" || resInnerNe.Args[1] != "x" {
+		t.Fatalf("expected args ['true', 'x'], got %v", resInnerNe.Args)
 	}
 
 	// Value path boolean as subAttr (eq vs ne)
@@ -364,24 +386,33 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for emails[...].primary eq true: %v", err)
 	}
-	if !strings.Contains(resSubEq.Args[0].(string), `"primaryFlag":true`) {
-		t.Fatalf("expected '\"primaryFlag\":true' for primary eq true, got %v", resSubEq.Args[0])
+	if !strings.Contains(resSubEq.SQL, "(elem->>'primaryFlag') = $2") {
+		t.Fatalf("expected '(elem->>'primaryFlag') = $2' in SQL, got %s", resSubEq.SQL)
+	}
+	if len(resSubEq.Args) != 2 || resSubEq.Args[0] != "work" || resSubEq.Args[1] != "true" {
+		t.Fatalf("expected args ['work', 'true'], got %v", resSubEq.Args)
 	}
 
 	resSubNe, err := ParseUserFilter(`emails[type eq "work"].primary ne true`, 1)
 	if err != nil {
 		t.Fatalf("unexpected error for emails[...].primary ne true: %v", err)
 	}
-	if !strings.Contains(resSubNe.Args[0].(string), `"primaryFlag":false`) {
-		t.Fatalf("expected '\"primaryFlag\":false' for primary ne true, got %v", resSubNe.Args[0])
+	if !strings.Contains(resSubNe.SQL, "((elem->>'primaryFlag') != $2 OR (elem->>'primaryFlag') IS NULL)") {
+		t.Fatalf("expected negation clause in SQL, got %s", resSubNe.SQL)
+	}
+	if len(resSubNe.Args) != 2 || resSubNe.Args[0] != "work" || resSubNe.Args[1] != "true" {
+		t.Fatalf("expected args ['work', 'true'], got %v", resSubNe.Args)
 	}
 
 	resSubNeFalse, err := ParseUserFilter(`emails[type eq "work"].primary ne false`, 1)
 	if err != nil {
 		t.Fatalf("unexpected error for emails[...].primary ne false: %v", err)
 	}
-	if !strings.Contains(resSubNeFalse.Args[0].(string), `"primaryFlag":true`) {
-		t.Fatalf("expected '\"primaryFlag\":true' for primary ne false, got %v", resSubNeFalse.Args[0])
+	if !strings.Contains(resSubNeFalse.SQL, "((elem->>'primaryFlag') != $2 OR (elem->>'primaryFlag') IS NULL)") {
+		t.Fatalf("expected negation clause in SQL, got %s", resSubNeFalse.SQL)
+	}
+	if len(resSubNeFalse.Args) != 2 || resSubNeFalse.Args[0] != "work" || resSubNeFalse.Args[1] != "false" {
+		t.Fatalf("expected args ['work', 'false'], got %v", resSubNeFalse.Args)
 	}
 
 	// Invalid operator or value when primary is subAttr
@@ -397,8 +428,8 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for bracket in string: %v", err)
 	}
-	if !strings.Contains(resBracketInString.Args[0].(string), `"value":"a]b"`) {
-		t.Fatalf("expected '\"value\":\"a]b\"' in arg, got %v", resBracketInString.Args[0])
+	if len(resBracketInString.Args) != 2 || resBracketInString.Args[0] != "a]b" || resBracketInString.Args[1] != "x" {
+		t.Fatalf("expected args ['a]b', 'x'], got %v", resBracketInString.Args)
 	}
 
 	// Multi-clause inner filters must be rejected

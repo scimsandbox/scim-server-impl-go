@@ -252,8 +252,7 @@ func serviceProviderConfigSchema() map[string]any {
 		attr("index", "boolean", true, "readOnly", "none", "Index pagination supported", false),
 		paginationMode,
 		attr("defaultPageSize", "integer", false, "readOnly", "none", "Default page size", false),
-		attr("maxPageSize", "integer", false, "readOnly", "none", "Max page size", false),
-		attr("cursorTimeout", "integer", false, "readOnly", "none", "Cursor timeout", false))
+		attr("maxPageSize", "integer", false, "readOnly", "none", "Max page size", false))
 
 	changePassword := withSubAttributes(attr("changePassword", "complex", true, "readOnly", "none",
 		"Change password configuration", false),

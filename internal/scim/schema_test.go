@@ -142,9 +142,11 @@ func TestServiceProviderConfig(t *testing.T) {
     subAttrs := paginationAttr["subAttributes"].([]map[string]any)
     var modeAttr map[string]any
     for _, sa := range subAttrs {
+        if sa["name"] == "cursorTimeout" {
+            t.Fatalf("cursorTimeout should not be present in schema subAttributes when cursor pagination is disabled")
+        }
         if sa["name"] == "defaultPaginationMode" {
             modeAttr = sa
-            break
         }
     }
     if modeAttr == nil {

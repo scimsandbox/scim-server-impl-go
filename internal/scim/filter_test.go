@@ -224,7 +224,7 @@ func TestIsValidDateTime_TableDriven(t *testing.T) {
 		{"2024-01-01T15:04:05.999999999", true},
 		{"2024-01-01 15:04:05", true},
 		{"2024-01-01 15:04:05.123456", true},
-		{"2024-01-01", true},
+		{"2024-01-01", false},
 		{"not-an-iso-8601-date", false},
 		{"2024-02-30T00:00:00Z", false},
 		{"", false},
@@ -255,13 +255,18 @@ func TestParseUserFilter_DateTimeNormalizationAndOperators(t *testing.T) {
 		t.Fatalf("expected normalized UTC dateTime (13:00:00Z), got %s", argStr)
 	}
 
+	// Date-only without time must be rejected per RFC 7643 §2.3.5
+	if _, err := ParseUserFilter(`meta.created gt "2024-01-01"`, 1); err == nil {
+		t.Fatalf("expected error for date-only on meta.created")
+	}
+
 	// Substring operators rejected on dateTime
 	invalidOps := []string{"co", "sw", "ew"}
 	for _, op := range invalidOps {
-		if _, err := ParseUserFilter(`meta.created `+op+` "2024-01-01"`, 1); err == nil {
+		if _, err := ParseUserFilter(`meta.created `+op+` "2024-01-01T00:00:00Z"`, 1); err == nil {
 			t.Fatalf("expected error for %s on meta.created", op)
 		}
-		if _, err := ParseUserFilter(`meta.lastModified `+op+` "2024-01-01"`, 1); err == nil {
+		if _, err := ParseUserFilter(`meta.lastModified `+op+` "2024-01-01T00:00:00Z"`, 1); err == nil {
 			t.Fatalf("expected error for %s on meta.lastModified", op)
 		}
 	}
@@ -345,12 +350,66 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 		t.Fatalf("unexpected error for valid primary eq true in value path: %v", err)
 	}
 
-	// Invalid operator when primary is subAttr
+	// Value path boolean ne inside inner filter
+	resInnerNe, err := ParseUserFilter(`emails[primary ne true].value eq "x"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for primary ne true in value path: %v", err)
+	}
+	if !strings.Contains(resInnerNe.Args[0].(string), `"primaryFlag":false`) {
+		t.Fatalf("expected '\"primaryFlag\":false' for primary ne true, got %v", resInnerNe.Args[0])
+	}
+
+	// Value path boolean as subAttr (eq vs ne)
+	resSubEq, err := ParseUserFilter(`emails[type eq "work"].primary eq true`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for emails[...].primary eq true: %v", err)
+	}
+	if !strings.Contains(resSubEq.Args[0].(string), `"primaryFlag":true`) {
+		t.Fatalf("expected '\"primaryFlag\":true' for primary eq true, got %v", resSubEq.Args[0])
+	}
+
+	resSubNe, err := ParseUserFilter(`emails[type eq "work"].primary ne true`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for emails[...].primary ne true: %v", err)
+	}
+	if !strings.Contains(resSubNe.Args[0].(string), `"primaryFlag":false`) {
+		t.Fatalf("expected '\"primaryFlag\":false' for primary ne true, got %v", resSubNe.Args[0])
+	}
+
+	resSubNeFalse, err := ParseUserFilter(`emails[type eq "work"].primary ne false`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for emails[...].primary ne false: %v", err)
+	}
+	if !strings.Contains(resSubNeFalse.Args[0].(string), `"primaryFlag":true`) {
+		t.Fatalf("expected '\"primaryFlag\":true' for primary ne false, got %v", resSubNeFalse.Args[0])
+	}
+
+	// Invalid operator or value when primary is subAttr
 	if _, err := ParseUserFilter(`emails[type eq "work"].primary gt true`, 1); err == nil {
 		t.Fatalf("expected error for emails[...].primary gt true")
 	}
+	if _, err := ParseUserFilter(`emails[type eq "work"].primary eq "yes"`, 1); err == nil {
+		t.Fatalf("expected error for emails[...].primary eq 'yes'")
+	}
 
-	// Direct JSON attribute boolean checks
+	// Bracket inside quoted string literal must not terminate value path
+	resBracketInString, err := ParseUserFilter(`emails[value eq "a]b"].value eq "x"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for bracket in string: %v", err)
+	}
+	if !strings.Contains(resBracketInString.Args[0].(string), `"value":"a]b"`) {
+		t.Fatalf("expected '\"value\":\"a]b\"' in arg, got %v", resBracketInString.Args[0])
+	}
+
+	// Multi-clause inner filters must be rejected
+	if _, err := ParseUserFilter(`emails[type eq "work" and primary eq true].value eq "x"`, 1); err == nil {
+		t.Fatalf("expected error for multi-clause inner filter with 'and'")
+	}
+	if _, err := ParseUserFilter(`emails[type eq "work" or primary eq true].value eq "x"`, 1); err == nil {
+		t.Fatalf("expected error for multi-clause inner filter with 'or'")
+	}
+
+	// Direct JSON attribute boolean checks: ne is not supported on JSON collections
 	if _, err := ParseUserFilter(`emails.primary gt true`, 1); err == nil {
 		t.Fatalf("expected error for emails.primary gt true")
 	}
@@ -359,5 +418,11 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 	}
 	if _, err := ParseUserFilter(`emails.primary eq true`, 1); err != nil {
 		t.Fatalf("unexpected error for emails.primary eq true: %v", err)
+	}
+	if _, err := ParseUserFilter(`emails.primary ne true`, 1); err == nil {
+		t.Fatalf("expected error for emails.primary ne true (unsupported operator)")
+	}
+	if _, err := ParseUserFilter(`emails.value ne "x"`, 1); err == nil {
+		t.Fatalf("expected error for emails.value ne 'x' (unsupported operator)")
 	}
 }

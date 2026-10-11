@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -139,6 +140,85 @@ func TestListUsersFilterMultiValuedJsonAttributes(t *testing.T) {
 	}
 	if strings.Contains(respBody, `"user1"`) {
 		t.Fatal("filter response should not contain user1")
+	}
+
+	testCases := []struct {
+		name        string
+		filter      string
+		expectCode  int
+		wantUsers   []string
+		rejectUsers []string
+	}{
+		{
+			name:        "canonical RFC value-path: type eq work and value eq",
+			filter:      `emails[type eq "work"].value eq "user1@work.com"`,
+			expectCode:  http.StatusOK,
+			wantUsers:   []string{"user1"},
+			rejectUsers: []string{"user2"},
+		},
+		{
+			name:        "boolean inner value-path: primary eq true and value eq",
+			filter:      `emails[primary eq true].value eq "user1@work.com"`,
+			expectCode:  http.StatusOK,
+			wantUsers:   []string{"user1"},
+			rejectUsers: []string{"user2"},
+		},
+		{
+			name:        "inverted order: value eq and type eq",
+			filter:      `emails[value eq "user1@work.com"].type eq "work"`,
+			expectCode:  http.StatusOK,
+			wantUsers:   []string{"user1"},
+			rejectUsers: []string{"user2"},
+		},
+		{
+			name:        "boolean subAttr ne: primary ne true excludes primary user",
+			filter:      `emails[type eq "work"].primary ne true`,
+			expectCode:  http.StatusOK,
+			wantUsers:   nil,
+			rejectUsers: []string{"user1", "user2"},
+		},
+		{
+			name:        "boolean subAttr eq false: matches user2",
+			filter:      `emails[type eq "home"].primary eq false`,
+			expectCode:  http.StatusOK,
+			wantUsers:   []string{"user2"},
+			rejectUsers: []string{"user1"},
+		},
+		{
+			name:        "boolean inner pr: presence check does not produce false constraint",
+			filter:      `emails[primary pr].value eq "user1@work.com"`,
+			expectCode:  http.StatusOK,
+			wantUsers:   []string{"user1"},
+			rejectUsers: []string{"user2"},
+		},
+		{
+			name:        "unknown sub-attribute inside value path: rejected as 400",
+			filter:      `emails[active eq true].value eq "user1@work.com"`,
+			expectCode:  http.StatusBadRequest,
+			wantUsers:   nil,
+			rejectUsers: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := doRequest(t, http.MethodGet,
+				scimURL(env.server.URL, wsID, "/Users?filter="+url.QueryEscape(tc.filter)), token, "")
+			body := readBody(t, r)
+			if r.StatusCode != tc.expectCode {
+				t.Fatalf("expected status %d, got %d: %s", tc.expectCode, r.StatusCode, body)
+			}
+			for _, u := range tc.wantUsers {
+				if !strings.Contains(body, `"`+u+`"`) {
+					t.Fatalf("expected response to contain user %s, got: %s", u, body)
+				}
+			}
+			for _, u := range tc.rejectUsers {
+				if strings.Contains(body, `"`+u+`"`) {
+					t.Fatalf("expected response to NOT contain user %s, got: %s", u, body)
+				}
+			}
+		})
 	}
 }
 

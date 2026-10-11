@@ -108,4 +108,52 @@ func TestServiceProviderConfig(t *testing.T) {
     if filter["supported"] != true {
         t.Fatalf("filter.supported = %v, want true", filter["supported"])
     }
+
+    pagination := spc["pagination"].(map[string]any)
+    if pagination["cursor"] != false {
+        t.Fatalf("pagination.cursor = %v, want false", pagination["cursor"])
+    }
+    if pagination["index"] != true {
+        t.Fatalf("pagination.index = %v, want true", pagination["index"])
+    }
+    if pagination["defaultPaginationMode"] != "index" {
+        t.Fatalf("pagination.defaultPaginationMode = %v, want index", pagination["defaultPaginationMode"])
+    }
+    if _, exists := pagination["cursorTimeout"]; exists {
+        t.Fatalf("pagination should not contain cursorTimeout when cursor is false")
+    }
+
+    // Verify ServiceProviderConfig schema definition
+    spcSchema := GetSchemaByID("urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig")
+    if spcSchema == nil {
+        t.Fatalf("ServiceProviderConfig schema definition not found")
+    }
+    attrs := spcSchema["attributes"].([]map[string]any)
+    var paginationAttr map[string]any
+    for _, a := range attrs {
+        if a["name"] == "pagination" {
+            paginationAttr = a
+            break
+        }
+    }
+    if paginationAttr == nil {
+        t.Fatalf("pagination attribute not found in schema")
+    }
+    subAttrs := paginationAttr["subAttributes"].([]map[string]any)
+    var modeAttr map[string]any
+    for _, sa := range subAttrs {
+        if sa["name"] == "cursorTimeout" {
+            t.Fatalf("cursorTimeout should not be present in schema subAttributes when cursor pagination is disabled")
+        }
+        if sa["name"] == "defaultPaginationMode" {
+            modeAttr = sa
+        }
+    }
+    if modeAttr == nil {
+        t.Fatalf("defaultPaginationMode subAttribute not found")
+    }
+    canonicalValues, ok := modeAttr["canonicalValues"].([]string)
+    if !ok || len(canonicalValues) != 1 || canonicalValues[0] != "index" {
+        t.Fatalf("canonicalValues = %v, want [index]", modeAttr["canonicalValues"])
+    }
 }

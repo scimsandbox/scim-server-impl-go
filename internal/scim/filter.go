@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -240,33 +241,46 @@ func tokenize(filter string) []token {
 // ── Case-insensitive attribute set ──────────────────
 
 var caseInsensitiveAttrs = map[string]bool{
-	attrUsername:              true,
-	attrDisplayName:           true,
-	attrExternalID:            true,
-	attrNameFamilyName:        true,
-	attrNameGivenName:         true,
-	attrNameFormatted:         true,
-	attrNameMiddleName:        true,
-	attrNameHonorificPrefix:   true,
-	attrNameHonorificSuffix:   true,
-	attrNickname:              true,
-	attrTitle:                 true,
-	attrUserType:              true,
-	attrPreferredLanguage:     true,
-	attrLocale:                true,
-	attrTimeZone:              true,
-	attrEmailsValue:           true,
-	attrEmailsType:            true,
-	attrPhoneNumbersValue:     true,
-	attrPhoneNumbersType:      true,
-	attrImsValue:              true,
-	attrImsType:               true,
-	attrAddressesType:         true,
-	attrPhotosValue:           true,
-	attrPhotosType:            true,
-	attrRolesValue:            true,
-	attrEntitlementsValue:     true,
-	attrX509CertificatesValue: true,
+	attrUsername:               true,
+	attrDisplayName:            true,
+	attrExternalID:             true,
+	attrNameFamilyName:         true,
+	attrNameGivenName:          true,
+	attrNameFormatted:          true,
+	attrNameMiddleName:         true,
+	attrNameHonorificPrefix:    true,
+	attrNameHonorificSuffix:    true,
+	attrNickname:               true,
+	attrTitle:                  true,
+	attrUserType:               true,
+	attrPreferredLanguage:      true,
+	attrLocale:                 true,
+	attrTimeZone:               true,
+	attrEmailsValue:            true,
+	attrEmailsType:             true,
+	"emails.display":           true,
+	attrPhoneNumbersValue:      true,
+	attrPhoneNumbersType:       true,
+	"phonenumbers.display":     true,
+	attrImsValue:               true,
+	attrImsType:                true,
+	"ims.display":              true,
+	attrAddressesType:          true,
+	"addresses.formatted":      true,
+	"addresses.streetaddress":  true,
+	"addresses.locality":       true,
+	"addresses.region":         true,
+	"addresses.postalcode":     true,
+	"addresses.country":        true,
+	attrPhotosValue:            true,
+	attrPhotosType:             true,
+	"photos.display":           true,
+	attrRolesValue:             true,
+	"roles.display":            true,
+	attrEntitlementsValue:      true,
+	"entitlements.display":     true,
+	attrX509CertificatesValue:  true,
+	"x509certificates.display": true,
 }
 
 // ── URN prefix handling ─────────────────────────────
@@ -471,6 +485,17 @@ func (p *filterParser) parseAtom() (*FilterResult, error) {
 	return p.buildComparison(attrName, operator, value)
 }
 
+type innerToken struct {
+	val      string
+	isString bool
+}
+
+type innerClause struct {
+	attr string
+	op   string
+	val  string
+}
+
 func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	// Parse something like: emails[type eq "work"].value eq "example@example.com"
 	raw := p.next().val // e.g., "emails[type"
@@ -478,64 +503,145 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	collectionAttr := raw[:bracketIdx]
 	filterStart := raw[bracketIdx+1:]
 
-	// Collect tokens until we find "]" or something ending with "]"
-	filterParts := []string{filterStart}
-	for {
-		t := p.peek()
-		if t == nil {
-			return nil, fmt.Errorf("unterminated value path filter")
+	if !isJSONCollection(collectionAttr) {
+		if strings.EqualFold(collectionAttr, "members") {
+			return nil, fmt.Errorf("value path filters on 'members' are not supported")
 		}
-		val := t.val
-		if strings.HasSuffix(val, "]") {
-			p.next()
-			val = strings.TrimSuffix(val, "]")
-			if val != "" {
-				filterParts = append(filterParts, val)
-			}
-			break
-		}
-		if t.typ == tokenString {
-			filterParts = append(filterParts, `"`+val+`"`)
-		} else {
-			filterParts = append(filterParts, val)
-		}
-		p.next()
+		return nil, fmt.Errorf("attribute '%s' is not a multi-valued complex attribute", collectionAttr)
 	}
-	// filterParts is the inner filter (e.g. ["type", "eq", "work"])
 
-	// Check for sub-attribute after "]" (e.g. ".value")
-	// The "." should be part of the next token, or...
-	// Actually, the tokenizer would give us ".value" as a separate token
+	var innerTokens []innerToken
 	var subAttr string
-	t := p.peek()
-	if t != nil && t.typ == tokenWord && strings.HasPrefix(t.val, ".") {
-		subAttr = t.val[1:]
-		p.next()
+
+	if closeIdx := strings.Index(filterStart, "]"); closeIdx >= 0 {
+		before := filterStart[:closeIdx]
+		if before != "" {
+			innerTokens = append(innerTokens, innerToken{val: before, isString: false})
+		}
+		after := filterStart[closeIdx+1:]
+		if strings.HasPrefix(after, ".") {
+			subAttr = after[1:]
+		}
+	} else {
+		if filterStart != "" {
+			innerTokens = append(innerTokens, innerToken{val: filterStart, isString: false})
+		}
+		for {
+			t := p.peek()
+			if t == nil {
+				return nil, fmt.Errorf("unterminated value path filter")
+			}
+			p.next()
+			if t.typ != tokenString {
+				if closeIdx := strings.Index(t.val, "]"); closeIdx >= 0 {
+					before := t.val[:closeIdx]
+					if before != "" {
+						innerTokens = append(innerTokens, innerToken{val: before, isString: false})
+					}
+					after := t.val[closeIdx+1:]
+					if strings.HasPrefix(after, ".") {
+						subAttr = after[1:]
+					}
+					break
+				}
+				innerTokens = append(innerTokens, innerToken{val: t.val, isString: false})
+			} else {
+				innerTokens = append(innerTokens, innerToken{val: t.val, isString: true})
+			}
+		}
 	}
+
+	// Check for sub-attribute after "]" if not already extracted (e.g. ".value" as a separate token)
+	if subAttr == "" {
+		t := p.peek()
+		if t != nil && t.typ == tokenWord && strings.HasPrefix(t.val, ".") {
+			subAttr = t.val[1:]
+			p.next()
+		}
+	}
+
+	// Reject multi-clause inner filters (and/or/not)
+	for _, tok := range innerTokens {
+		if !tok.isString {
+			lower := strings.ToLower(tok.val)
+			if lower == filterOpAnd || lower == filterOpOr || lower == filterOpNot || tok.val == "(" || tok.val == ")" {
+				return nil, fmt.Errorf("multi-clause inner filters in value paths are not supported")
+			}
+		}
+	}
+
+	var clause *innerClause
+	if len(innerTokens) == 2 {
+		attr := innerTokens[0].val
+		op := strings.ToLower(innerTokens[1].val)
+		if op != filterOpPr {
+			return nil, fmt.Errorf("expected 'pr' operator in 2-token inner filter, got: %s", innerTokens[1].val)
+		}
+		if _, _, err := resolveSubAttribute(collectionAttr, attr); err != nil {
+			return nil, err
+		}
+		clause = &innerClause{attr: attr, op: op}
+	} else if len(innerTokens) == 3 {
+		attr := innerTokens[0].val
+		op := strings.ToLower(innerTokens[1].val)
+		val := innerTokens[2].val
+		_, isBool, err := resolveSubAttribute(collectionAttr, attr)
+		if err != nil {
+			return nil, err
+		}
+		if isBool {
+			if op != filterOpEq && op != filterOpNe && op != filterOpPr {
+				return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", op, attr)
+			}
+			if !strings.EqualFold(val, "true") && !strings.EqualFold(val, "false") {
+				return nil, fmt.Errorf("invalid boolean value for attribute '%s': %s", attr, val)
+			}
+		}
+		clause = &innerClause{attr: attr, op: op, val: val}
+	} else if len(innerTokens) == 1 {
+		attr := innerTokens[0].val
+		if _, _, err := resolveSubAttribute(collectionAttr, attr); err != nil {
+			return nil, err
+		}
+		clause = &innerClause{attr: attr, op: filterOpPr}
+	} else if len(innerTokens) > 0 {
+		return nil, fmt.Errorf("invalid inner filter in value path")
+	}
+
+	if subAttr != "" {
+		if _, _, err := resolveSubAttribute(collectionAttr, subAttr); err != nil {
+			return nil, err
+		}
+	}
+
+	col := p.resolveJSONColumn(collectionAttr)
 
 	// Now we need operator + value for the outer comparison
 	opToken := p.peek()
 	if opToken == nil || opToken.typ != tokenWord {
 		// Just a path filter without outer comparison (pr-style)
-		col := p.resolveJSONColumn(collectionAttr)
-		innerFilter := strings.Join(filterParts, " ")
-		return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, "", "")
+		return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, "", "")
 	}
 
 	operator := strings.ToLower(opToken.val)
 
 	// If the next token is a logical keyword, this is a standalone value path filter
 	if operator == filterOpAnd || operator == filterOpOr || operator == filterOpNot {
-		col := p.resolveJSONColumn(collectionAttr)
-		innerFilter := strings.Join(filterParts, " ")
-		return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, "", "")
+		return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, "", "")
+	}
+
+	if subAttr != "" {
+		_, isBool, _ := resolveSubAttribute(collectionAttr, subAttr)
+		if isBool {
+			if operator != filterOpPr && operator != filterOpEq && operator != filterOpNe {
+				return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", operator, subAttr)
+			}
+		}
 	}
 
 	if operator == filterOpPr {
 		p.next()
-		col := p.resolveJSONColumn(collectionAttr)
-		innerFilter := strings.Join(filterParts, " ")
-		return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, filterOpPr, "")
+		return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, filterOpPr, "")
 	}
 
 	// Regular comparison
@@ -546,9 +652,16 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	}
 	value := valToken.val
 
-	col := p.resolveJSONColumn(collectionAttr)
-	innerFilter := strings.Join(filterParts, " ")
-	return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, operator, value)
+	if subAttr != "" {
+		_, isBool, _ := resolveSubAttribute(collectionAttr, subAttr)
+		if isBool {
+			if !strings.EqualFold(value, "true") && !strings.EqualFold(value, "false") {
+				return nil, fmt.Errorf("invalid boolean value for attribute '%s': %s", subAttr, value)
+			}
+		}
+	}
+
+	return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, operator, value)
 }
 
 func (p *filterParser) resolveColumn(attr string) (string, error) {
@@ -702,11 +815,36 @@ func (p *filterParser) buildComparison(attr, operator, value string) (*FilterRes
 		return nil, err
 	}
 
+	lowerAttr := strings.ToLower(attr)
+
+	// Validate boolean attributes: only eq and ne are supported per RFC 7644 §3.4.2.2
+	if isBooleanAttr(lowerAttr) {
+		if operator != filterOpEq && operator != filterOpNe {
+			return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", operator, attr)
+		}
+		if !strings.EqualFold(value, "true") && !strings.EqualFold(value, "false") {
+			return nil, fmt.Errorf("invalid boolean value for attribute '%s': %s", attr, value)
+		}
+	}
+
+	// Validate dateTime attributes per RFC 7643 §2.3.5
+	if lowerAttr == attrMetaCreated || lowerAttr == attrMetaLastModified {
+		if operator == filterOpCo || operator == filterOpSw || operator == filterOpEw {
+			return nil, fmt.Errorf("comparison operator '%s' is not supported for dateTime attribute '%s'", operator, attr)
+		}
+		t, err := parseDateTime(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid dateTime format for attribute '%s': %s", attr, value)
+		}
+		// Normalize to UTC string before SQL binding to avoid session timezone dependency
+		value = t.UTC().Format(time.RFC3339Nano)
+	}
+
 	isCaseInsensitive := caseInsensitiveAttrs[strings.ToLower(attr)]
 
 	switch operator {
 	case filterOpEq:
-		if strings.EqualFold(value, "true") || strings.EqualFold(value, "false") {
+		if isBooleanAttr(lowerAttr) {
 			param := p.nextParam()
 			boolVal := strings.EqualFold(value, "true")
 			return &FilterResult{SQL: col + " = " + param, Args: []any{boolVal}}, nil
@@ -719,6 +857,10 @@ func (p *filterParser) buildComparison(attr, operator, value string) (*FilterRes
 
 	case filterOpNe:
 		param := p.nextParam()
+		if isBooleanAttr(lowerAttr) {
+			boolVal := strings.EqualFold(value, "true")
+			return &FilterResult{SQL: "(" + col + " != " + param + " OR " + col + " IS NULL)", Args: []any{boolVal}}, nil
+		}
 		if isCaseInsensitive {
 			return &FilterResult{SQL: "(" + sqlLowerPrefix + col + ") != " + sqlLowerPrefix + param + ") OR " + col + " IS NULL)", Args: []any{value}}, nil
 		}
@@ -769,7 +911,68 @@ func (p *filterParser) buildComparison(attr, operator, value string) (*FilterRes
 	}
 }
 
+func resolveSubAttribute(collectionAttr, subAttr string) (string, bool, error) {
+	colLower := strings.ToLower(collectionAttr)
+	subLower := strings.ToLower(subAttr)
+
+	switch colLower {
+	case jsonCollectionEmails, jsonCollectionPhoneNumbers, jsonCollectionIms, jsonCollectionPhotos,
+		jsonCollectionEntitlements, jsonCollectionRoles, jsonCollectionX509Certificates:
+		switch subLower {
+		case "value":
+			return "value", false, nil
+		case "type":
+			return "type", false, nil
+		case "display":
+			return "display", false, nil
+		case "primary":
+			return "primaryFlag", true, nil
+		default:
+			return "", false, fmt.Errorf("unknown sub-attribute '%s' for '%s'", subAttr, collectionAttr)
+		}
+	case jsonCollectionAddresses:
+		switch subLower {
+		case "formatted":
+			return "formatted", false, nil
+		case "streetaddress":
+			return "streetAddress", false, nil
+		case "locality":
+			return "locality", false, nil
+		case "region":
+			return "region", false, nil
+		case "postalcode":
+			return "postalCode", false, nil
+		case "country":
+			return "country", false, nil
+		case "type":
+			return "type", false, nil
+		case "primary":
+			return "primaryFlag", true, nil
+		default:
+			return "", false, fmt.Errorf("unknown sub-attribute '%s' for '%s'", subAttr, collectionAttr)
+		}
+	default:
+		return "", false, fmt.Errorf("attribute '%s' is not a multi-valued complex attribute", collectionAttr)
+	}
+}
+
 func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, operator, value string) (*FilterResult, error) {
+	jsonKey, isBool, err := resolveSubAttribute(collectionName, subAttr)
+	if err != nil {
+		return nil, err
+	}
+
+	if isBool {
+		if operator != filterOpEq && operator != filterOpPr {
+			return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s.%s'", operator, collectionName, subAttr)
+		}
+		if operator == filterOpEq {
+			if !strings.EqualFold(value, "true") && !strings.EqualFold(value, "false") {
+				return nil, fmt.Errorf("invalid boolean value for attribute '%s.%s': %s", collectionName, subAttr, value)
+			}
+		}
+	}
+
 	// For JSON columns, we use casting to text and LIKE patterns
 	// This matches the Java implementation's approach
 	param := p.nextParam()
@@ -777,11 +980,12 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 
 	switch operator {
 	case filterOpEq:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s"%%`, escaped)
-		if subAttr == "value" || subAttr == "type" || subAttr == "display" {
+		var pattern string
+		if isBool {
+			pattern = fmt.Sprintf(`%%"primaryFlag":%s%%`, strings.ToLower(value))
+		} else {
 			// Match JSON key-value pair
-			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, subAttr, escaped)
+			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, jsonKey, escapeLikeValue(value))
 		}
 		if isCaseInsensitive {
 			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
@@ -790,7 +994,7 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 
 	case filterOpCo:
 		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%%%s%%"%%`, subAttr, escaped)
+		pattern := fmt.Sprintf(`%%"%s":"%%%s%%"%%`, jsonKey, escaped)
 		if isCaseInsensitive {
 			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
 		}
@@ -798,7 +1002,7 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 
 	case filterOpSw:
 		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%s%%"%%`, subAttr, escaped)
+		pattern := fmt.Sprintf(`%%"%s":"%s%%"%%`, jsonKey, escaped)
 		if isCaseInsensitive {
 			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
 		}
@@ -806,7 +1010,7 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 
 	case filterOpEw:
 		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%%%s"%%`, subAttr, escaped)
+		pattern := fmt.Sprintf(`%%"%s":"%%%s"%%`, jsonKey, escaped)
 		if isCaseInsensitive {
 			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
 		}
@@ -820,65 +1024,107 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 	}
 }
 
-func (p *filterParser) buildJSONContainsFilter(col, _, innerFilter, subAttr, operator, value string) (*FilterResult, error) {
-	// This handles value path filters like emails[type eq "work"].value eq "user@example.com"
-	// We combine inner filter + outer comparison into a LIKE pattern on the JSON text
-	param := p.nextParam()
-
-	if operator == "" || operator == filterOpPr {
-		// Just check if the collection has a matching element
-		// Parse inner filter to extract key=value
-		innerParts := parseSimpleEqFilter(innerFilter)
-		if innerParts == nil {
-			return &FilterResult{SQL: col + sqlIsNotNullAnd + col + sqlTextNotEqualsEmptyArray, Args: nil}, nil
-		}
-		pattern := fmt.Sprintf(`%%"%s":"%s"%%`, innerParts[0], escapeLikeValue(innerParts[1]))
-		return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
+func (p *filterParser) buildElemCondition(collectionAttr, attr, op, val string) (string, []any, error) {
+	jsonKey, isBool, err := resolveSubAttribute(collectionAttr, attr)
+	if err != nil {
+		return "", nil, err
 	}
 
-	// For combined filters, we use a simpler approach:
-	// Check if the stringified JSON contains the expected patterns
-	innerParts := parseSimpleEqFilter(innerFilter)
-	outerEscaped := escapeLikeValue(value)
-
-	if innerParts != nil && subAttr != "" {
-		// Combined: emails[type eq "work"].value eq "user@example.com"
-		// Build a pattern that matches both conditions in the same JSON object
-		innerPattern := fmt.Sprintf(`"%s":"%s"`, innerParts[0], escapeLikeValue(innerParts[1]))
-		var outerPattern string
-		switch operator {
-		case filterOpEq:
-			outerPattern = fmt.Sprintf(`"%s":"%s"`, subAttr, outerEscaped)
-		case filterOpCo:
-			outerPattern = fmt.Sprintf(`"%s":"%%%s%%"`, subAttr, outerEscaped)
-		case filterOpSw:
-			outerPattern = fmt.Sprintf(`"%s":"%s%%"`, subAttr, outerEscaped)
-		case filterOpEw:
-			outerPattern = fmt.Sprintf(`"%s":"%%%s"`, subAttr, outerEscaped)
-		default:
-			return nil, fmt.Errorf("unsupported operator in value path filter: %s", operator)
+	if isBool {
+		if op != filterOpEq && op != filterOpNe && op != filterOpPr {
+			return "", nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", op, attr)
 		}
-		pattern := "%%" + innerPattern + "%%" + outerPattern + "%%"
-		return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
+		if op == filterOpPr {
+			return fmt.Sprintf("(elem->>'%s') IS NOT NULL", jsonKey), nil, nil
+		}
+		if !strings.EqualFold(val, "true") && !strings.EqualFold(val, "false") {
+			return "", nil, fmt.Errorf("invalid boolean value for attribute '%s': %s", attr, val)
+		}
+		param := p.nextParam()
+		boolStr := strings.ToLower(val)
+		if op == filterOpEq {
+			return fmt.Sprintf("(elem->>'%s') = %s", jsonKey, param), []any{boolStr}, nil
+		}
+		// filterOpNe
+		return fmt.Sprintf("((elem->>'%s') != %s OR (elem->>'%s') IS NULL)", jsonKey, param, jsonKey), []any{boolStr}, nil
 	}
 
-	// Fallback: just search for value in JSON text
-	pattern := "%%" + outerEscaped + "%%"
-	return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
+	switch op {
+	case filterOpPr:
+		return fmt.Sprintf("((elem->>'%s') IS NOT NULL AND (elem->>'%s') != '')", jsonKey, jsonKey), nil, nil
+	case filterOpEq:
+		param := p.nextParam()
+		return fmt.Sprintf("LOWER(elem->>'%s') = LOWER(%s)", jsonKey, param), []any{val}, nil
+	case filterOpNe:
+		param := p.nextParam()
+		return fmt.Sprintf("((elem->>'%s') IS NULL OR LOWER(elem->>'%s') != LOWER(%s))", jsonKey, jsonKey, param), []any{val}, nil
+	case filterOpCo:
+		param := p.nextParam()
+		escaped := escapeLikeValue(val)
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{"%" + escaped + "%"}, nil
+	case filterOpSw:
+		param := p.nextParam()
+		escaped := escapeLikeValue(val)
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{escaped + "%"}, nil
+	case filterOpEw:
+		param := p.nextParam()
+		escaped := escapeLikeValue(val)
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{"%" + escaped}, nil
+	case filterOpGt:
+		param := p.nextParam()
+		return fmt.Sprintf("LOWER(elem->>'%s') > LOWER(%s)", jsonKey, param), []any{val}, nil
+	case filterOpGe:
+		param := p.nextParam()
+		return fmt.Sprintf("LOWER(elem->>'%s') >= LOWER(%s)", jsonKey, param), []any{val}, nil
+	case filterOpLt:
+		param := p.nextParam()
+		return fmt.Sprintf("LOWER(elem->>'%s') < LOWER(%s)", jsonKey, param), []any{val}, nil
+	case filterOpLe:
+		param := p.nextParam()
+		return fmt.Sprintf("LOWER(elem->>'%s') <= LOWER(%s)", jsonKey, param), []any{val}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported operator in value path filter: %s", op)
+	}
 }
 
-// parseSimpleEqFilter extracts [key, value] from a simple "key eq value" filter.
-func parseSimpleEqFilter(filter string) []string {
-	filter = strings.TrimSpace(filter)
-	parts := strings.SplitN(filter, " ", 3)
-	if len(parts) != 3 {
-		return nil
+func (p *filterParser) buildJSONContainsFilter(col, collectionAttr string, clause *innerClause, subAttr, operator, value string) (*FilterResult, error) {
+	var conds []string
+	var args []any
+
+	if clause != nil && clause.attr != "" {
+		c, a, err := p.buildElemCondition(collectionAttr, clause.attr, clause.op, clause.val)
+		if err != nil {
+			return nil, err
+		}
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
-	if !strings.EqualFold(parts[1], filterOpEq) {
-		return nil
+
+	if subAttr != "" {
+		op := operator
+		if op == "" {
+			op = filterOpPr
+		}
+		c, a, err := p.buildElemCondition(collectionAttr, subAttr, op, value)
+		if err != nil {
+			return nil, err
+		}
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
-	value := strings.Trim(parts[2], `"`)
-	return []string{parts[0], value}
+
+	if len(conds) == 0 {
+		return &FilterResult{SQL: col + sqlIsNotNullAnd + col + sqlTextNotEqualsEmptyArray, Args: nil}, nil
+	}
+
+	whereClause := strings.Join(conds, " AND ")
+	sql := fmt.Sprintf("(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE %s))",
+		col, col, col, col, whereClause)
+
+	return &FilterResult{
+		SQL:  sql,
+		Args: args,
+	}, nil
 }
 
 func escapeLikeValue(value string) string {
@@ -896,4 +1142,30 @@ func escapeLikeValue(value string) string {
 		}
 	}
 	return b.String()
+}
+
+func isBooleanAttr(attr string) bool {
+	return strings.ToLower(attr) == attrActive
+}
+
+// parseDateTime parses date and dateTime strings per RFC 7643 §2.3.5 (which recommends RFC 3339 / ISO 8601).
+// Accepts RFC 3339 strings with timezone offset, as well as zoneless local datetimes (interpreted as UTC).
+// Date-only strings without a time component are rejected per RFC 7643 §2.3.5.
+func parseDateTime(s string) (time.Time, error) {
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02 15:04:05.999999999",
+	}
+	for _, f := range formats {
+		if t, err := time.ParseInLocation(f, s, time.UTC); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid dateTime format: %s", s)
+}
+
+func isValidDateTime(s string) bool {
+	_, err := parseDateTime(s)
+	return err == nil
 }

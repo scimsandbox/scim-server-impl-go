@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -702,6 +703,22 @@ func (p *filterParser) buildComparison(attr, operator, value string) (*FilterRes
 		return nil, err
 	}
 
+	lowerAttr := strings.ToLower(attr)
+
+	// Validate boolean attributes: only eq and ne are supported per RFC 7644 §3.4.2.2
+	if lowerAttr == attrActive {
+		if operator != filterOpEq && operator != filterOpNe {
+			return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", operator, attr)
+		}
+	}
+
+	// Validate dateTime attributes per RFC 7643 §2.3.5
+	if lowerAttr == attrMetaCreated || lowerAttr == attrMetaLastModified {
+		if !isValidDateTime(value) {
+			return nil, fmt.Errorf("invalid dateTime format for attribute '%s': %s", attr, value)
+		}
+	}
+
 	isCaseInsensitive := caseInsensitiveAttrs[strings.ToLower(attr)]
 
 	switch operator {
@@ -896,4 +913,22 @@ func escapeLikeValue(value string) string {
 		}
 	}
 	return b.String()
+}
+
+func isValidDateTime(s string) bool {
+	formats := []string{
+		time.RFC3339,
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, f := range formats {
+		if _, err := time.Parse(f, s); err == nil {
+			return true
+		}
+	}
+	return false
 }

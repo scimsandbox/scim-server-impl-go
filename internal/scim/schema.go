@@ -16,7 +16,7 @@ func ServiceProviderConfig() map[string]any {
 			"maxResults": 200,
 		},
 		"pagination": map[string]any{
-			"cursor":                true,
+			"cursor":                false,
 			"index":                 true,
 			"defaultPaginationMode": "index",
 			"defaultPageSize":       10,

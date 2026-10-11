@@ -174,6 +174,12 @@ func TestParseFilter_Invalid(t *testing.T) {
     if _, err := ParseUserFilter("(userName eq \"test\"", 1); err == nil {
         t.Fatalf("expected error for unmatched paren")
     }
+    if _, err := ParseUserFilter(`meta.lastModified gt "not-an-iso-8601-date"`, 1); err == nil {
+        t.Fatalf("expected error for malformed dateTime in filter")
+    }
+    if _, err := ParseUserFilter(`active gt true`, 1); err == nil {
+        t.Fatalf("expected error for gt on boolean attribute")
+    }
 }
 
 func TestParseUserFilter_UnknownAttribute(t *testing.T) {

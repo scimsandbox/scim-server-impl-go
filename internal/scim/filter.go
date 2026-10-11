@@ -258,16 +258,29 @@ var caseInsensitiveAttrs = map[string]bool{
 	attrTimeZone:              true,
 	attrEmailsValue:           true,
 	attrEmailsType:            true,
+	"emails.display":           true,
 	attrPhoneNumbersValue:     true,
 	attrPhoneNumbersType:      true,
+	"phonenumbers.display":     true,
 	attrImsValue:              true,
 	attrImsType:               true,
+	"ims.display":              true,
 	attrAddressesType:         true,
+	"addresses.formatted":      true,
+	"addresses.streetaddress":  true,
+	"addresses.locality":       true,
+	"addresses.region":         true,
+	"addresses.postalcode":     true,
+	"addresses.country":        true,
 	attrPhotosValue:           true,
 	attrPhotosType:            true,
+	"photos.display":           true,
 	attrRolesValue:            true,
+	"roles.display":            true,
 	attrEntitlementsValue:     true,
+	"entitlements.display":     true,
 	attrX509CertificatesValue: true,
+	"x509certificates.display": true,
 }
 
 // ── URN prefix handling ─────────────────────────────
@@ -491,6 +504,9 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	filterStart := raw[bracketIdx+1:]
 
 	if !isJSONCollection(collectionAttr) {
+		if strings.EqualFold(collectionAttr, "members") {
+			return nil, fmt.Errorf("value path filters on 'members' are not supported")
+		}
 		return nil, fmt.Errorf("attribute '%s' is not a multi-valued complex attribute", collectionAttr)
 	}
 
@@ -1056,16 +1072,16 @@ func (p *filterParser) buildElemCondition(collectionAttr, attr, op, val string) 
 		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{"%" + escaped}, nil
 	case filterOpGt:
 		param := p.nextParam()
-		return fmt.Sprintf("(elem->>'%s') > %s", jsonKey, param), []any{val}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') > LOWER(%s)", jsonKey, param), []any{val}, nil
 	case filterOpGe:
 		param := p.nextParam()
-		return fmt.Sprintf("(elem->>'%s') >= %s", jsonKey, param), []any{val}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') >= LOWER(%s)", jsonKey, param), []any{val}, nil
 	case filterOpLt:
 		param := p.nextParam()
-		return fmt.Sprintf("(elem->>'%s') < %s", jsonKey, param), []any{val}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') < LOWER(%s)", jsonKey, param), []any{val}, nil
 	case filterOpLe:
 		param := p.nextParam()
-		return fmt.Sprintf("(elem->>'%s') <= %s", jsonKey, param), []any{val}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') <= LOWER(%s)", jsonKey, param), []any{val}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported operator in value path filter: %s", op)
 	}
@@ -1102,8 +1118,8 @@ func (p *filterParser) buildJSONContainsFilter(col, collectionAttr string, claus
 	}
 
 	whereClause := strings.Join(conds, " AND ")
-	sql := fmt.Sprintf("(%s IS NOT NULL AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE %s))",
-		col, col, col, whereClause)
+	sql := fmt.Sprintf("(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE %s))",
+		col, col, col, col, whereClause)
 
 	return &FilterResult{
 		SQL:  sql,

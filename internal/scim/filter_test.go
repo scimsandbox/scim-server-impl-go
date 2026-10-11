@@ -456,4 +456,32 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 	if _, err := ParseUserFilter(`emails.value ne "x"`, 1); err == nil {
 		t.Fatalf("expected error for emails.value ne 'x' (unsupported operator)")
 	}
+
+	// Members value path filter returns clear message
+	if _, err := ParseUserFilter(`members[value eq "x"]`, 1); err == nil {
+		t.Fatalf("expected error for members value path filter")
+	} else if !strings.Contains(err.Error(), "value path filters on 'members' are not supported") {
+		t.Fatalf("unexpected error message for members: %v", err)
+	}
+
+	// Direct emails.display eq is case-insensitive
+	resDisplay, err := ParseUserFilter(`emails.display eq "Work"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for emails.display eq 'Work': %v", err)
+	}
+	if !strings.Contains(resDisplay.SQL, "LOWER(") {
+		t.Fatalf("expected LOWER() in SQL for emails.display, got %s", resDisplay.SQL)
+	}
+
+	// Value path gt is lowercased and SQL includes jsonb_typeof check
+	resGt, err := ParseUserFilter(`emails[type gt "work"].value eq "x"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error for emails[type gt work]: %v", err)
+	}
+	if !strings.Contains(resGt.SQL, "jsonb_typeof(emails::jsonb) = 'array'") {
+		t.Fatalf("expected jsonb_typeof guard in SQL, got %s", resGt.SQL)
+	}
+	if !strings.Contains(resGt.SQL, "LOWER(elem->>'type') > LOWER($1)") {
+		t.Fatalf("expected LOWER(elem->>'type') > LOWER($1) in SQL, got %s", resGt.SQL)
+	}
 }

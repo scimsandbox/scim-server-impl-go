@@ -116,6 +116,7 @@ const (
 	sqlLike                    = " LIKE "
 	sqlTextCast                = "::text"
 	sqlTextLike                = sqlTextCast + sqlLike
+	sqlTextNotLike             = sqlTextCast + " NOT LIKE "
 	sqlTextLowerLikeSeparator  = sqlTextCast + sqlLowerLikeSeparator
 	sqlIsNotNull               = " IS NOT NULL"
 	sqlIsNotNullAnd            = sqlIsNotNull + " AND "
@@ -479,19 +480,28 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	collectionAttr := raw[:bracketIdx]
 	filterStart := raw[bracketIdx+1:]
 
-	// Collect tokens until we find "]" or something ending with "]"
+	// Collect tokens until we find "]" or something containing "]"
 	filterParts := []string{filterStart}
+	var subAttr string
 	for {
 		t := p.peek()
 		if t == nil {
 			return nil, fmt.Errorf("unterminated value path filter")
 		}
+		p.next()
 		val := t.val
-		if strings.HasSuffix(val, "]") {
-			p.next()
-			val = strings.TrimSuffix(val, "]")
-			if val != "" {
-				filterParts = append(filterParts, val)
+		if closeIdx := strings.Index(val, "]"); closeIdx >= 0 {
+			before := val[:closeIdx]
+			if before != "" {
+				if t.typ == tokenString {
+					filterParts = append(filterParts, `"`+before+`"`)
+				} else {
+					filterParts = append(filterParts, before)
+				}
+			}
+			after := val[closeIdx+1:]
+			if strings.HasPrefix(after, ".") {
+				subAttr = after[1:]
 			}
 			break
 		}
@@ -500,18 +510,21 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 		} else {
 			filterParts = append(filterParts, val)
 		}
-		p.next()
 	}
 	// filterParts is the inner filter (e.g. ["type", "eq", "work"])
 
-	// Check for sub-attribute after "]" (e.g. ".value")
-	// The "." should be part of the next token, or...
-	// Actually, the tokenizer would give us ".value" as a separate token
-	var subAttr string
-	t := p.peek()
-	if t != nil && t.typ == tokenWord && strings.HasPrefix(t.val, ".") {
-		subAttr = t.val[1:]
-		p.next()
+	// Check for sub-attribute after "]" if not already extracted (e.g. ".value" as a separate token)
+	if subAttr == "" {
+		t := p.peek()
+		if t != nil && t.typ == tokenWord && strings.HasPrefix(t.val, ".") {
+			subAttr = t.val[1:]
+			p.next()
+		}
+	}
+
+	innerFilter := strings.Join(filterParts, " ")
+	if err := validateInnerFilter(innerFilter); err != nil {
+		return nil, err
 	}
 
 	// Now we need operator + value for the outer comparison
@@ -519,7 +532,6 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	if opToken == nil || opToken.typ != tokenWord {
 		// Just a path filter without outer comparison (pr-style)
 		col := p.resolveJSONColumn(collectionAttr)
-		innerFilter := strings.Join(filterParts, " ")
 		return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, "", "")
 	}
 
@@ -528,14 +540,18 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	// If the next token is a logical keyword, this is a standalone value path filter
 	if operator == filterOpAnd || operator == filterOpOr || operator == filterOpNot {
 		col := p.resolveJSONColumn(collectionAttr)
-		innerFilter := strings.Join(filterParts, " ")
 		return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, "", "")
+	}
+
+	if isBooleanAttr(subAttr) {
+		if operator != filterOpPr && operator != filterOpEq && operator != filterOpNe {
+			return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", operator, subAttr)
+		}
 	}
 
 	if operator == filterOpPr {
 		p.next()
 		col := p.resolveJSONColumn(collectionAttr)
-		innerFilter := strings.Join(filterParts, " ")
 		return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, filterOpPr, "")
 	}
 
@@ -547,8 +563,13 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	}
 	value := valToken.val
 
+	if isBooleanAttr(subAttr) {
+		if !strings.EqualFold(value, "true") && !strings.EqualFold(value, "false") {
+			return nil, fmt.Errorf("invalid boolean value for attribute '%s': %s", subAttr, value)
+		}
+	}
+
 	col := p.resolveJSONColumn(collectionAttr)
-	innerFilter := strings.Join(filterParts, " ")
 	return p.buildJSONContainsFilter(col, collectionAttr, innerFilter, subAttr, operator, value)
 }
 
@@ -706,24 +727,33 @@ func (p *filterParser) buildComparison(attr, operator, value string) (*FilterRes
 	lowerAttr := strings.ToLower(attr)
 
 	// Validate boolean attributes: only eq and ne are supported per RFC 7644 §3.4.2.2
-	if lowerAttr == attrActive {
+	if isBooleanAttr(lowerAttr) {
 		if operator != filterOpEq && operator != filterOpNe {
 			return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", operator, attr)
+		}
+		if !strings.EqualFold(value, "true") && !strings.EqualFold(value, "false") {
+			return nil, fmt.Errorf("invalid boolean value for attribute '%s': %s", attr, value)
 		}
 	}
 
 	// Validate dateTime attributes per RFC 7643 §2.3.5
 	if lowerAttr == attrMetaCreated || lowerAttr == attrMetaLastModified {
-		if !isValidDateTime(value) {
+		if operator == filterOpCo || operator == filterOpSw || operator == filterOpEw {
+			return nil, fmt.Errorf("comparison operator '%s' is not supported for dateTime attribute '%s'", operator, attr)
+		}
+		t, err := parseDateTime(value)
+		if err != nil {
 			return nil, fmt.Errorf("invalid dateTime format for attribute '%s': %s", attr, value)
 		}
+		// Normalize to UTC string before SQL binding to avoid session timezone dependency
+		value = t.UTC().Format(time.RFC3339Nano)
 	}
 
 	isCaseInsensitive := caseInsensitiveAttrs[strings.ToLower(attr)]
 
 	switch operator {
 	case filterOpEq:
-		if strings.EqualFold(value, "true") || strings.EqualFold(value, "false") {
+		if isBooleanAttr(lowerAttr) {
 			param := p.nextParam()
 			boolVal := strings.EqualFold(value, "true")
 			return &FilterResult{SQL: col + " = " + param, Args: []any{boolVal}}, nil
@@ -736,6 +766,10 @@ func (p *filterParser) buildComparison(attr, operator, value string) (*FilterRes
 
 	case filterOpNe:
 		param := p.nextParam()
+		if isBooleanAttr(lowerAttr) {
+			boolVal := strings.EqualFold(value, "true")
+			return &FilterResult{SQL: "(" + col + " != " + param + " OR " + col + " IS NULL)", Args: []any{boolVal}}, nil
+		}
 		if isCaseInsensitive {
 			return &FilterResult{SQL: "(" + sqlLowerPrefix + col + ") != " + sqlLowerPrefix + param + ") OR " + col + " IS NULL)", Args: []any{value}}, nil
 		}
@@ -787,6 +821,17 @@ func (p *filterParser) buildComparison(attr, operator, value string) (*FilterRes
 }
 
 func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, operator, value string) (*FilterResult, error) {
+	if isBooleanAttr(subAttr) {
+		if operator != filterOpEq && operator != filterOpNe && operator != filterOpPr {
+			return nil, fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s.%s'", operator, collectionName, subAttr)
+		}
+		if operator == filterOpEq || operator == filterOpNe {
+			if !strings.EqualFold(value, "true") && !strings.EqualFold(value, "false") {
+				return nil, fmt.Errorf("invalid boolean value for attribute '%s.%s': %s", collectionName, subAttr, value)
+			}
+		}
+	}
+
 	// For JSON columns, we use casting to text and LIKE patterns
 	// This matches the Java implementation's approach
 	param := p.nextParam()
@@ -794,16 +839,30 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 
 	switch operator {
 	case filterOpEq:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s"%%`, escaped)
-		if subAttr == "value" || subAttr == "type" || subAttr == "display" {
+		var pattern string
+		if isBooleanAttr(subAttr) {
+			pattern = fmt.Sprintf(`%%"primaryFlag":%s%%`, strings.ToLower(value))
+		} else if subAttr == "value" || subAttr == "type" || subAttr == "display" {
 			// Match JSON key-value pair
-			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, subAttr, escaped)
+			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, subAttr, escapeLikeValue(value))
+		} else {
+			pattern = fmt.Sprintf(`%%"%s"%%`, escapeLikeValue(value))
 		}
 		if isCaseInsensitive {
 			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
 		}
 		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
+
+	case filterOpNe:
+		var pattern string
+		if isBooleanAttr(subAttr) {
+			pattern = fmt.Sprintf(`%%"primaryFlag":%s%%`, strings.ToLower(value))
+		} else if subAttr == "value" || subAttr == "type" || subAttr == "display" {
+			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, subAttr, escapeLikeValue(value))
+		} else {
+			pattern = fmt.Sprintf(`%%"%s"%%`, escapeLikeValue(value))
+		}
+		return &FilterResult{SQL: "(" + col + sqlTextNotLike + param + " OR " + col + " IS NULL)", Args: []any{pattern}}, nil
 
 	case filterOpCo:
 		escaped := escapeLikeValue(value)
@@ -849,7 +908,12 @@ func (p *filterParser) buildJSONContainsFilter(col, _, innerFilter, subAttr, ope
 		if innerParts == nil {
 			return &FilterResult{SQL: col + sqlIsNotNullAnd + col + sqlTextNotEqualsEmptyArray, Args: nil}, nil
 		}
-		pattern := fmt.Sprintf(`%%"%s":"%s"%%`, innerParts[0], escapeLikeValue(innerParts[1]))
+		var pattern string
+		if isBooleanAttr(innerParts[0]) {
+			pattern = fmt.Sprintf(`%%"primaryFlag":%s%%`, strings.ToLower(innerParts[1]))
+		} else {
+			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, innerParts[0], escapeLikeValue(innerParts[1]))
+		}
 		return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
 	}
 
@@ -861,19 +925,28 @@ func (p *filterParser) buildJSONContainsFilter(col, _, innerFilter, subAttr, ope
 	if innerParts != nil && subAttr != "" {
 		// Combined: emails[type eq "work"].value eq "user@example.com"
 		// Build a pattern that matches both conditions in the same JSON object
-		innerPattern := fmt.Sprintf(`"%s":"%s"`, innerParts[0], escapeLikeValue(innerParts[1]))
+		var innerPattern string
+		if isBooleanAttr(innerParts[0]) {
+			innerPattern = fmt.Sprintf(`"primaryFlag":%s`, strings.ToLower(innerParts[1]))
+		} else {
+			innerPattern = fmt.Sprintf(`"%s":"%s"`, innerParts[0], escapeLikeValue(innerParts[1]))
+		}
 		var outerPattern string
-		switch operator {
-		case filterOpEq:
-			outerPattern = fmt.Sprintf(`"%s":"%s"`, subAttr, outerEscaped)
-		case filterOpCo:
-			outerPattern = fmt.Sprintf(`"%s":"%%%s%%"`, subAttr, outerEscaped)
-		case filterOpSw:
-			outerPattern = fmt.Sprintf(`"%s":"%s%%"`, subAttr, outerEscaped)
-		case filterOpEw:
-			outerPattern = fmt.Sprintf(`"%s":"%%%s"`, subAttr, outerEscaped)
-		default:
-			return nil, fmt.Errorf("unsupported operator in value path filter: %s", operator)
+		if isBooleanAttr(subAttr) {
+			outerPattern = fmt.Sprintf(`"primaryFlag":%s`, strings.ToLower(value))
+		} else {
+			switch operator {
+			case filterOpEq:
+				outerPattern = fmt.Sprintf(`"%s":"%s"`, subAttr, outerEscaped)
+			case filterOpCo:
+				outerPattern = fmt.Sprintf(`"%s":"%%%s%%"`, subAttr, outerEscaped)
+			case filterOpSw:
+				outerPattern = fmt.Sprintf(`"%s":"%s%%"`, subAttr, outerEscaped)
+			case filterOpEw:
+				outerPattern = fmt.Sprintf(`"%s":"%%%s"`, subAttr, outerEscaped)
+			default:
+				return nil, fmt.Errorf("unsupported operator in value path filter: %s", operator)
+			}
 		}
 		pattern := "%%" + innerPattern + "%%" + outerPattern + "%%"
 		return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
@@ -915,20 +988,66 @@ func escapeLikeValue(value string) string {
 	return b.String()
 }
 
-func isValidDateTime(s string) bool {
+var logicalOpRegex = regexp.MustCompile(`(?i)\s+(?:and|or)\s+`)
+
+func isBooleanAttr(attr string) bool {
+	lower := strings.ToLower(attr)
+	if lower == attrActive || lower == "primary" {
+		return true
+	}
+	parts := strings.Split(lower, ".")
+	if len(parts) > 1 && parts[len(parts)-1] == "primary" {
+		return true
+	}
+	return false
+}
+
+func validateInnerFilter(filter string) error {
+	clauses := logicalOpRegex.Split(strings.TrimSpace(filter), -1)
+	for _, clause := range clauses {
+		fields := strings.Fields(strings.TrimSpace(clause))
+		if len(fields) < 2 {
+			continue
+		}
+		attr := fields[0]
+		op := strings.ToLower(fields[1])
+		if isBooleanAttr(attr) {
+			if op == filterOpPr {
+				continue
+			}
+			if op != filterOpEq && op != filterOpNe {
+				return fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", op, attr)
+			}
+			if len(fields) < 3 {
+				return fmt.Errorf("expected value for attribute '%s'", attr)
+			}
+			val := strings.Trim(fields[2], `"`)
+			if !strings.EqualFold(val, "true") && !strings.EqualFold(val, "false") {
+				return fmt.Errorf("invalid boolean value for attribute '%s': %s", attr, val)
+			}
+		}
+	}
+	return nil
+}
+
+// parseDateTime parses date and dateTime strings per RFC 7643 §2.3.5 (which recommends RFC 3339 / ISO 8601),
+// while also accepting common variants without timezone offset (interpreted as UTC) and date-only strings.
+func parseDateTime(s string) (time.Time, error) {
 	formats := []string{
 		time.RFC3339,
-		time.RFC3339Nano,
-		"2006-01-02T15:04:05Z07:00",
-		"2006-01-02T15:04:05",
 		"2006-01-02T15:04:05.999999999",
-		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999999",
 		"2006-01-02",
 	}
 	for _, f := range formats {
-		if _, err := time.Parse(f, s); err == nil {
-			return true
+		if t, err := time.ParseInLocation(f, s, time.UTC); err == nil {
+			return t.UTC(), nil
 		}
 	}
-	return false
+	return time.Time{}, fmt.Errorf("invalid dateTime format: %s", s)
+}
+
+func isValidDateTime(s string) bool {
+	_, err := parseDateTime(s)
+	return err == nil
 }

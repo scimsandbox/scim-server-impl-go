@@ -22,8 +22,9 @@ func TestResolveUserSortColumn(t *testing.T) {
 		{"name.givenname", "name_given_name"},
 		{"displayname", "display_name"},
 		{"title", "title"},
-		{"emails.value", "emails"},
-		{"email", "emails"},
+		{"emails", userSortEmailsExpression},
+		{"emails.value", userSortEmailsExpression},
+		{"email", userSortEmailsExpression},
 		{"meta.created", "created_at"},
 		{"meta.lastmodified", "last_modified"},
 		{"externalid", "external_id"},
@@ -38,6 +39,81 @@ func TestResolveUserSortColumn(t *testing.T) {
 			got := resolveUserSortColumn(tc.input)
 			if got != tc.want {
 				t.Fatalf("resolveUserSortColumn(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUserSortEmailsExpressionConstant(t *testing.T) {
+	t.Parallel()
+
+	const expected = `COALESCE((SELECT elem->>'value' FROM jsonb_array_elements(emails::jsonb) elem WHERE (COALESCE(elem->>'primaryFlag', elem->>'primary'))::boolean IS TRUE LIMIT 1), emails::jsonb->0->>'value')`
+	if userSortEmailsExpression != expected {
+		t.Fatalf("userSortEmailsExpression = %q, want %q", userSortEmailsExpression, expected)
+	}
+}
+
+// --- buildOrderClause ---
+
+func TestBuildOrderClause(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		col  string
+		dir  string
+		want string
+	}{
+		{"default_ascending", "user_name", "", "ORDER BY user_name ASC NULLS LAST"},
+		{"explicit_asc", "user_name", "ASC", "ORDER BY user_name ASC NULLS LAST"},
+		{"lowercase_asc", "user_name", "asc", "ORDER BY user_name ASC NULLS LAST"},
+		{"full_ascending", "user_name", "ascending", "ORDER BY user_name ASC NULLS LAST"},
+		{"explicit_desc", "user_name", "DESC", "ORDER BY user_name DESC NULLS FIRST"},
+		{"lowercase_desc", "user_name", "desc", "ORDER BY user_name DESC NULLS FIRST"},
+		{"full_descending", "user_name", "descending", "ORDER BY user_name DESC NULLS FIRST"},
+		{"mixed_case_descending", "user_name", "Descending", "ORDER BY user_name DESC NULLS FIRST"},
+		{"group_display_name_asc", "display_name", "ascending", "ORDER BY display_name ASC NULLS LAST"},
+		{"group_display_name_desc", "display_name", "descending", "ORDER BY display_name DESC NULLS FIRST"},
+		{"emails_expression_asc", userSortEmailsExpression, "ascending", "ORDER BY " + userSortEmailsExpression + " ASC NULLS LAST"},
+		{"emails_expression_desc", userSortEmailsExpression, "descending", "ORDER BY " + userSortEmailsExpression + " DESC NULLS FIRST"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := buildOrderClause(tc.col, tc.dir)
+			if got != tc.want {
+				t.Fatalf("buildOrderClause(%q, %q) = %q, want %q", tc.col, tc.dir, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- resolveGroupSortColumn ---
+
+func TestResolveGroupSortColumn(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"displayname", "display_name"},
+		{"display_name", "display_name"},
+		{"DISPLAYNAME", "display_name"},
+		{"meta.created", "created_at"},
+		{"meta.lastmodified", "last_modified"},
+		{"externalid", "external_id"},
+		{"", "display_name"},
+		{"unknown_attr", "display_name"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			t.Parallel()
+			got := resolveGroupSortColumn(tc.input)
+			if got != tc.want {
+				t.Fatalf("resolveGroupSortColumn(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
 	}

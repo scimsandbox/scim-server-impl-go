@@ -123,11 +123,7 @@ func (r *GroupRepository) List(ctx context.Context, workspaceID uuid.UUID, where
 	}
 
 	sortCol := resolveGroupSortColumn(sortAttr)
-	direction := "ASC"
-	if strings.EqualFold(sortDir, "descending") {
-		direction = "DESC"
-	}
-	query += fmt.Sprintf(" ORDER BY %s %s", sortCol, direction)
+	query += " " + buildOrderClause(sortCol, sortDir)
 	query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := jdbc.QueryContext(ctx, query, args...)

@@ -159,11 +159,11 @@ func userSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:User",
-		"name":       "User",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:User",
+		"name":        "User",
 		"description": "User Account",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:User",
@@ -184,11 +184,11 @@ func groupSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:Group",
-		"name":       "Group",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:Group",
+		"name":        "Group",
 		"description": "Group",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:Group",
@@ -214,11 +214,11 @@ func enterpriseUserSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
-		"name":       "EnterpriseUser",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
+		"name":        "EnterpriseUser",
 		"description": "Enterprise User Extension",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
@@ -282,11 +282,11 @@ func serviceProviderConfigSchema() map[string]any {
 	attrs := []map[string]any{docURI, patch, bulk, filter, pagination, changePassword, sort, etag, authSchemes}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig",
-		"name":       "ServiceProviderConfig",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig",
+		"name":        "ServiceProviderConfig",
 		"description": "Schema for representing the service provider's configuration",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig",
@@ -318,11 +318,11 @@ func resourceTypeSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:ResourceType",
-		"name":       "ResourceType",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:ResourceType",
+		"name":        "ResourceType",
 		"description": "Schema for representing resource types",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:ResourceType",
@@ -385,11 +385,11 @@ func schemaSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         coreSchemaURN,
-		"name":       "Schema",
+		"schemas":     []string{coreSchemaURN},
+		"id":          coreSchemaURN,
+		"name":        "Schema",
 		"description": "Schema for representing schemas",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:Schema",

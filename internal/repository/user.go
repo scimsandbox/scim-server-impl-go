@@ -196,11 +196,7 @@ func (r *UserRepository) List(ctx context.Context, workspaceID uuid.UUID, whereC
 	}
 
 	sortCol := resolveUserSortColumn(sortAttr)
-	direction := "ASC"
-	if strings.EqualFold(sortDir, "descending") {
-		direction = "DESC"
-	}
-	query += fmt.Sprintf(" ORDER BY %s %s", sortCol, direction)
+	query += " " + buildOrderClause(sortCol, sortDir)
 	query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := jdbc.QueryContext(ctx, query, args...)
@@ -220,6 +216,18 @@ func (r *UserRepository) List(ctx context.Context, workspaceID uuid.UUID, whereC
 	return users, rows.Err()
 }
 
+const userSortEmailsExpression = `COALESCE((SELECT elem->>'value' FROM jsonb_array_elements(emails::jsonb) elem WHERE (COALESCE(elem->>'primaryFlag', elem->>'primary'))::boolean IS TRUE LIMIT 1), emails::jsonb->0->>'value')`
+
+func buildOrderClause(sortCol, sortDir string) string {
+	direction := "ASC"
+	nullsOrder := "NULLS LAST"
+	if strings.EqualFold(sortDir, "descending") || strings.EqualFold(sortDir, "desc") {
+		direction = "DESC"
+		nullsOrder = "NULLS FIRST"
+	}
+	return fmt.Sprintf("ORDER BY %s %s %s", sortCol, direction, nullsOrder)
+}
+
 func resolveUserSortColumn(sortBy string) string {
 	switch strings.ToLower(sortBy) {
 	case "username", "user_name":
@@ -232,8 +240,8 @@ func resolveUserSortColumn(sortBy string) string {
 		return "display_name"
 	case "title":
 		return "title"
-	case "emails.value", "email":
-		return "emails"
+	case "emails", "emails.value", "email":
+		return userSortEmailsExpression
 	case "meta.created":
 		return "created_at"
 	case "meta.lastmodified":

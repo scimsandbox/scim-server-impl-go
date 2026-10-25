@@ -173,6 +173,8 @@ func ResolveUserSortAttribute(sortBy string) string {
 		return sqlDisplayName
 	case attrTitle:
 		return sqlTitle
+	case "emails", "emails.value", "email":
+		return "emails"
 	case attrMetaCreated:
 		return sqlCreatedAt
 	case attrMetaLastModified:

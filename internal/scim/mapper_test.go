@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 )
 
@@ -162,5 +164,59 @@ func TestApplyMsCompat(t *testing.T) {
 	roles := result["roles"].([]map[string]any)
 	if roles[0]["primary"] != "false" {
 		t.Fatalf("roles primary = %v, want string false", roles[0]["primary"])
+	}
+}
+
+func TestHashPassword(t *testing.T) {
+	// Plaintext password should be hashed
+	pw := "mySecretPass123"
+	hashed := HashPassword(&pw)
+	if hashed == nil {
+		t.Fatalf("expected non-nil hashed password")
+	}
+	if *hashed == pw {
+		t.Fatalf("expected password to be hashed, but was identical to plaintext")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*hashed), []byte(pw)); err != nil {
+		t.Fatalf("bcrypt verification failed: %v", err)
+	}
+
+	// Pre-hashed $2a$ password should remain untouched
+	preHashed := "$2a$10$abcdefghijklmnopqrstuvwxyz0123456789"
+	sameHashed := HashPassword(&preHashed)
+	if sameHashed == nil || *sameHashed != preHashed {
+		t.Fatalf("expected pre-hashed $2a$ password to remain unchanged, got %v", sameHashed)
+	}
+
+	// Pre-hashed $2b$ password should remain untouched
+	preHashed2b := "$2b$10$abcdefghijklmnopqrstuvwxyz0123456789"
+	sameHashed2b := HashPassword(&preHashed2b)
+	if sameHashed2b == nil || *sameHashed2b != preHashed2b {
+		t.Fatalf("expected pre-hashed $2b$ password to remain unchanged, got %v", sameHashed2b)
+	}
+
+	// Nil / empty stays nil / empty
+	if HashPassword(nil) != nil {
+		t.Fatalf("nil password should return nil")
+	}
+	empty := ""
+	resEmpty := HashPassword(&empty)
+	if resEmpty == nil || *resEmpty != "" {
+		t.Fatalf("empty password should remain empty")
+	}
+}
+
+func TestApplyUserAttributes_Password(t *testing.T) {
+	u := &model.ScimUser{}
+	input := map[string]any{
+		"userName": "test@example.com",
+		"password": "Password123!",
+	}
+	ApplyFromScimInput(u, input)
+	if u.Password == nil {
+		t.Fatalf("expected user password to be set")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*u.Password), []byte("Password123!")); err != nil {
+		t.Fatalf("bcrypt compare failed: %v", err)
 	}
 }

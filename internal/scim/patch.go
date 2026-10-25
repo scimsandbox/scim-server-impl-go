@@ -212,7 +212,7 @@ func setSingleAttribute(user *model.ScimUser, path string, value any) error {
 	case "active":
 		user.Active = toBool(value)
 	case "password":
-		user.Password = s
+		user.Password = HashPassword(s)
 	default:
 		return NewScimError(400, "invalidPath", "Unknown attribute: "+path)
 	}

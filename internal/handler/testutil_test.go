@@ -82,7 +82,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 	userHandler := NewUserHandler(userRepo, membershipRepo, workspaceRepo)
 	groupHandler := NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo)
 	bulkHandler := NewBulkHandler(userHandler, groupHandler)
-	discoveryHandler := NewDiscoveryHandler()
+	discoveryHandler := NewDiscoveryHandler(userHandler, groupHandler)
 
 	r := chi.NewRouter()
 
@@ -103,8 +103,9 @@ func setupTestEnv(t *testing.T) *testEnv {
 		r.Delete("/Groups/{id}", groupHandler.DeleteGroup)
 		r.Post("/Groups/.search", groupHandler.SearchGroups)
 
+		r.Get("/", discoveryHandler.RootSearch)
 		r.Post("/Bulk", bulkHandler.ProcessBulk)
-		r.Post("/.search", discoveryHandler.GlobalSearchNotImplemented)
+		r.Post("/.search", discoveryHandler.RootSearch)
 
 		r.Get("/ServiceProviderConfig", discoveryHandler.GetServiceProviderConfig)
 		r.Get("/Schemas", discoveryHandler.GetSchemas)

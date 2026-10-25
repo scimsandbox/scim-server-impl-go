@@ -22,7 +22,7 @@ func ServiceProviderConfig() map[string]any {
 			"defaultPageSize":       10,
 			"maxPageSize":           200,
 		},
-		"changePassword": map[string]any{"supported": false},
+		"changePassword": map[string]any{"supported": true},
 		"sort":           map[string]any{"supported": true},
 		"etag":           map[string]any{"supported": true},
 		"authenticationSchemes": []map[string]any{{

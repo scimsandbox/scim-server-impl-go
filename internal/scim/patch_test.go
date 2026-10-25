@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 )
 
@@ -79,7 +81,7 @@ func TestApplyPatchOperations_AddSingleAttributes(t *testing.T) {
 		{"op": "add", "path": "locale", "value": "en-US"},
 		{"op": "add", "path": "timezone", "value": "UTC"},
 		{"op": "add", "path": "active", "value": true},
-		{"op": "add", "path": "password", "value": "secret"},
+		{"op": "add", "path": "password", "value": "newsecret123"},
 	}
 	if err := ApplyPatchOperations(u, ops); err != nil {
 		t.Fatalf("apply failed: %v", err)
@@ -96,7 +98,12 @@ func TestApplyPatchOperations_AddSingleAttributes(t *testing.T) {
 	if !u.Active {
 		t.Fatalf("active expected true")
 	}
-	assertStringPtrEquals(t, "password", u.Password, "secret")
+	if u.Password == nil {
+		t.Fatalf("expected password to be set")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*u.Password), []byte("newsecret123")); err != nil {
+		t.Fatalf("bcrypt comparison failed: %v", err)
+	}
 }
 
 func TestApplyPatchOperations_AddSubAttributes(t *testing.T) {

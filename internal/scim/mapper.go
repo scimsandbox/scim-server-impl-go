@@ -229,7 +229,7 @@ func applySimpleAttributes(user *model.ScimUser, input map[string]any) {
 		user.Active = true
 	}
 	if v, ok := input["password"]; ok {
-		user.Password = toStringPtr(v)
+		user.Password = HashPassword(toStringPtr(v))
 	}
 }
 

@@ -51,6 +51,7 @@ const (
 	attrActive                = "active"
 	attrMetaCreated           = "meta.created"
 	attrMetaLastModified      = "meta.lastmodified"
+	attrMetaResourceType      = "meta.resourcetype"
 	attrID                    = "id"
 	attrEmployeeNumber        = "employeenumber"
 	attrCostCenter            = "costcenter"
@@ -243,6 +244,7 @@ func tokenize(filter string) []token {
 // ── Case-insensitive attribute set ──────────────────
 
 var caseInsensitiveAttrs = map[string]bool{
+	attrMetaResourceType:      true,
 	attrUsername:               true,
 	attrDisplayName:            true,
 	attrExternalID:             true,
@@ -720,6 +722,11 @@ func (p *filterParser) resolveColumn(attr string) (string, error) {
 		return sqlCreatedAt, nil
 	case attrMetaLastModified:
 		return sqlLastModified, nil
+	case attrMetaResourceType:
+		if p.entityType == entityTypeUser {
+			return "'User'::text", nil
+		}
+		return "'Group'::text", nil
 	case attrID:
 		return sqlID, nil
 	// Enterprise extension

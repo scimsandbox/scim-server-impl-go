@@ -109,6 +109,11 @@ func TestServiceProviderConfig(t *testing.T) {
 		t.Fatalf("filter.supported = %v, want true", filter["supported"])
 	}
 
+	changePassword := spc["changePassword"].(map[string]any)
+	if changePassword["supported"] != true {
+		t.Fatalf("changePassword.supported = %v, want true", changePassword["supported"])
+	}
+
 	pagination := spc["pagination"].(map[string]any)
 	if pagination["cursor"] != false {
 		t.Fatalf("pagination.cursor = %v, want false", pagination["cursor"])

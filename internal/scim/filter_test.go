@@ -494,3 +494,36 @@ func TestParseUserFilter_ValuePathBooleans(t *testing.T) {
 		t.Fatalf("expected LOWER(elem->>'type') > LOWER($1) in SQL, got %s", resGt.SQL)
 	}
 }
+
+func TestParseFilter_MetaResourceType(t *testing.T) {
+	resUser, err := ParseUserFilter(`meta.resourceType eq "User"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(resUser.SQL, "'User'::text") {
+		t.Fatalf("expected 'User'::text in SQL, got %s", resUser.SQL)
+	}
+	if len(resUser.Args) != 1 || resUser.Args[0] != "User" {
+		t.Fatalf("expected Arg 'User', got %v", resUser.Args)
+	}
+
+	resGroup, err := ParseGroupFilter(`meta.resourceType eq "Group"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(resGroup.SQL, "'Group'::text") {
+		t.Fatalf("expected 'Group'::text in SQL, got %s", resGroup.SQL)
+	}
+	if len(resGroup.Args) != 1 || resGroup.Args[0] != "Group" {
+		t.Fatalf("expected Arg 'Group', got %v", resGroup.Args)
+	}
+
+	resCase, err := ParseUserFilter(`meta.resourceType eq "user"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(resCase.SQL, "LOWER('User'::text) = LOWER($1)") {
+		t.Fatalf("expected LOWER expression, got %s", resCase.SQL)
+	}
+}
+

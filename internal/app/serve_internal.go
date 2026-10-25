@@ -92,7 +92,7 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	userHandler := handler.NewUserHandler(userRepo, membershipRepo, workspaceRepo)
 	groupHandler := handler.NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo)
 	bulkHandler := handler.NewBulkHandler(userHandler, groupHandler)
-	discoveryHandler := handler.NewDiscoveryHandler()
+	discoveryHandler := handler.NewDiscoveryHandler(userHandler, groupHandler)
 	meHandler := handler.NewMeHandler()
 
 	apiRouter := chi.NewRouter()
@@ -126,8 +126,9 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		r.Delete(groupsPath, groupHandler.DeleteGroup)
 		r.Post("/Groups/.search", groupHandler.SearchGroups)
 
+		r.Get("/", discoveryHandler.RootSearch)
 		r.Post("/Bulk", bulkHandler.ProcessBulk)
-		r.Post("/.search", discoveryHandler.GlobalSearchNotImplemented)
+		r.Post("/.search", discoveryHandler.RootSearch)
 
 		const serviceProviderConfigPath = "/ServiceProviderConfig"
 		r.Get(serviceProviderConfigPath, discoveryHandler.GetServiceProviderConfig)

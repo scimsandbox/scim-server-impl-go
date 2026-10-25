@@ -312,7 +312,9 @@ func (h *BulkHandler) createUserInternal(r *http.Request, wsID uuid.UUID, data m
 		LastModified: time.Now(),
 		Version:      0,
 	}
-	scim.ApplyFromScimInput(user, data)
+	if err := scim.ApplyFromScimInput(user, data); err != nil {
+		return nil, err
+	}
 
 	if err := h.userHandler.userRepo.Create(r.Context(), user); err != nil {
 		if isUserNameConflict(err) {
@@ -390,7 +392,9 @@ func (h *BulkHandler) replaceUserInternal(r *http.Request, wsID, userID uuid.UUI
 	}
 
 	scim.ClearMutableAttributes(user)
-	scim.ApplyFromScimInput(user, data)
+	if err := scim.ApplyFromScimInput(user, data); err != nil {
+		return err
+	}
 	user.LastModified = time.Now()
 
 	if err := h.userHandler.userRepo.Update(r.Context(), user); err != nil {

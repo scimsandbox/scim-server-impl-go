@@ -110,6 +110,12 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	compatParam := chi.URLParam(r, "compat")
+	if compatParam != "" && !strings.EqualFold(compatParam, "ms") {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Resource or endpoint not found: "+compatParam))
+		return
+	}
+
 	filterStr := r.URL.Query().Get("filter")
 	startIndex := clampInt(r.URL.Query().Get("startIndex"), 1, 1)
 	count := clampIntMax(r.URL.Query().Get("count"), 100, 0, 200)
@@ -192,25 +198,37 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(strings.ToLower(userErr.Error()), "unknown attribute") {
 				hasUser = false
 				userFilterResult = nil
+			} else {
+				// Syntax, operator, or invalid token error on user filter -> immediately 400 invalidFilter
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+userErr.Error()))
+				return
 			}
 		}
 		if hasGroup && groupErr != nil {
 			if strings.Contains(strings.ToLower(groupErr.Error()), "unknown attribute") {
 				hasGroup = false
 				groupFilterResult = nil
+			} else {
+				// Syntax, operator, or invalid token error on group filter -> immediately 400 invalidFilter
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+groupErr.Error()))
+				return
 			}
 		}
 
 		if !hasUser && !hasGroup {
-			errToReport := userErr
-			if errToReport == nil {
-				errToReport = groupErr
-			}
-			errMsg := "Invalid filter"
-			if errToReport != nil {
-				errMsg += ": " + errToReport.Error()
+			errMsg := "Invalid filter: attribute does not match any resource type"
+			if userErr != nil {
+				errMsg = "Invalid filter: " + userErr.Error()
+			} else if groupErr != nil {
+				errMsg = "Invalid filter: " + groupErr.Error()
 			}
 			scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", errMsg))
+			return
+		}
+
+		// Invariant defense-in-depth: if filter was provided, an eligible resource handler MUST have a valid filterResult
+		if (hasUser && userFilterResult == nil) || (hasGroup && groupFilterResult == nil) {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter"))
 			return
 		}
 	}

@@ -1,6 +1,8 @@
 package scim
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,7 +172,10 @@ func TestApplyMsCompat(t *testing.T) {
 func TestHashPassword(t *testing.T) {
 	// Plaintext password should be hashed
 	pw := "mySecretPass123"
-	hashed := HashPassword(&pw)
+	hashed, err := HashPassword(&pw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if hashed == nil {
 		t.Fatalf("expected non-nil hashed password")
 	}
@@ -183,26 +188,47 @@ func TestHashPassword(t *testing.T) {
 
 	// Pre-hashed $2a$ password should remain untouched
 	preHashed := "$2a$10$abcdefghijklmnopqrstuvwxyz0123456789"
-	sameHashed := HashPassword(&preHashed)
-	if sameHashed == nil || *sameHashed != preHashed {
-		t.Fatalf("expected pre-hashed $2a$ password to remain unchanged, got %v", sameHashed)
+	sameHashed, err := HashPassword(&preHashed)
+	if err != nil || sameHashed == nil || *sameHashed != preHashed {
+		t.Fatalf("expected pre-hashed $2a$ password to remain unchanged, got %v (err=%v)", sameHashed, err)
 	}
 
 	// Pre-hashed $2b$ password should remain untouched
 	preHashed2b := "$2b$10$abcdefghijklmnopqrstuvwxyz0123456789"
-	sameHashed2b := HashPassword(&preHashed2b)
-	if sameHashed2b == nil || *sameHashed2b != preHashed2b {
-		t.Fatalf("expected pre-hashed $2b$ password to remain unchanged, got %v", sameHashed2b)
+	sameHashed2b, err := HashPassword(&preHashed2b)
+	if err != nil || sameHashed2b == nil || *sameHashed2b != preHashed2b {
+		t.Fatalf("expected pre-hashed $2b$ password to remain unchanged, got %v (err=%v)", sameHashed2b, err)
+	}
+
+	// Pre-hashed $2y$ password should remain untouched
+	preHashed2y := "$2y$10$abcdefghijklmnopqrstuvwxyz0123456789"
+	sameHashed2y, err := HashPassword(&preHashed2y)
+	if err != nil || sameHashed2y == nil || *sameHashed2y != preHashed2y {
+		t.Fatalf("expected pre-hashed $2y$ password to remain unchanged, got %v (err=%v)", sameHashed2y, err)
 	}
 
 	// Nil / empty stays nil / empty
-	if HashPassword(nil) != nil {
-		t.Fatalf("nil password should return nil")
+	if res, err := HashPassword(nil); err != nil || res != nil {
+		t.Fatalf("nil password should return nil, nil")
 	}
 	empty := ""
-	resEmpty := HashPassword(&empty)
-	if resEmpty == nil || *resEmpty != "" {
+	resEmpty, err := HashPassword(&empty)
+	if err != nil || resEmpty == nil || *resEmpty != "" {
 		t.Fatalf("empty password should remain empty")
+	}
+
+	// Password exceeding 72 bytes must return error
+	longPw := strings.Repeat("a", 73)
+	resLong, err := HashPassword(&longPw)
+	if err == nil {
+		t.Fatalf("expected error for password > 72 bytes, got %v", resLong)
+	}
+	var scimErr *ScimError
+	if !errors.As(err, &scimErr) {
+		t.Fatalf("expected *ScimError, got %T", err)
+	}
+	if scimErr.Status != 400 || scimErr.ScimType != "invalidValue" {
+		t.Fatalf("expected status 400 and invalidValue, got %d, %s", scimErr.Status, scimErr.ScimType)
 	}
 }
 
@@ -212,11 +238,22 @@ func TestApplyUserAttributes_Password(t *testing.T) {
 		"userName": "test@example.com",
 		"password": "Password123!",
 	}
-	ApplyFromScimInput(u, input)
+	if err := ApplyFromScimInput(u, input); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if u.Password == nil {
 		t.Fatalf("expected user password to be set")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(*u.Password), []byte("Password123!")); err != nil {
 		t.Fatalf("bcrypt compare failed: %v", err)
+	}
+
+	// Long password rejected
+	inputLong := map[string]any{
+		"userName": "test2@example.com",
+		"password": strings.Repeat("X", 80),
+	}
+	if err := ApplyFromScimInput(&model.ScimUser{}, inputLong); err == nil {
+		t.Fatalf("expected error for password > 72 bytes in ApplyFromScimInput")
 	}
 }

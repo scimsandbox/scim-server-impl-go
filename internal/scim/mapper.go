@@ -74,8 +74,10 @@ func UserToScimResponse(user *model.ScimUser, baseURL string, groups []map[strin
 	return result
 }
 
-func ApplyFromScimInput(user *model.ScimUser, input map[string]any) {
-	applySimpleAttributes(user, input)
+func ApplyFromScimInput(user *model.ScimUser, input map[string]any) error {
+	if err := applySimpleAttributes(user, input); err != nil {
+		return err
+	}
 	applyNameAttribute(user, input)
 
 	if v, ok := input["emails"]; ok {
@@ -104,6 +106,7 @@ func ApplyFromScimInput(user *model.ScimUser, input map[string]any) {
 	}
 
 	applyEnterpriseExtension(user, input)
+	return nil
 }
 
 func ClearMutableAttributes(user *model.ScimUser) {
@@ -192,7 +195,7 @@ func putCollection(m map[string]any, key string, items []map[string]any) {
 	}
 }
 
-func applySimpleAttributes(user *model.ScimUser, input map[string]any) {
+func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
 	if v, ok := input["userName"].(string); ok {
 		user.UserName = v
 	}
@@ -229,8 +232,13 @@ func applySimpleAttributes(user *model.ScimUser, input map[string]any) {
 		user.Active = true
 	}
 	if v, ok := input["password"]; ok {
-		user.Password = HashPassword(toStringPtr(v))
+		pw, err := HashPassword(toStringPtr(v))
+		if err != nil {
+			return err
+		}
+		user.Password = pw
 	}
+	return nil
 }
 
 func applyNameAttribute(user *model.ScimUser, input map[string]any) {

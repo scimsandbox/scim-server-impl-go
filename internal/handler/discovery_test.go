@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
 )
@@ -93,15 +95,122 @@ func TestRootSearch_PostInvalidJSON(t *testing.T) {
 }
 
 func TestRootSearch_InvalidFilterSyntax(t *testing.T) {
-	dh := NewDiscoveryHandler()
-	rec := httptest.NewRecorder()
+	// Initialize with handlers so filter parsing is actually invoked
+	dh := NewDiscoveryHandler(&UserHandler{}, &GroupHandler{})
 	wsID := uuid.New()
-	req := httptest.NewRequest(http.MethodGet, `/?filter=userName%20eq`, nil)
-	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	testCases := []struct {
+		name   string
+		filter string
+	}{
+		{"missing value on user attribute", "userName eq"},
+		{"missing value on common attribute", "displayName eq"},
+		{"trailing operator", "userName eq \"alice\" and"},
+		{"unclosed parenthesis", "(userName eq \"alice\""},
+		{"invalid operator", "userName xx \"alice\""},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/?filter="+url.QueryEscape(tc.filter), nil)
+			req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+			dh.RootSearch(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for invalid filter syntax (%s), got %d: %s", tc.filter, rec.Code, rec.Body.String())
+			}
+
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("failed to parse JSON error: %v", err)
+			}
+			if body["scimType"] != "invalidFilter" {
+				t.Fatalf("expected scimType 'invalidFilter', got %v", body["scimType"])
+			}
+		})
+	}
+}
+
+func TestRootSearch_InvalidCompatMode(t *testing.T) {
+	dh := NewDiscoveryHandler(&UserHandler{}, &GroupHandler{})
+	wsID := uuid.New().String()
+
+	// Invalid compat mode returns 404
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID+"/scim/v2/invalid", nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("workspaceId", wsID)
+	routeCtx.URLParams.Add("compat", "invalid")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, uuid.MustParse(wsID)))
 
 	dh.RootSearch(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for invalid filter syntax, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for invalid compat mode, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+	if body["status"] != "404" {
+		t.Fatalf("expected status '404', got %v", body["status"])
+	}
+}
+
+func TestRootSearch_MethodNotAllowed(t *testing.T) {
+	dh := NewDiscoveryHandler()
+	r := chi.NewRouter()
+	r.MethodNotAllowed(MethodNotAllowed)
+	r.Get("/", dh.RootSearch)
+	r.Post("/", MethodNotAllowed)
+	r.Put("/", MethodNotAllowed)
+	r.Patch("/", MethodNotAllowed)
+	r.Delete("/", MethodNotAllowed)
+
+	const searchPath = "/.search"
+	r.Post(searchPath, dh.RootSearch)
+	r.Get(searchPath, MethodNotAllowed)
+	r.Put(searchPath, MethodNotAllowed)
+	r.Patch(searchPath, MethodNotAllowed)
+	r.Delete(searchPath, MethodNotAllowed)
+
+	disallowedRequests := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/.search"},
+		{http.MethodPut, "/.search"},
+		{http.MethodPatch, "/.search"},
+		{http.MethodDelete, "/.search"},
+		{http.MethodPost, "/"},
+		{http.MethodPut, "/"},
+		{http.MethodPatch, "/"},
+		{http.MethodDelete, "/"},
+	}
+
+	for _, tc := range disallowedRequests {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected 405 Method Not Allowed for %s %s, got %d", tc.method, tc.path, rec.Code)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != ScimContentType {
+				t.Fatalf("expected Content-Type %s, got %s", ScimContentType, ct)
+			}
+
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+			if body["status"] != "405" {
+				t.Fatalf("expected body status '405', got %v", body["status"])
+			}
+		})
 	}
 }
 

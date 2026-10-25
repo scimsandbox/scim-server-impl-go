@@ -74,7 +74,10 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		LastModified: time.Now(),
 		Version:      0,
 	}
-	scim.ApplyFromScimInput(user, input)
+	if err := scim.ApplyFromScimInput(user, input); err != nil {
+		scim.WriteErrorFromAny(w, err)
+		return
+	}
 
 	if err := h.userRepo.Create(r.Context(), user); err != nil {
 		if isUserNameConflict(err) {
@@ -301,7 +304,10 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	scim.ClearMutableAttributes(user)
-	scim.ApplyFromScimInput(user, input)
+	if err := scim.ApplyFromScimInput(user, input); err != nil {
+		scim.WriteErrorFromAny(w, err)
+		return
+	}
 	user.LastModified = time.Now()
 
 	if err := h.userRepo.Update(r.Context(), user); err != nil {

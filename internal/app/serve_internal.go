@@ -127,8 +127,19 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		r.Post("/Groups/.search", groupHandler.SearchGroups)
 
 		r.Get("/", discoveryHandler.RootSearch)
+		r.Post("/", handler.MethodNotAllowed)
+		r.Put("/", handler.MethodNotAllowed)
+		r.Patch("/", handler.MethodNotAllowed)
+		r.Delete("/", handler.MethodNotAllowed)
+
 		r.Post("/Bulk", bulkHandler.ProcessBulk)
-		r.Post("/.search", discoveryHandler.RootSearch)
+
+		const searchPath = "/.search"
+		r.Post(searchPath, discoveryHandler.RootSearch)
+		r.Get(searchPath, handler.MethodNotAllowed)
+		r.Put(searchPath, handler.MethodNotAllowed)
+		r.Patch(searchPath, handler.MethodNotAllowed)
+		r.Delete(searchPath, handler.MethodNotAllowed)
 
 		const serviceProviderConfigPath = "/ServiceProviderConfig"
 		r.Get(serviceProviderConfigPath, discoveryHandler.GetServiceProviderConfig)
@@ -160,6 +171,7 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 			scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Resource not found"))
 		})
+		r.MethodNotAllowed(handler.MethodNotAllowed)
 	}
 
 	apiRouter.Route("/ws/{workspaceId}/scim/v2", func(r chi.Router) {

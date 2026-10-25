@@ -139,6 +139,9 @@ func ParseUserFilter(filter string, startParam int) (*FilterResult, error) {
 	if err != nil {
 		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
 	}
+	if p.pos < len(p.tokens) {
+		return nil, NewScimError(400, "invalidFilter", fmt.Sprintf("Invalid filter: unexpected token '%s'", p.tokens[p.pos].val))
+	}
 	return result, nil
 }
 
@@ -156,6 +159,9 @@ func ParseGroupFilter(filter string, startParam int) (*FilterResult, error) {
 	result, err := p.parseOrExpression()
 	if err != nil {
 		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
+	}
+	if p.pos < len(p.tokens) {
+		return nil, NewScimError(400, "invalidFilter", fmt.Sprintf("Invalid filter: unexpected token '%s'", p.tokens[p.pos].val))
 	}
 	return result, nil
 }
@@ -244,7 +250,7 @@ func tokenize(filter string) []token {
 // ── Case-insensitive attribute set ──────────────────
 
 var caseInsensitiveAttrs = map[string]bool{
-	attrMetaResourceType:      true,
+	attrMetaResourceType:       true,
 	attrUsername:               true,
 	attrDisplayName:            true,
 	attrExternalID:             true,

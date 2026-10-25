@@ -200,7 +200,11 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 				userFilterResult = nil
 			} else {
 				// Syntax, operator, or invalid token error on user filter -> immediately 400 invalidFilter
-				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+userErr.Error()))
+				if scimErr, ok := userErr.(*scim.ScimError); ok {
+					scim.WriteScimError(w, scimErr)
+				} else {
+					scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+userErr.Error()))
+				}
 				return
 			}
 		}
@@ -210,7 +214,11 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 				groupFilterResult = nil
 			} else {
 				// Syntax, operator, or invalid token error on group filter -> immediately 400 invalidFilter
-				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+groupErr.Error()))
+				if scimErr, ok := groupErr.(*scim.ScimError); ok {
+					scim.WriteScimError(w, scimErr)
+				} else {
+					scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+groupErr.Error()))
+				}
 				return
 			}
 		}
@@ -218,9 +226,17 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 		if !hasUser && !hasGroup {
 			errMsg := "Invalid filter: attribute does not match any resource type"
 			if userErr != nil {
-				errMsg = "Invalid filter: " + userErr.Error()
+				if scimErr, ok := userErr.(*scim.ScimError); ok {
+					errMsg = scimErr.Detail
+				} else {
+					errMsg = "Invalid filter: " + userErr.Error()
+				}
 			} else if groupErr != nil {
-				errMsg = "Invalid filter: " + groupErr.Error()
+				if scimErr, ok := groupErr.(*scim.ScimError); ok {
+					errMsg = scimErr.Detail
+				} else {
+					errMsg = "Invalid filter: " + groupErr.Error()
+				}
 			}
 			scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", errMsg))
 			return

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -108,6 +109,11 @@ func TestRootSearch_InvalidFilterSyntax(t *testing.T) {
 		{"trailing operator", "userName eq \"alice\" and"},
 		{"unclosed parenthesis", "(userName eq \"alice\""},
 		{"invalid operator", "userName xx \"alice\""},
+		{"trailing closing parenthesis", `userName eq "alice")`},
+		{"nested trailing closing parenthesis", `(userName eq "alice"))`},
+		{"trailing token", `userName eq "alice" extra`},
+		{"trailing closing parenthesis on common attribute", `displayName eq "Engineering")`},
+		{"trailing token on common attribute", `displayName eq "Engineering" extra`},
 	}
 
 	for _, tc := range testCases {
@@ -127,6 +133,64 @@ func TestRootSearch_InvalidFilterSyntax(t *testing.T) {
 			}
 			if body["scimType"] != "invalidFilter" {
 				t.Fatalf("expected scimType 'invalidFilter', got %v", body["scimType"])
+			}
+			if detail, _ := body["detail"].(string); detail == "" {
+				t.Errorf("expected non-empty detail explaining invalid filter")
+			} else if strings.Contains(detail, "SCIM error") {
+				t.Errorf("expected clean detail without SCIM error prefix, got %q", detail)
+			}
+		})
+	}
+}
+
+func TestRootSearch_PostInvalidFilterSyntax(t *testing.T) {
+	dh := NewDiscoveryHandler(&UserHandler{}, &GroupHandler{})
+	wsID := uuid.New()
+
+	testCases := []struct {
+		name   string
+		filter string
+	}{
+		{"trailing closing parenthesis", `userName eq "alice")`},
+		{"nested trailing closing parenthesis", `(userName eq "alice"))`},
+		{"trailing extra token", `userName eq "alice" extra`},
+		{"consecutive filters without op", `userName eq "alice" userName eq "bob"`},
+		{"trailing operator", `userName eq "alice" and`},
+		{"unclosed parenthesis", `(userName eq "alice"`},
+		{"missing value", `userName eq`},
+		{"invalid operator", `userName xx "alice"`},
+		{"trailing closing parenthesis on common attribute", `displayName eq "Engineering")`},
+		{"trailing extra token on common attribute", `displayName eq "Engineering" extra`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			payload, _ := json.Marshal(map[string]any{"filter": tc.filter})
+			req := httptest.NewRequest(http.MethodPost, "/.search", bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/scim+json")
+			req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+			dh.RootSearch(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for POST invalid filter (%s), got %d: %s", tc.filter, rec.Code, rec.Body.String())
+			}
+
+			if ct := rec.Header().Get("Content-Type"); ct != ScimContentType {
+				t.Fatalf("expected Content-Type %s, got %s", ScimContentType, ct)
+			}
+
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("failed to parse JSON error: %v", err)
+			}
+			if body["scimType"] != "invalidFilter" {
+				t.Fatalf("expected scimType 'invalidFilter', got %v", body["scimType"])
+			}
+			if detail, _ := body["detail"].(string); detail == "" {
+				t.Errorf("expected non-empty detail explaining invalid filter")
+			} else if strings.Contains(detail, "SCIM error") {
+				t.Errorf("expected clean detail without SCIM error prefix, got %q", detail)
 			}
 		})
 	}
@@ -287,4 +351,3 @@ func TestExtractSortAttr(t *testing.T) {
 		t.Fatalf("expected false for nil map")
 	}
 }
-

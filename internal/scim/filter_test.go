@@ -527,3 +527,45 @@ func TestParseFilter_MetaResourceType(t *testing.T) {
 	}
 }
 
+func TestParseFilter_UnconsumedTrailingTokens(t *testing.T) {
+	testCases := []struct {
+		name    string
+		filter  string
+		isGroup bool
+	}{
+		{"user unmatched closing paren", `userName eq "alice")`, false},
+		{"user extra closing paren", `(userName eq "alice"))`, false},
+		{"user trailing identifier", `userName eq "alice" extra`, false},
+		{"user consecutive expressions without op", `userName eq "alice" userName eq "bob"`, false},
+		{"group unmatched closing paren", `displayName eq "admins")`, true},
+		{"group extra closing paren", `(displayName eq "admins"))`, true},
+		{"group trailing token", `displayName eq "admins" garbage`, true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			if tc.isGroup {
+				_, err = ParseGroupFilter(tc.filter, 2)
+			} else {
+				_, err = ParseUserFilter(tc.filter, 2)
+			}
+			if err == nil {
+				t.Fatalf("expected error for filter with trailing tokens: %s", tc.filter)
+			}
+			scimErr, ok := err.(*ScimError)
+			if !ok {
+				t.Fatalf("expected *ScimError, got %T: %v", err, err)
+			}
+			if scimErr.Status != 400 {
+				t.Errorf("expected status 400, got %d", scimErr.Status)
+			}
+			if scimErr.ScimType != "invalidFilter" {
+				t.Errorf("expected scimType 'invalidFilter', got %s", scimErr.ScimType)
+			}
+			if !strings.Contains(scimErr.Detail, "unexpected token") {
+				t.Errorf("expected detail to contain 'unexpected token', got %s", scimErr.Detail)
+			}
+		})
+	}
+}

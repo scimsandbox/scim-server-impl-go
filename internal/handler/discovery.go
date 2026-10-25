@@ -116,55 +116,55 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filterStr := r.URL.Query().Get("filter")
-	startIndex := clampInt(r.URL.Query().Get("startIndex"), 1, 1)
-	count := clampIntMax(r.URL.Query().Get("count"), 100, 0, 200)
-	sortBy := r.URL.Query().Get("sortBy")
-	sortOrder := r.URL.Query().Get("sortOrder")
-	attrs := r.URL.Query().Get("attributes")
-	excludedAttrs := r.URL.Query().Get("excludedAttributes")
-
+	var body map[string]any
 	if r.Method == http.MethodPost {
-		var body map[string]any
 		if err := readJSON(r, &body); err != nil {
 			if err != io.EOF {
 				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
 				return
 			}
-		} else if body != nil {
-			if f, ok := body["filter"].(string); ok {
-				filterStr = f
-			}
-			if si, ok := body["startIndex"].(float64); ok {
-				startIndex = max(1, int(si))
-			}
-			if c, ok := body["count"].(float64); ok {
-				count = max(0, min(200, int(c)))
-			}
-			if sb, ok := body["sortBy"].(string); ok {
-				sortBy = sb
-			}
-			if so, ok := body["sortOrder"].(string); ok {
-				sortOrder = so
-			}
-			if a, ok := body["attributes"].([]any); ok {
-				strs := make([]string, 0, len(a))
-				for _, v := range a {
-					if s, ok := v.(string); ok {
-						strs = append(strs, s)
-					}
+		}
+	}
+
+	pag, scimErr := parsePagination(r.URL.Query(), body, wsID, 100)
+	if scimErr != nil {
+		scim.WriteScimError(w, scimErr)
+		return
+	}
+
+	filterStr := r.URL.Query().Get("filter")
+	sortBy := r.URL.Query().Get("sortBy")
+	sortOrder := r.URL.Query().Get("sortOrder")
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+
+	if body != nil {
+		if f, ok := body["filter"].(string); ok {
+			filterStr = f
+		}
+		if sb, ok := body["sortBy"].(string); ok {
+			sortBy = sb
+		}
+		if so, ok := body["sortOrder"].(string); ok {
+			sortOrder = so
+		}
+		if a, ok := body["attributes"].([]any); ok {
+			strs := make([]string, 0, len(a))
+			for _, v := range a {
+				if s, ok := v.(string); ok {
+					strs = append(strs, s)
 				}
-				attrs = strings.Join(strs, ",")
 			}
-			if ea, ok := body["excludedAttributes"].([]any); ok {
-				strs := make([]string, 0, len(ea))
-				for _, v := range ea {
-					if s, ok := v.(string); ok {
-						strs = append(strs, s)
-					}
+			attrs = strings.Join(strs, ",")
+		}
+		if ea, ok := body["excludedAttributes"].([]any); ok {
+			strs := make([]string, 0, len(ea))
+			for _, v := range ea {
+				if s, ok := v.(string); ok {
+					strs = append(strs, s)
 				}
-				excludedAttrs = strings.Join(strs, ",")
 			}
+			excludedAttrs = strings.Join(strs, ",")
 		}
 	}
 
@@ -256,7 +256,7 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 	totalResults := 0
 
 	if hasUser && !hasGroup {
-		tot, userRes, err := h.queryUsers(r.Context(), wsID, userFilterResult, sortBy, sortOrder, max(0, startIndex-1), count, baseURL, compat, attrs, excludedAttrs)
+		tot, userRes, err := h.queryUsers(r.Context(), wsID, userFilterResult, sortBy, sortOrder, pag.Offset, pag.Count, baseURL, compat, attrs, excludedAttrs)
 		if err != nil {
 			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
 			return
@@ -264,7 +264,7 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 		totalResults = tot
 		resources = userRes
 	} else if !hasUser && hasGroup {
-		tot, groupRes, err := h.queryGroups(r.Context(), wsID, groupFilterResult, sortBy, sortOrder, max(0, startIndex-1), count, baseURL, attrs, excludedAttrs)
+		tot, groupRes, err := h.queryGroups(r.Context(), wsID, groupFilterResult, sortBy, sortOrder, pag.Offset, pag.Count, baseURL, attrs, excludedAttrs)
 		if err != nil {
 			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
 			return
@@ -284,9 +284,9 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		totalResults = totUsers + totGroups
 
-		if count > 0 {
+		if pag.Count > 0 {
 			if sortBy != "" {
-				fetchLimit := startIndex - 1 + count
+				fetchLimit := pag.Offset + pag.Count
 				if fetchLimit > 200 {
 					fetchLimit = 200
 				}
@@ -295,9 +295,9 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 				combined := append(uRes, gRes...)
 				sortResources(combined, sortBy, sortOrder)
 
-				offset := startIndex - 1
+				offset := pag.Offset
 				if offset < len(combined) {
-					end := offset + count
+					end := offset + pag.Count
 					if end > len(combined) {
 						end = len(combined)
 					}
@@ -306,19 +306,19 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 					resources = []map[string]any{}
 				}
 			} else {
-				offset := startIndex - 1
+				offset := pag.Offset
 				if offset < totUsers {
-					uCount := min(count, totUsers-offset)
+					uCount := min(pag.Count, totUsers-offset)
 					_, uRes, _ := h.queryUsers(r.Context(), wsID, userFilterResult, "", "", offset, uCount, baseURL, compat, attrs, excludedAttrs)
 					resources = append(resources, uRes...)
-					if len(resources) < count {
-						gNeeded := count - len(resources)
+					if len(resources) < pag.Count {
+						gNeeded := pag.Count - len(resources)
 						_, gRes, _ := h.queryGroups(r.Context(), wsID, groupFilterResult, "", "", 0, gNeeded, baseURL, attrs, excludedAttrs)
 						resources = append(resources, gRes...)
 					}
 				} else {
 					gOffset := offset - totUsers
-					_, gRes, _ := h.queryGroups(r.Context(), wsID, groupFilterResult, "", "", gOffset, count, baseURL, attrs, excludedAttrs)
+					_, gRes, _ := h.queryGroups(r.Context(), wsID, groupFilterResult, "", "", gOffset, pag.Count, baseURL, attrs, excludedAttrs)
 					resources = gRes
 				}
 			}
@@ -329,14 +329,7 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 		resources = []map[string]any{}
 	}
 
-	listResponse := map[string]any{
-		"schemas":      []string{"urn:ietf:params:scim:api:messages:2.0:ListResponse"},
-		"totalResults": totalResults,
-		"startIndex":   startIndex,
-		"itemsPerPage": len(resources),
-		"Resources":    resources,
-	}
-
+	listResponse := buildListResponse(pag, wsID, totalResults, resources)
 	writeJSON(w, http.StatusOK, listResponse)
 }
 

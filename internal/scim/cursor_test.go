@@ -1,0 +1,174 @@
+package scim
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+func TestEncodeDecodeCursor_RoundTrip(t *testing.T) {
+	wsID := uuid.New()
+	testOffsets := []int{0, 1, 10, 25, 100, 9999}
+
+	for _, offset := range testOffsets {
+		token, err := EncodeCursor(wsID, offset, 3600)
+		if err != nil {
+			t.Fatalf("unexpected error encoding cursor: %v", err)
+		}
+
+		if !strings.HasPrefix(token, CursorPrefix) {
+			t.Fatalf("expected token to have prefix %q, got %q", CursorPrefix, token)
+		}
+
+		decodedOffset, err := DecodeCursor(token, wsID)
+		if err != nil {
+			t.Fatalf("unexpected error decoding cursor: %v", err)
+		}
+
+		if decodedOffset != offset {
+			t.Fatalf("expected offset %d, got %d", offset, decodedOffset)
+		}
+	}
+}
+
+func TestDecodeCursor_EmptyString(t *testing.T) {
+	wsID := uuid.New()
+	offset, err := DecodeCursor("", wsID)
+	if err != nil {
+		t.Fatalf("expected nil error for empty cursor, got: %v", err)
+	}
+	if offset != 0 {
+		t.Fatalf("expected offset 0 for empty cursor, got: %d", offset)
+	}
+}
+
+func TestDecodeCursor_InvalidPrefix(t *testing.T) {
+	wsID := uuid.New()
+	invalidTokens := []string{
+		"invalid-token",
+		"scim_cursor_xyz",
+		"cur_12345",
+		"Bearer xyz",
+	}
+
+	for _, token := range invalidTokens {
+		_, err := DecodeCursor(token, wsID)
+		if err == nil {
+			t.Fatalf("expected error for token %q, got nil", token)
+		}
+		scimErr, ok := err.(*ScimError)
+		if !ok {
+			t.Fatalf("expected *ScimError, got %T", err)
+		}
+		if scimErr.Status != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", scimErr.Status, http.StatusBadRequest)
+		}
+		if scimErr.ScimType != "invalidCursor" {
+			t.Errorf("scimType = %q, want invalidCursor", scimErr.ScimType)
+		}
+	}
+}
+
+func TestDecodeCursor_InvalidBase64(t *testing.T) {
+	wsID := uuid.New()
+	token := CursorPrefix + "!!!not-valid-base64-url???"
+	_, err := DecodeCursor(token, wsID)
+	if err == nil {
+		t.Fatalf("expected error for malformed base64, got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+}
+
+func TestDecodeCursor_InvalidJSON(t *testing.T) {
+	wsID := uuid.New()
+	malformedPayload := base64.RawURLEncoding.EncodeToString([]byte("not valid json"))
+	token := CursorPrefix + malformedPayload
+
+	_, err := DecodeCursor(token, wsID)
+	if err == nil {
+		t.Fatalf("expected error for malformed JSON, got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+}
+
+func TestDecodeCursor_WorkspaceMismatch(t *testing.T) {
+	wsA := uuid.New()
+	wsB := uuid.New()
+
+	token, err := EncodeCursor(wsA, 10, 3600)
+	if err != nil {
+		t.Fatalf("unexpected encode error: %v", err)
+	}
+
+	_, err = DecodeCursor(token, wsB)
+	if err == nil {
+		t.Fatalf("expected error when decoding with wrong workspace ID, got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+}
+
+func TestDecodeCursor_NegativeOffset(t *testing.T) {
+	wsID := uuid.New()
+	payload := CursorPayload{
+		WorkspaceID: wsID.String(),
+		Offset:      -5,
+		ExpiresAt:   time.Now().UTC().Add(time.Hour).Unix(),
+	}
+	data, _ := json.Marshal(payload)
+	token := CursorPrefix + base64.RawURLEncoding.EncodeToString(data)
+
+	_, err := DecodeCursor(token, wsID)
+	if err == nil {
+		t.Fatalf("expected error for negative offset, got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+}
+
+func TestDecodeCursor_Expired(t *testing.T) {
+	wsID := uuid.New()
+	payload := CursorPayload{
+		WorkspaceID: wsID.String(),
+		Offset:      5,
+		ExpiresAt:   time.Now().UTC().Add(-10 * time.Minute).Unix(),
+	}
+	data, _ := json.Marshal(payload)
+	token := CursorPrefix + base64.RawURLEncoding.EncodeToString(data)
+
+	_, err := DecodeCursor(token, wsID)
+	if err == nil {
+		t.Fatalf("expected error for expired cursor, got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+}
+
+func TestEncodeCursor_NegativeOffsetFails(t *testing.T) {
+	wsID := uuid.New()
+	_, err := EncodeCursor(wsID, -1, 3600)
+	if err == nil {
+		t.Fatalf("expected error encoding negative offset, got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+}

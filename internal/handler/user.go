@@ -158,8 +158,11 @@ func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	startIndex := clampInt(r.URL.Query().Get("startIndex"), 1, 1)
-	count := clampIntMax(r.URL.Query().Get("count"), 10, 0, 200)
+	pag, scimErr := parsePagination(r.URL.Query(), nil, wsID, 10)
+	if scimErr != nil {
+		scim.WriteScimError(w, scimErr)
+		return
+	}
 	filterStr := r.URL.Query().Get("filter")
 	sortBy := r.URL.Query().Get("sortBy")
 	sortOrder := r.URL.Query().Get("sortOrder")
@@ -205,26 +208,15 @@ func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	offset := max(0, startIndex-1)
-	pageNumber := 0
-	skipWithinPage := 0
-	if count > 0 {
-		pageNumber = offset / count
-		skipWithinPage = offset % count
-	}
-
-	users, err := h.userRepo.List(r.Context(), wsID, whereClause, filterArgs, sortColumn, sortDir, pageNumber*count, count)
-	if err != nil {
-		slog.Error("list users failed", "error", err)
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
-		return
-	}
-
-	// Skip within page
-	if skipWithinPage > 0 && skipWithinPage < len(users) {
-		users = users[skipWithinPage:]
-	} else if skipWithinPage >= len(users) {
-		users = nil
+	var users []*model.ScimUser
+	if pag.Count > 0 {
+		var err error
+		users, err = h.userRepo.List(r.Context(), wsID, whereClause, filterArgs, sortColumn, sortDir, pag.Offset, pag.Count)
+		if err != nil {
+			slog.Error("list users failed", "error", err)
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
+			return
+		}
 	}
 
 	baseURL := buildBaseURL(r)
@@ -244,14 +236,7 @@ func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		resources = append(resources, response)
 	}
 
-	listResponse := map[string]any{
-		"schemas":      []string{"urn:ietf:params:scim:api:messages:2.0:ListResponse"},
-		"totalResults": totalCount,
-		"startIndex":   startIndex,
-		"itemsPerPage": len(resources),
-		"Resources":    resources,
-	}
-
+	listResponse := buildListResponse(pag, wsID, int(totalCount), resources)
 	writeJSON(w, http.StatusOK, listResponse)
 }
 
@@ -499,38 +484,53 @@ func (h *UserHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	if f, ok := body["filter"].(string); ok {
-		q.Set("filter", f)
-	}
-	if si, ok := body["startIndex"].(float64); ok {
-		q.Set("startIndex", strconv.Itoa(int(si)))
-	}
-	if c, ok := body["count"].(float64); ok {
-		q.Set("count", strconv.Itoa(int(c)))
-	}
-	if sb, ok := body["sortBy"].(string); ok {
-		q.Set("sortBy", sb)
-	}
-	if so, ok := body["sortOrder"].(string); ok {
-		q.Set("sortOrder", so)
-	}
-	if a, ok := body["attributes"].([]any); ok {
-		strs := make([]string, 0, len(a))
-		for _, v := range a {
-			if s, ok := v.(string); ok {
-				strs = append(strs, s)
+	if body != nil {
+		if cur, exists := body["cursor"]; exists {
+			if curStr, ok := cur.(string); ok {
+				q.Set("cursor", curStr)
+			} else {
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidCursor", "cursor must be a string"))
+				return
 			}
 		}
-		q.Set("attributes", strings.Join(strs, ","))
-	}
-	if ea, ok := body["excludedAttributes"].([]any); ok {
-		strs := make([]string, 0, len(ea))
-		for _, v := range ea {
-			if s, ok := v.(string); ok {
-				strs = append(strs, s)
+		if si, exists := body["startIndex"]; exists {
+			if num, ok := si.(float64); ok {
+				q.Set("startIndex", strconv.Itoa(int(num)))
+			} else {
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", "startIndex must be an integer"))
+				return
 			}
 		}
-		q.Set("excludedAttributes", strings.Join(strs, ","))
+		if f, ok := body["filter"].(string); ok {
+			q.Set("filter", f)
+		}
+		if c, ok := body["count"].(float64); ok {
+			q.Set("count", strconv.Itoa(int(c)))
+		}
+		if sb, ok := body["sortBy"].(string); ok {
+			q.Set("sortBy", sb)
+		}
+		if so, ok := body["sortOrder"].(string); ok {
+			q.Set("sortOrder", so)
+		}
+		if a, ok := body["attributes"].([]any); ok {
+			strs := make([]string, 0, len(a))
+			for _, v := range a {
+				if s, ok := v.(string); ok {
+					strs = append(strs, s)
+				}
+			}
+			q.Set("attributes", strings.Join(strs, ","))
+		}
+		if ea, ok := body["excludedAttributes"].([]any); ok {
+			strs := make([]string, 0, len(ea))
+			for _, v := range ea {
+				if s, ok := v.(string); ok {
+					strs = append(strs, s)
+				}
+			}
+			q.Set("excludedAttributes", strings.Join(strs, ","))
+		}
 	}
 	r.URL.RawQuery = q.Encode()
 

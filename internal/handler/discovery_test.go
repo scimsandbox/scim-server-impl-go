@@ -351,3 +351,106 @@ func TestExtractSortAttr(t *testing.T) {
 		t.Fatalf("expected false for nil map")
 	}
 }
+
+func TestServiceProviderConfig_PaginationAdvertised_CUR06(t *testing.T) {
+	dh := NewDiscoveryHandler()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ServiceProviderConfig", nil)
+
+	dh.GetServiceProviderConfig(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var spc map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &spc); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	pag, ok := spc["pagination"].(map[string]any)
+	if !ok {
+		t.Fatalf("pagination attribute missing or not an object in ServiceProviderConfig")
+	}
+
+	if pag["cursor"] != true {
+		t.Errorf("pagination.cursor = %v, want true", pag["cursor"])
+	}
+	if pag["index"] != true {
+		t.Errorf("pagination.index = %v, want true", pag["index"])
+	}
+	if pag["defaultPaginationMode"] != "index" {
+		t.Errorf("pagination.defaultPaginationMode = %v, want index", pag["defaultPaginationMode"])
+	}
+	if pag["cursorTimeout"] != float64(3600) {
+		t.Errorf("pagination.cursorTimeout = %v, want 3600", pag["cursorTimeout"])
+	}
+}
+
+func TestRootSearch_CursorPagination_CUR05(t *testing.T) {
+	dh := NewDiscoveryHandler()
+	rec := httptest.NewRecorder()
+	wsID := uuid.New()
+	body := `{"schemas":["urn:ietf:params:scim:api:messages:2.0:SearchRequest"],"cursor":"","count":1}`
+	req := httptest.NewRequest(http.MethodPost, "/.search", strings.NewReader(body))
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	dh.RootSearch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+	schemas, ok := resp["schemas"].([]any)
+	if !ok || len(schemas) == 0 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:ListResponse" {
+		t.Errorf("schemas = %v, want ListResponse", resp["schemas"])
+	}
+	if _, exists := resp["startIndex"]; exists {
+		t.Errorf("startIndex should be omitted in cursor mode")
+	}
+}
+
+func TestRootSearch_MutualExclusion(t *testing.T) {
+	dh := NewDiscoveryHandler()
+	rec := httptest.NewRecorder()
+	wsID := uuid.New()
+	req := httptest.NewRequest(http.MethodGet, "/?cursor=&startIndex=1", nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	dh.RootSearch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for mutual exclusivity violation, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+	if resp["scimType"] != "invalidValue" && resp["scimType"] != "invalidCursor" {
+		t.Errorf("scimType = %v, want invalidValue or invalidCursor", resp["scimType"])
+	}
+}
+
+func TestRootSearch_InvalidCursor_CUR04(t *testing.T) {
+	dh := NewDiscoveryHandler()
+	rec := httptest.NewRecorder()
+	wsID := uuid.New()
+	req := httptest.NewRequest(http.MethodGet, "/?cursor=invalid-opaque-cursor-999", nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	dh.RootSearch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid cursor, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+	if resp["scimType"] != "invalidCursor" {
+		t.Errorf("scimType = %v, want invalidCursor", resp["scimType"])
+	}
+}
+

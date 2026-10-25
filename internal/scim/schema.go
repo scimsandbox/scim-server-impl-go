@@ -16,11 +16,12 @@ func ServiceProviderConfig() map[string]any {
 			"maxResults": 200,
 		},
 		"pagination": map[string]any{
-			"cursor":                false,
+			"cursor":                true,
 			"index":                 true,
 			"defaultPaginationMode": "index",
 			"defaultPageSize":       10,
 			"maxPageSize":           200,
+			"cursorTimeout":         3600,
 		},
 		"changePassword": map[string]any{"supported": true},
 		"sort":           map[string]any{"supported": true},
@@ -244,7 +245,7 @@ func serviceProviderConfigSchema() map[string]any {
 		attr("maxResults", "integer", true, "readOnly", "none", "Maximum results", false))
 
 	paginationMode := attr("defaultPaginationMode", "string", false, "readOnly", "none", "Default pagination mode", false)
-	paginationMode["canonicalValues"] = []string{"index"}
+	paginationMode["canonicalValues"] = []string{"cursor", "index"}
 	delete(paginationMode, "uniqueness")
 
 	pagination := withSubAttributes(attr("pagination", "complex", false, "readOnly", "none", "Pagination configuration", false),
@@ -252,7 +253,8 @@ func serviceProviderConfigSchema() map[string]any {
 		attr("index", "boolean", true, "readOnly", "none", "Index pagination supported", false),
 		paginationMode,
 		attr("defaultPageSize", "integer", false, "readOnly", "none", "Default page size", false),
-		attr("maxPageSize", "integer", false, "readOnly", "none", "Max page size", false))
+		attr("maxPageSize", "integer", false, "readOnly", "none", "Max page size", false),
+		attr("cursorTimeout", "integer", false, "readOnly", "none", "Cursor timeout in seconds", false))
 
 	changePassword := withSubAttributes(attr("changePassword", "complex", true, "readOnly", "none",
 		"Change password configuration", false),

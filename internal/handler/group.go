@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -172,8 +174,11 @@ func (h *GroupHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	startIndex := clampInt(r.URL.Query().Get("startIndex"), 1, 1)
-	count := clampIntMax(r.URL.Query().Get("count"), 100, 0, 200)
+	pag, scimErr := parsePagination(r.URL.Query(), nil, wsID, 100)
+	if scimErr != nil {
+		scim.WriteScimError(w, scimErr)
+		return
+	}
 	filterStr := r.URL.Query().Get("filter")
 	sortBy := r.URL.Query().Get("sortBy")
 	if sortBy == "" {
@@ -217,33 +222,17 @@ func (h *GroupHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if count == 0 {
-		listResponse := map[string]any{
-			"schemas":      []string{"urn:ietf:params:scim:api:messages:2.0:ListResponse"},
-			"totalResults": totalCount,
-			"startIndex":   startIndex,
-			"itemsPerPage": 0,
-			"Resources":    []map[string]any{},
-		}
+	if pag.Count == 0 {
+		listResponse := buildListResponse(pag, wsID, int(totalCount), []map[string]any{})
 		writeJSON(w, http.StatusOK, listResponse)
 		return
 	}
 
-	offset := max(0, startIndex-1)
-	pageNumber := offset / count
-	skipWithinPage := offset % count
-
-	groups, err := h.groupRepo.List(r.Context(), wsID, whereClause, filterArgs, sortColumn, sortDir, pageNumber*count, count)
+	groups, err := h.groupRepo.List(r.Context(), wsID, whereClause, filterArgs, sortColumn, sortDir, pag.Offset, pag.Count)
 	if err != nil {
 		slog.Error("list groups failed", "error", err)
 		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
 		return
-	}
-
-	if skipWithinPage > 0 && skipWithinPage < len(groups) {
-		groups = groups[skipWithinPage:]
-	} else if skipWithinPage >= len(groups) {
-		groups = nil
 	}
 
 	baseURL := buildBaseURL(r)
@@ -261,14 +250,7 @@ func (h *GroupHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
 		resources = append(resources, response)
 	}
 
-	listResponse := map[string]any{
-		"schemas":      []string{"urn:ietf:params:scim:api:messages:2.0:ListResponse"},
-		"totalResults": totalCount,
-		"startIndex":   startIndex,
-		"itemsPerPage": len(resources),
-		"Resources":    resources,
-	}
-
+	listResponse := buildListResponse(pag, wsID, int(totalCount), resources)
 	writeJSON(w, http.StatusOK, listResponse)
 }
 
@@ -546,6 +528,64 @@ func (h *GroupHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *GroupHandler) SearchGroups(w http.ResponseWriter, r *http.Request) {
+	// POST /.search: parse JSON body and inject into query params for ListGroups
+	var body map[string]any
+	if err := readJSON(r, &body); err != nil && err != io.EOF {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+		return
+	}
+
+	q := r.URL.Query()
+	if body != nil {
+		if cur, exists := body["cursor"]; exists {
+			if curStr, ok := cur.(string); ok {
+				q.Set("cursor", curStr)
+			} else {
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidCursor", "cursor must be a string"))
+				return
+			}
+		}
+		if si, exists := body["startIndex"]; exists {
+			if num, ok := si.(float64); ok {
+				q.Set("startIndex", strconv.Itoa(int(num)))
+			} else {
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", "startIndex must be an integer"))
+				return
+			}
+		}
+		if f, ok := body["filter"].(string); ok {
+			q.Set("filter", f)
+		}
+		if c, ok := body["count"].(float64); ok {
+			q.Set("count", strconv.Itoa(int(c)))
+		}
+		if sb, ok := body["sortBy"].(string); ok {
+			q.Set("sortBy", sb)
+		}
+		if so, ok := body["sortOrder"].(string); ok {
+			q.Set("sortOrder", so)
+		}
+		if a, ok := body["attributes"].([]any); ok {
+			strs := make([]string, 0, len(a))
+			for _, v := range a {
+				if s, ok := v.(string); ok {
+					strs = append(strs, s)
+				}
+			}
+			q.Set("attributes", strings.Join(strs, ","))
+		}
+		if ea, ok := body["excludedAttributes"].([]any); ok {
+			strs := make([]string, 0, len(ea))
+			for _, v := range ea {
+				if s, ok := v.(string); ok {
+					strs = append(strs, s)
+				}
+			}
+			q.Set("excludedAttributes", strings.Join(strs, ","))
+		}
+	}
+	r.URL.RawQuery = q.Encode()
+
 	h.ListGroups(w, r)
 }
 

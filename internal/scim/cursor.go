@@ -21,8 +21,8 @@ const (
 // CursorPayload represents the claims embedded inside the stateless opaque cursor token.
 type CursorPayload struct {
 	WorkspaceID string `json:"w"`
-	Offset      int    `json:"o"`
-	ExpiresAt   int64  `json:"exp"`
+	Offset      *int   `json:"o"`
+	ExpiresAt   *int64 `json:"exp"`
 }
 
 // EncodeCursor constructs a URL-safe unpadded Base64URL token prefixed with "scim_cur_".
@@ -37,8 +37,8 @@ func EncodeCursor(workspaceID uuid.UUID, offset int, timeoutSeconds int) (string
 	exp := time.Now().UTC().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
 	payload := CursorPayload{
 		WorkspaceID: workspaceID.String(),
-		Offset:      offset,
-		ExpiresAt:   exp,
+		Offset:      &offset,
+		ExpiresAt:   &exp,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -78,13 +78,21 @@ func DecodeCursor(token string, workspaceID uuid.UUID) (int, error) {
 		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Cursor does not belong to the target workspace")
 	}
 
-	if p.Offset < 0 {
+	if p.Offset == nil {
+		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Invalid cursor: missing offset parameter")
+	}
+
+	if p.ExpiresAt == nil {
+		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Invalid cursor: missing expiration timestamp")
+	}
+
+	if *p.Offset < 0 {
 		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Invalid cursor: negative offset")
 	}
 
-	if p.ExpiresAt <= time.Now().UTC().Unix() {
+	if *p.ExpiresAt <= time.Now().UTC().Unix() {
 		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Cursor has expired")
 	}
 
-	return p.Offset, nil
+	return *p.Offset, nil
 }

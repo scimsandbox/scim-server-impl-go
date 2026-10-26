@@ -3,6 +3,7 @@ package scim
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -123,10 +124,12 @@ func TestDecodeCursor_WorkspaceMismatch(t *testing.T) {
 
 func TestDecodeCursor_NegativeOffset(t *testing.T) {
 	wsID := uuid.New()
+	negOffset := -5
+	futureExp := time.Now().UTC().Add(time.Hour).Unix()
 	payload := CursorPayload{
 		WorkspaceID: wsID.String(),
-		Offset:      -5,
-		ExpiresAt:   time.Now().UTC().Add(time.Hour).Unix(),
+		Offset:      &negOffset,
+		ExpiresAt:   &futureExp,
 	}
 	data, _ := json.Marshal(payload)
 	token := CursorPrefix + base64.RawURLEncoding.EncodeToString(data)
@@ -143,10 +146,12 @@ func TestDecodeCursor_NegativeOffset(t *testing.T) {
 
 func TestDecodeCursor_Expired(t *testing.T) {
 	wsID := uuid.New()
+	offset := 5
+	pastExp := time.Now().UTC().Add(-10 * time.Minute).Unix()
 	payload := CursorPayload{
 		WorkspaceID: wsID.String(),
-		Offset:      5,
-		ExpiresAt:   time.Now().UTC().Add(-10 * time.Minute).Unix(),
+		Offset:      &offset,
+		ExpiresAt:   &pastExp,
 	}
 	data, _ := json.Marshal(payload)
 	token := CursorPrefix + base64.RawURLEncoding.EncodeToString(data)
@@ -170,5 +175,42 @@ func TestEncodeCursor_NegativeOffsetFails(t *testing.T) {
 	scimErr, ok := err.(*ScimError)
 	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
 		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+}
+
+func TestDecodeCursor_MissingOffset(t *testing.T) {
+	wsID := uuid.New()
+	futureExp := time.Now().UTC().Add(time.Hour).Unix()
+	rawJSON := fmt.Sprintf(`{"w":"%s","exp":%d}`, wsID, futureExp)
+	token := CursorPrefix + base64.RawURLEncoding.EncodeToString([]byte(rawJSON))
+
+	_, err := DecodeCursor(token, wsID)
+	if err == nil {
+		t.Fatalf("expected error for missing offset 'o', got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+	if !strings.Contains(scimErr.Detail, "missing offset parameter") {
+		t.Errorf("detail = %q, want 'missing offset parameter'", scimErr.Detail)
+	}
+}
+
+func TestDecodeCursor_MissingExpiresAt(t *testing.T) {
+	wsID := uuid.New()
+	rawJSON := fmt.Sprintf(`{"w":"%s","o":10}`, wsID)
+	token := CursorPrefix + base64.RawURLEncoding.EncodeToString([]byte(rawJSON))
+
+	_, err := DecodeCursor(token, wsID)
+	if err == nil {
+		t.Fatalf("expected error for missing expiration 'exp', got nil")
+	}
+	scimErr, ok := err.(*ScimError)
+	if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidCursor" {
+		t.Fatalf("expected 400 invalidCursor, got: %v", err)
+	}
+	if !strings.Contains(scimErr.Detail, "missing expiration timestamp") {
+		t.Errorf("detail = %q, want 'missing expiration timestamp'", scimErr.Detail)
 	}
 }

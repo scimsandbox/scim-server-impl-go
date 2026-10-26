@@ -26,6 +26,10 @@ func ServiceProviderConfig() map[string]any {
 		"changePassword": map[string]any{"supported": true},
 		"sort":           map[string]any{"supported": true},
 		"etag":           map[string]any{"supported": true},
+		"securityEvents": map[string]any{
+			"supported":    true,
+			"asyncRequest": "request",
+		},
 		"authenticationSchemes": []map[string]any{{
 			"type":        "oauthbearertoken",
 			"name":        "OAuth Bearer Token",
@@ -266,6 +270,15 @@ func serviceProviderConfigSchema() map[string]any {
 	etag := withSubAttributes(attr("etag", "complex", true, "readOnly", "none", "ETag configuration", false),
 		attr("supported", "boolean", true, "readOnly", "none", "Whether ETags are supported", false))
 
+	asyncRequest := attr("asyncRequest", "string", false, "readOnly", "none", "Async request mode", false)
+	asyncRequest["canonicalValues"] = []string{"request", "long", "none"}
+	delete(asyncRequest, "uniqueness")
+
+	securityEvents := withSubAttributes(attr("securityEvents", "complex", false, "readOnly", "none",
+		"Security events configuration", false),
+		attr("supported", "boolean", true, "readOnly", "none", "Whether security events are supported", false),
+		asyncRequest)
+
 	schemeType := attr("type", "string", true, "readOnly", "none", "Scheme type", false)
 	schemeType["canonicalValues"] = []string{"httpbasic", "httpdigest", "oauth", "oauth2", "oauthbearertoken"}
 	specURI := withCaseExact(attr("specUri", "reference", false, "readOnly", "none", "Specification URI", false))
@@ -281,7 +294,7 @@ func serviceProviderConfigSchema() map[string]any {
 		specURI,
 		authDocURI)
 
-	attrs := []map[string]any{docURI, patch, bulk, filter, pagination, changePassword, sort, etag, authSchemes}
+	attrs := []map[string]any{docURI, patch, bulk, filter, pagination, changePassword, sort, etag, securityEvents, authSchemes}
 
 	return map[string]any{
 		"schemas":     []string{coreSchemaURN},

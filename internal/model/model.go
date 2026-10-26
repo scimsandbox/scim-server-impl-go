@@ -173,3 +173,22 @@ type ScimRequestLog struct {
 	ResponseBody *string
 	CreatedAt    time.Time
 }
+
+const (
+	AsyncStatusPending   = "PENDING"
+	AsyncStatusCompleted = "COMPLETED"
+	AsyncStatusFailed    = "FAILED"
+)
+
+// ScimAsyncEvent represents an asynchronous operation event per RFC 9967.
+type ScimAsyncEvent struct {
+	TxnID        uuid.UUID  `json:"txnId"`
+	WorkspaceID  uuid.UUID  `json:"workspaceId"`
+	Operation    string     `json:"operation"`
+	ResourceType string     `json:"resourceType"`
+	ResourceID   *uuid.UUID `json:"resourceId,omitempty"`
+	Status       string     `json:"status"`
+	SetPayload   *string    `json:"setPayload,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	CompletedAt  *time.Time `json:"completedAt,omitempty"`
+}

@@ -27,6 +27,7 @@ type GroupHandler struct {
 	membershipRepo *repository.MembershipRepository
 	userRepo       *repository.UserRepository
 	workspaceRepo  *repository.WorkspaceRepository
+	asyncEventRepo repository.AsyncEventRepo
 }
 
 func NewGroupHandler(
@@ -34,12 +35,18 @@ func NewGroupHandler(
 	membershipRepo *repository.MembershipRepository,
 	userRepo *repository.UserRepository,
 	workspaceRepo *repository.WorkspaceRepository,
+	asyncEventRepo ...repository.AsyncEventRepo,
 ) *GroupHandler {
+	var ar repository.AsyncEventRepo
+	if len(asyncEventRepo) > 0 {
+		ar = asyncEventRepo[0]
+	}
 	return &GroupHandler{
 		groupRepo:      groupRepo,
 		membershipRepo: membershipRepo,
 		userRepo:       userRepo,
 		workspaceRepo:  workspaceRepo,
+		asyncEventRepo: ar,
 	}
 }
 
@@ -59,6 +66,78 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	displayName, _ := input["displayName"].(string)
 	if displayName == "" {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", "displayName is required"))
+		return
+	}
+
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "POST",
+			ResourceType: "Group",
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(detachedInput map[string]any, ws uuid.UUID, txn uuid.UUID, base string) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			dName, _ := detachedInput["displayName"].(string)
+			group := &model.ScimGroup{
+				ID:           uuid.New(),
+				WorkspaceID:  ws,
+				DisplayName:  dName,
+				CreatedAt:    time.Now().UTC(),
+				LastModified: time.Now().UTC(),
+				Version:      0,
+			}
+			if extID, ok := detachedInput["externalId"].(string); ok {
+				group.ExternalID = &extID
+			}
+
+			if err := h.groupRepo.Create(workerCtx, group); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, nil, nil, time.Now().UTC())
+				return
+			}
+
+			if members, ok := detachedInput["members"].([]any); ok {
+				for _, m := range members {
+					if memberMap, ok := m.(map[string]any); ok {
+						if err := h.addMember(workerCtx, group.ID, ws, memberMap); err != nil {
+							_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &group.ID, nil, time.Now().UTC())
+							return
+						}
+					}
+				}
+			}
+
+			h.touchWorkspace(workerCtx, ws)
+
+			memberships, _ := h.membershipRepo.FindByGroupID(workerCtx, group.ID)
+			group.Members = memberships
+			resp := scim.GroupToScimResponse(group, base)
+
+			setStr, err := buildSETJson(base, txn, "Group", group.ID, "POST", resp)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &group.ID, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &group.ID, &setStr, time.Now().UTC())
+		}(input, wsID, txnID, baseURL)
 		return
 	}
 
@@ -278,6 +357,92 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "PUT",
+			ResourceType: "Group",
+			ResourceID:   &groupID,
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(detachedInput map[string]any, ws uuid.UUID, gid uuid.UUID, txn uuid.UUID, base string) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			var updatedGroup *model.ScimGroup
+			err := jdbc.InTransaction(workerCtx, func(tx jdbc.Tx) error {
+				group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(workerCtx, tx, gid, ws)
+				if err != nil || group == nil {
+					return errors.New("group not found")
+				}
+				dName, _ := detachedInput["displayName"].(string)
+				group.DisplayName = dName
+				if extID, ok := detachedInput["externalId"]; ok {
+					if s, ok := extID.(string); ok {
+						group.ExternalID = &s
+					} else {
+						group.ExternalID = nil
+					}
+				} else {
+					group.ExternalID = nil
+				}
+				if err := h.membershipRepo.DeleteByGroupIDTx(workerCtx, tx, gid); err != nil {
+					return err
+				}
+				if members, ok := detachedInput["members"].([]any); ok {
+					for _, m := range members {
+						if memberMap, ok := m.(map[string]any); ok {
+							if err := h.addMemberTx(workerCtx, tx, gid, ws, memberMap); err != nil {
+								return err
+							}
+						}
+					}
+				}
+				group.LastModified = time.Now().UTC()
+				if err := h.groupRepo.UpdateTx(workerCtx, tx, group); err != nil {
+					return err
+				}
+				memberships, err := h.membershipRepo.FindByGroupIDTx(workerCtx, tx, gid)
+				if err != nil {
+					return err
+				}
+				group.Members = memberships
+				updatedGroup = group
+				return nil
+			})
+			if err != nil || updatedGroup == nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, nil, time.Now().UTC())
+				return
+			}
+			h.touchWorkspace(workerCtx, ws)
+
+			resp := scim.GroupToScimResponse(updatedGroup, base)
+			setStr, err := buildSETJson(base, txn, "Group", gid, "PUT", resp)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &gid, &setStr, time.Now().UTC())
+		}(input, wsID, groupID, txnID, baseURL)
+		return
+	}
+
 	var updatedGroup *model.ScimGroup
 	err = jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
 		group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(r.Context(), tx, groupID, wsID)
@@ -415,6 +580,76 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "PATCH",
+			ResourceType: "Group",
+			ResourceID:   &groupID,
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(detachedOps []any, ws uuid.UUID, gid uuid.UUID, txn uuid.UUID, base string) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			var updatedGroup *model.ScimGroup
+			err := jdbc.InTransaction(workerCtx, func(tx jdbc.Tx) error {
+				group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(workerCtx, tx, gid, ws)
+				if err != nil || group == nil {
+					return errors.New("group not found")
+				}
+				for _, op := range detachedOps {
+					if m, ok := op.(map[string]any); ok {
+						if err := h.applyGroupPatchOpTx(workerCtx, tx, group, ws, m); err != nil {
+							return err
+						}
+					}
+				}
+				group.LastModified = time.Now().UTC()
+				if err := h.groupRepo.UpdateTx(workerCtx, tx, group); err != nil {
+					return err
+				}
+				memberships, err := h.membershipRepo.FindByGroupIDTx(workerCtx, tx, gid)
+				if err != nil {
+					return err
+				}
+				group.Members = memberships
+				updatedGroup = group
+				return nil
+			})
+			if err != nil || updatedGroup == nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, nil, time.Now().UTC())
+				return
+			}
+			h.touchWorkspace(workerCtx, ws)
+
+			resp := scim.GroupToScimResponse(updatedGroup, base)
+			setStr, err := buildSETJson(base, txn, "Group", gid, "PATCH", resp)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &gid, &setStr, time.Now().UTC())
+		}(ops, wsID, groupID, txnID, baseURL)
+		return
+	}
+
 	var updatedGroup *model.ScimGroup
 	err = jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
 		group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(r.Context(), tx, groupID, wsID)
@@ -499,6 +734,52 @@ func (h *GroupHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 	groupID, err := parseUUID(chi.URLParam(r, "id"))
 	if err != nil {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Group not found"))
+		return
+	}
+
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "DELETE",
+			ResourceType: "Group",
+			ResourceID:   &groupID,
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(ws uuid.UUID, gid uuid.UUID, txn uuid.UUID, base string) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			_ = h.membershipRepo.DeleteByMemberValue(workerCtx, gid)
+			_ = h.membershipRepo.DeleteByGroupID(workerCtx, gid)
+			if err := h.groupRepo.Delete(workerCtx, gid, ws); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, nil, time.Now().UTC())
+				return
+			}
+			h.touchWorkspace(workerCtx, ws)
+
+			setStr, err := buildSETJson(base, txn, "Group", gid, "DELETE", nil)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &gid, &setStr, time.Now().UTC())
+		}(wsID, groupID, txnID, baseURL)
 		return
 	}
 

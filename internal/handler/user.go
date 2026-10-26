@@ -23,17 +23,24 @@ type UserHandler struct {
 	userRepo       *repository.UserRepository
 	membershipRepo *repository.MembershipRepository
 	workspaceRepo  *repository.WorkspaceRepository
+	asyncEventRepo repository.AsyncEventRepo
 }
 
 func NewUserHandler(
 	userRepo *repository.UserRepository,
 	membershipRepo *repository.MembershipRepository,
 	workspaceRepo *repository.WorkspaceRepository,
+	asyncEventRepo ...repository.AsyncEventRepo,
 ) *UserHandler {
+	var ar repository.AsyncEventRepo
+	if len(asyncEventRepo) > 0 {
+		ar = asyncEventRepo[0]
+	}
 	return &UserHandler{
 		userRepo:       userRepo,
 		membershipRepo: membershipRepo,
 		workspaceRepo:  workspaceRepo,
+		asyncEventRepo: ar,
 	}
 }
 
@@ -53,6 +60,65 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	userName, _ := input["userName"].(string)
 	if userName == "" {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", "userName is required"))
+		return
+	}
+
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "POST",
+			ResourceType: "User",
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(detachedInput map[string]any, ws uuid.UUID, txn uuid.UUID, base string, compat scim.CompatMode) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			user := &model.ScimUser{
+				ID:           uuid.New(),
+				WorkspaceID:  ws,
+				Active:       true,
+				CreatedAt:    time.Now().UTC(),
+				LastModified: time.Now().UTC(),
+				Version:      0,
+			}
+			if err := scim.ApplyFromScimInput(user, detachedInput); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, nil, nil, time.Now().UTC())
+				return
+			}
+			if err := h.userRepo.Create(workerCtx, user); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, nil, nil, time.Now().UTC())
+				return
+			}
+			h.touchWorkspace(workerCtx, ws)
+
+			resp := scim.UserToScimResponse(user, base, nil)
+			if compat == scim.CompatMS {
+				resp = scim.ApplyMsCompat(resp)
+			}
+			setStr, err := buildSETJson(base, txn, "User", user.ID, "POST", resp)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &user.ID, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &user.ID, &setStr, time.Now().UTC())
+		}(input, wsID, txnID, baseURL, getCompatMode(r))
 		return
 	}
 
@@ -253,6 +319,72 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var input map[string]any
+	if err := readJSON(r, &input); err != nil {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+		return
+	}
+
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "PUT",
+			ResourceType: "User",
+			ResourceID:   &userID,
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(detachedInput map[string]any, ws uuid.UUID, uid uuid.UUID, txn uuid.UUID, base string, compat scim.CompatMode) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			u, err := h.userRepo.FindByIDAndWorkspaceID(workerCtx, uid, ws)
+			if err != nil || u == nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			scim.ClearMutableAttributes(u)
+			if err := scim.ApplyFromScimInput(u, detachedInput); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			u.LastModified = time.Now().UTC()
+			if err := h.userRepo.Update(workerCtx, u); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			h.touchWorkspace(workerCtx, ws)
+
+			groups := h.getUserGroups(workerCtx, u.ID, base)
+			resp := scim.UserToScimResponse(u, base, groups)
+			if compat == scim.CompatMS {
+				resp = scim.ApplyMsCompat(resp)
+			}
+			setStr, err := buildSETJson(base, txn, "User", u.ID, "PUT", resp)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &uid, &setStr, time.Now().UTC())
+		}(input, wsID, userID, txnID, baseURL, getCompatMode(r))
+		return
+	}
+
 	user, err := h.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
 	if err != nil || user == nil {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
@@ -267,12 +399,6 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
 			return
 		}
-	}
-
-	var input map[string]any
-	if err := readJSON(r, &input); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
-		return
 	}
 
 	newUserName, _ := input["userName"].(string)
@@ -337,24 +463,6 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := h.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
-	if err != nil || user == nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
-		return
-	}
-
-	oldUserName := user.UserName
-
-	// If-Match check
-	ifMatch := r.Header.Get("If-Match")
-	if ifMatch != "" {
-		etag := fmt.Sprintf("W/\"%d\"", user.Version)
-		if ifMatch != etag {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-			return
-		}
-	}
-
 	var patchReq map[string]any
 	if err := readJSON(r, &patchReq); err != nil {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
@@ -386,6 +494,83 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 	for _, op := range ops {
 		if m, ok := op.(map[string]any); ok {
 			operations = append(operations, m)
+		}
+	}
+
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "PATCH",
+			ResourceType: "User",
+			ResourceID:   &userID,
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(detachedOps []map[string]any, ws uuid.UUID, uid uuid.UUID, txn uuid.UUID, base string, compat scim.CompatMode) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			u, err := h.userRepo.FindByIDAndWorkspaceID(workerCtx, uid, ws)
+			if err != nil || u == nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			if err := scim.ApplyPatchOperations(u, detachedOps); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			u.LastModified = time.Now().UTC()
+			if err := h.userRepo.Update(workerCtx, u); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			h.touchWorkspace(workerCtx, ws)
+
+			groups := h.getUserGroups(workerCtx, u.ID, base)
+			resp := scim.UserToScimResponse(u, base, groups)
+			if compat == scim.CompatMS {
+				resp = scim.ApplyMsCompat(resp)
+			}
+			setStr, err := buildSETJson(base, txn, "User", u.ID, "PATCH", resp)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &uid, &setStr, time.Now().UTC())
+		}(operations, wsID, userID, txnID, baseURL, getCompatMode(r))
+		return
+	}
+
+	user, err := h.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
+	if err != nil || user == nil {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
+		return
+	}
+
+	oldUserName := user.UserName
+
+	// If-Match check
+	ifMatch := r.Header.Get("If-Match")
+	if ifMatch != "" {
+		etag := fmt.Sprintf("W/\"%d\"", user.Version)
+		if ifMatch != etag {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
+			return
 		}
 	}
 
@@ -452,6 +637,51 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	userID, err := parseUUID(chi.URLParam(r, "id"))
 	if err != nil {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
+		return
+	}
+
+	if isAsyncPreferred(r) && h.asyncEventRepo != nil {
+		txnID := uuid.New()
+		baseURL := buildBaseURL(r)
+		eventURL := baseURL + "/Events/" + txnID.String()
+
+		event := &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "DELETE",
+			ResourceType: "User",
+			ResourceID:   &userID,
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+			return
+		}
+
+		w.Header().Set("Set-Txn", txnID.String())
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.Header().Set("Location", eventURL)
+		w.WriteHeader(http.StatusAccepted)
+
+		go func(ws uuid.UUID, uid uuid.UUID, txn uuid.UUID, base string) {
+			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			_ = h.membershipRepo.DeleteByMemberValue(workerCtx, uid)
+			if err := h.userRepo.Delete(workerCtx, uid, ws); err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			h.touchWorkspace(workerCtx, ws)
+
+			setStr, err := buildSETJson(base, txn, "User", uid, "DELETE", nil)
+			if err != nil {
+				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, nil, time.Now().UTC())
+				return
+			}
+			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &uid, &setStr, time.Now().UTC())
+		}(wsID, userID, txnID, baseURL)
 		return
 	}
 

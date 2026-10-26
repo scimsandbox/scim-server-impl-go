@@ -84,13 +84,15 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	workspaceRepo := repository.NewWorkspaceRepository()
 	tokenRepo := repository.NewTokenRepository()
 	requestLogRepo := repository.NewRequestLogRepository()
+	asyncEventRepo := repository.NewAsyncEventRepository()
 
 	// Services
 	cleanupService := service.NewWorkspaceCleanupService(workspaceRepo, logger)
 
 	// Handlers
-	userHandler := handler.NewUserHandler(userRepo, membershipRepo, workspaceRepo)
-	groupHandler := handler.NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo)
+	userHandler := handler.NewUserHandler(userRepo, membershipRepo, workspaceRepo, asyncEventRepo)
+	groupHandler := handler.NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo, asyncEventRepo)
+	asyncEventHandler := handler.NewAsyncEventHandler(asyncEventRepo)
 	bulkHandler := handler.NewBulkHandler(userHandler, groupHandler)
 	discoveryHandler := handler.NewDiscoveryHandler(userHandler, groupHandler)
 	meHandler := handler.NewMeHandler()
@@ -125,6 +127,13 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		r.Patch(groupsPath, groupHandler.PatchGroup)
 		r.Delete(groupsPath, groupHandler.DeleteGroup)
 		r.Post("/Groups/.search", groupHandler.SearchGroups)
+
+		const eventsPath = "/Events/{txnId}"
+		r.Get(eventsPath, asyncEventHandler.GetEvent)
+		r.Post(eventsPath, handler.MethodNotAllowed)
+		r.Put(eventsPath, handler.MethodNotAllowed)
+		r.Patch(eventsPath, handler.MethodNotAllowed)
+		r.Delete(eventsPath, handler.MethodNotAllowed)
 
 		r.Get("/", discoveryHandler.RootSearch)
 		r.Post("/", handler.MethodNotAllowed)

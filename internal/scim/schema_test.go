@@ -168,4 +168,49 @@ func TestServiceProviderConfig(t *testing.T) {
 	if !ok || len(canonicalValues) != 2 || canonicalValues[0] != "cursor" || canonicalValues[1] != "index" {
 		t.Fatalf("canonicalValues = %v, want [cursor, index]", modeAttr["canonicalValues"])
 	}
+
+	// Verify securityEvents in ServiceProviderConfig
+	secEvents, ok := spc["securityEvents"].(map[string]any)
+	if !ok || secEvents == nil {
+		t.Fatalf("securityEvents missing in ServiceProviderConfig")
+	}
+	if secEvents["supported"] != true {
+		t.Fatalf("securityEvents.supported = %v, want true", secEvents["supported"])
+	}
+	if secEvents["asyncRequest"] != "request" {
+		t.Fatalf("securityEvents.asyncRequest = %v, want request", secEvents["asyncRequest"])
+	}
+
+	// Verify securityEvents in ServiceProviderConfig schema definition
+	var secEventsAttr map[string]any
+	for _, a := range attrs {
+		if a["name"] == "securityEvents" {
+			secEventsAttr = a
+			break
+		}
+	}
+	if secEventsAttr == nil {
+		t.Fatalf("securityEvents attribute not found in ServiceProviderConfig schema")
+	}
+	secSubAttrs := secEventsAttr["subAttributes"].([]map[string]any)
+	var supportedAttr, asyncReqAttr map[string]any
+	for _, sa := range secSubAttrs {
+		if sa["name"] == "supported" {
+			supportedAttr = sa
+		}
+		if sa["name"] == "asyncRequest" {
+			asyncReqAttr = sa
+		}
+	}
+	if supportedAttr == nil || supportedAttr["type"] != "boolean" {
+		t.Fatalf("securityEvents.supported subAttribute invalid: %v", supportedAttr)
+	}
+	if asyncReqAttr == nil || asyncReqAttr["type"] != "string" {
+		t.Fatalf("securityEvents.asyncRequest subAttribute invalid: %v", asyncReqAttr)
+	}
+	secCanonical, ok := asyncReqAttr["canonicalValues"].([]string)
+	if !ok || len(secCanonical) != 3 || secCanonical[0] != "request" || secCanonical[1] != "long" || secCanonical[2] != "none" {
+		t.Fatalf("securityEvents.asyncRequest canonicalValues = %v, want [request, long, none]", asyncReqAttr["canonicalValues"])
+	}
 }
+

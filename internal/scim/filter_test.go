@@ -161,9 +161,25 @@ func TestParseGroupFilter_Basic(t *testing.T) {
 }
 
 func TestParseGroupFilter_UnknownAttribute(t *testing.T) {
-	_, err := ParseGroupFilter(`unknownAttr eq "test"`, 1)
-	if err == nil {
-		t.Fatalf("expected error for unknown group filter attribute")
+	userOnlyAttrs := []string{
+		`unknownAttr eq "test"`,
+		`userName sw "val_"`,
+		`active eq true`,
+		`name.familyName eq "Smith"`,
+		`emails.value co "@test.com"`,
+		`emails pr`,
+		`emails[type eq "work"]`,
+		`urn:ietf:params:scim:schemas:core:2.0:User:displayName eq "test"`,
+		`urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department eq "QA"`,
+	}
+	for _, f := range userOnlyAttrs {
+		_, err := ParseGroupFilter(f, 1)
+		if err == nil {
+			t.Fatalf("expected error for non-group filter attribute: %s", f)
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "unknown attribute") {
+			t.Fatalf("expected 'unknown attribute' error for %q, got: %v", f, err)
+		}
 	}
 }
 

@@ -303,13 +303,31 @@ const (
 )
 
 func stripURNPrefix(attr string) string {
-	if strings.HasPrefix(attr, coreUserURN) {
+	lower := strings.ToLower(attr)
+	if strings.HasPrefix(lower, strings.ToLower(coreUserURN)) {
 		return attr[len(coreUserURN):]
 	}
-	if strings.HasPrefix(attr, coreGroupURN) {
+	if strings.HasPrefix(lower, strings.ToLower(coreGroupURN)) {
 		return attr[len(coreGroupURN):]
 	}
-	if strings.HasPrefix(attr, enterpriseURN) {
+	if strings.HasPrefix(lower, strings.ToLower(enterpriseURN)) {
+		return attr[len(enterpriseURN):]
+	}
+	return attr
+}
+
+func (p *filterParser) stripEntityURNPrefix(attr string) string {
+	lower := strings.ToLower(attr)
+	if p.entityType == entityTypeGroup {
+		if strings.HasPrefix(lower, strings.ToLower(coreGroupURN)) {
+			return attr[len(coreGroupURN):]
+		}
+		return attr
+	}
+	if strings.HasPrefix(lower, strings.ToLower(coreUserURN)) {
+		return attr[len(coreUserURN):]
+	}
+	if strings.HasPrefix(lower, strings.ToLower(enterpriseURN)) {
 		return attr[len(enterpriseURN):]
 	}
 	return attr
@@ -459,7 +477,7 @@ func (p *filterParser) parseAtom() (*FilterResult, error) {
 		return nil, fmt.Errorf("expected attribute name, got: %s", t.val)
 	}
 	attrName := p.next().val
-	attrName = stripURNPrefix(attrName)
+	attrName = p.stripEntityURNPrefix(attrName)
 
 	// Check for "pr" (present) operator
 	opToken := p.peek()
@@ -512,6 +530,13 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	bracketIdx := strings.Index(raw, "[")
 	collectionAttr := raw[:bracketIdx]
 	filterStart := raw[bracketIdx+1:]
+
+	if p.entityType == entityTypeGroup {
+		if strings.EqualFold(collectionAttr, "members") {
+			return nil, fmt.Errorf("value path filters on 'members' are not supported")
+		}
+		return nil, fmt.Errorf("unknown attribute: %s", collectionAttr)
+	}
 
 	if !isJSONCollection(collectionAttr) {
 		if strings.EqualFold(collectionAttr, "members") {
@@ -675,13 +700,34 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 }
 
 func (p *filterParser) resolveColumn(attr string) (string, error) {
-	// Handle enterprise extension prefix
-	if strings.HasPrefix(attr, enterpriseURNBase+":") {
+	lower := strings.ToLower(attr)
+
+	if p.entityType == entityTypeGroup {
+		switch lower {
+		case attrID:
+			return sqlID, nil
+		case attrDisplayName:
+			return sqlDisplayName, nil
+		case attrExternalID:
+			return sqlExternalID, nil
+		case attrMetaCreated:
+			return sqlCreatedAt, nil
+		case attrMetaLastModified:
+			return sqlLastModified, nil
+		case attrMetaResourceType:
+			return "'Group'::text", nil
+		case attrMembersValue:
+			return sqlMemberValue, nil
+		default:
+			return "", fmt.Errorf("unknown attribute: %s", attr)
+		}
+	}
+
+	// Handle enterprise extension prefix (User only)
+	if strings.HasPrefix(lower, strings.ToLower(enterpriseURNBase)+":") {
 		attr = attr[len(enterpriseURN):]
 		return p.resolveEnterpriseColumn(attr)
 	}
-
-	lower := strings.ToLower(attr)
 
 	// JSON collection attributes → use LIKE-based filtering
 	if isJSONCollection(lower) {
@@ -729,10 +775,7 @@ func (p *filterParser) resolveColumn(attr string) (string, error) {
 	case attrMetaLastModified:
 		return sqlLastModified, nil
 	case attrMetaResourceType:
-		if p.entityType == entityTypeUser {
-			return "'User'::text", nil
-		}
-		return "'Group'::text", nil
+		return "'User'::text", nil
 	case attrID:
 		return sqlID, nil
 	// Enterprise extension
@@ -751,9 +794,6 @@ func (p *filterParser) resolveColumn(attr string) (string, error) {
 		return sqlEnterpriseManagerValue, nil
 	case attrManagerDisplayName:
 		return sqlEnterpriseManagerDisplay, nil
-	// Group attributes
-	case attrMembersValue:
-		return sqlMemberValue, nil
 	default:
 		return "", fmt.Errorf("unknown attribute: %s", attr)
 	}
@@ -818,9 +858,9 @@ func (p *filterParser) resolveJSONColumn(attr string) string {
 }
 
 func (p *filterParser) buildComparison(attr, operator, value string) (*FilterResult, error) {
-	// Handle JSON sub-attribute paths like emails.value
+	// Handle JSON sub-attribute paths like emails.value (User only)
 	parts := strings.SplitN(attr, ".", 2)
-	if len(parts) == 2 && isJSONCollection(parts[0]) {
+	if p.entityType == entityTypeUser && len(parts) == 2 && isJSONCollection(parts[0]) {
 		col := p.resolveJSONColumn(parts[0])
 		return p.buildJSONAttributeFilter(col, parts[0], parts[1], operator, value)
 	}

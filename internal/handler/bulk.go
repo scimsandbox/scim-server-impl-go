@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
@@ -139,6 +140,12 @@ func (h *BulkHandler) processOperation(r *http.Request, op map[string]any, wsID 
 			result["response"] = buildBulkError("500", "", "Internal server error")
 		}
 	}()
+
+	if method == "POST" && strings.TrimSpace(bulkId) == "" {
+		result["status"] = "400"
+		result["response"] = buildBulkError("400", "invalidValue", "bulkId is required for POST operations")
+		return result
+	}
 
 	// Resolve bulkId references
 	if opPath != "" {
@@ -334,44 +341,53 @@ func (h *BulkHandler) createGroupInternal(r *http.Request, wsID uuid.UUID, data 
 		return nil, &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "displayName is required"}
 	}
 
-	existing, err := h.groupHandler.groupRepo.FindByDisplayNameAndWorkspaceID(r.Context(), displayName, wsID)
-	if err != nil {
-		return nil, &scim.ScimError{Status: 500, Detail: "Internal error"}
-	}
-	if existing != nil {
-		return nil, &scim.ScimError{Status: 409, ScimType: "uniqueness",
-			Detail: "Group with displayName '" + displayName + "' already exists"}
-	}
+	var createdID uuid.UUID
+	err := jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
+		existing, err := h.groupHandler.groupRepo.FindByDisplayNameAndWorkspaceIDTx(r.Context(), tx, displayName, wsID)
+		if err != nil {
+			return &scim.ScimError{Status: 500, Detail: "Internal error"}
+		}
+		if existing != nil {
+			return &scim.ScimError{Status: 409, ScimType: "uniqueness",
+				Detail: "Group with displayName '" + displayName + "' already exists"}
+		}
 
-	group := &model.ScimGroup{
-		ID:           uuid.New(),
-		WorkspaceID:  wsID,
-		DisplayName:  displayName,
-		CreatedAt:    time.Now(),
-		LastModified: time.Now(),
-		Version:      0,
-	}
-	if extID, ok := data["externalId"].(string); ok {
-		group.ExternalID = &extID
-	}
+		group := &model.ScimGroup{
+			ID:           uuid.New(),
+			WorkspaceID:  wsID,
+			DisplayName:  displayName,
+			CreatedAt:    time.Now().UTC(),
+			LastModified: time.Now().UTC(),
+			Version:      0,
+		}
+		if extID, ok := data["externalId"].(string); ok {
+			group.ExternalID = &extID
+		}
 
-	if err := h.groupHandler.groupRepo.Create(r.Context(), group); err != nil {
-		return nil, &scim.ScimError{Status: 500, Detail: "Failed to create group"}
-	}
+		if err := h.groupHandler.groupRepo.CreateTx(r.Context(), tx, group); err != nil {
+			return &scim.ScimError{Status: 500, Detail: "Failed to create group"}
+		}
 
-	// Add members
-	if members, ok := data["members"].([]any); ok {
-		for _, m := range members {
-			if memberMap, ok := m.(map[string]any); ok {
-				if err := h.groupHandler.addMember(r.Context(), group.ID, wsID, memberMap); err != nil {
-					return nil, err
+		// Add members within transaction; any failure (e.g. unresolved circular bulkId) triggers rollback
+		if members, ok := data["members"].([]any); ok {
+			for _, m := range members {
+				if memberMap, ok := m.(map[string]any); ok {
+					if err := h.groupHandler.addMemberTx(r.Context(), tx, group.ID, wsID, memberMap); err != nil {
+						return err
+					}
 				}
 			}
 		}
+
+		createdID = group.ID
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	h.groupHandler.touchWorkspace(r.Context(), wsID)
-	return &group.ID, nil
+	return &createdID, nil
 }
 
 func (h *BulkHandler) replaceUserInternal(r *http.Request, wsID, userID uuid.UUID, data map[string]any) error {
@@ -410,42 +426,55 @@ func (h *BulkHandler) replaceUserInternal(r *http.Request, wsID, userID uuid.UUI
 }
 
 func (h *BulkHandler) replaceGroupInternal(r *http.Request, wsID, groupID uuid.UUID, data map[string]any) error {
-	group, err := h.groupHandler.groupRepo.FindByIDAndWorkspaceID(r.Context(), groupID, wsID)
-	if err != nil || group == nil {
-		return &scim.ScimError{Status: 404, Detail: groupNotFoundDetail}
-	}
+	err := jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
+		group, err := h.groupHandler.groupRepo.FindByIDAndWorkspaceIDTx(r.Context(), tx, groupID, wsID)
+		if err != nil || group == nil {
+			return &scim.ScimError{Status: 404, Detail: groupNotFoundDetail}
+		}
 
-	displayName, _ := data["displayName"].(string)
-	if displayName == "" {
-		return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "displayName is required"}
-	}
+		displayName, _ := data["displayName"].(string)
+		if displayName == "" {
+			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "displayName is required"}
+		}
 
-	group.DisplayName = displayName
-	if extID, ok := data["externalId"]; ok {
-		if s, ok := extID.(string); ok {
-			group.ExternalID = &s
+		// GRP_21: RFC 7643 §4.2 - Group member sub-attributes 'value' and 'type' are immutable
+		if err := h.groupHandler.checkMemberTypeImmutabilityTx(r.Context(), tx, group.ID, data["members"]); err != nil {
+			return err
+		}
+
+		group.DisplayName = displayName
+		if extID, ok := data["externalId"]; ok {
+			if s, ok := extID.(string); ok {
+				group.ExternalID = &s
+			} else {
+				group.ExternalID = nil
+			}
 		} else {
 			group.ExternalID = nil
 		}
-	} else {
-		group.ExternalID = nil
-	}
 
-	// Clear and re-add members
-	_ = h.groupHandler.membershipRepo.DeleteByGroupID(r.Context(), group.ID)
-	if members, ok := data["members"].([]any); ok {
-		for _, m := range members {
-			if memberMap, ok := m.(map[string]any); ok {
-				if err := h.groupHandler.addMember(r.Context(), group.ID, wsID, memberMap); err != nil {
-					return err
+		// Clear and re-add members within transaction
+		if err := h.groupHandler.membershipRepo.DeleteByGroupIDTx(r.Context(), tx, group.ID); err != nil {
+			return err
+		}
+		if members, ok := data["members"].([]any); ok {
+			for _, m := range members {
+				if memberMap, ok := m.(map[string]any); ok {
+					if err := h.groupHandler.addMemberTx(r.Context(), tx, group.ID, wsID, memberMap); err != nil {
+						return err
+					}
 				}
 			}
 		}
-	}
 
-	group.LastModified = time.Now()
-	if err := h.groupHandler.groupRepo.Update(r.Context(), group); err != nil {
-		return &scim.ScimError{Status: 500, Detail: "Failed to update group"}
+		group.LastModified = time.Now().UTC()
+		if err := h.groupHandler.groupRepo.UpdateTx(r.Context(), tx, group); err != nil {
+			return &scim.ScimError{Status: 500, Detail: "Failed to update group"}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	h.groupHandler.touchWorkspace(r.Context(), wsID)

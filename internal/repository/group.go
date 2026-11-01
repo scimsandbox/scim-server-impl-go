@@ -204,6 +204,22 @@ func (r *GroupRepository) UpdateTx(ctx context.Context, tx jdbc.Executor, g *mod
 	return nil
 }
 
+func (r *GroupRepository) CreateTx(ctx context.Context, tx jdbc.Executor, g *model.ScimGroup) error {
+	if g.ID == uuid.Nil {
+		g.ID = uuid.New()
+	}
+	now := time.Now().UTC()
+	g.CreatedAt = now
+	g.LastModified = now
+	g.Version = 0
+
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO scim_groups (id, workspace_id, external_id, display_name, created_at, last_modified, version)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		g.ID, g.WorkspaceID, g.ExternalID, g.DisplayName, g.CreatedAt, g.LastModified, g.Version)
+	return err
+}
+
 // MembershipRepository
 
 type MembershipRepository struct{}

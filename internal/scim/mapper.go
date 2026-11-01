@@ -332,7 +332,7 @@ func replaceCollectionEmails(v any) []model.ScimUserEmail {
 			result = append(result, buildEmail(m))
 		}
 	}
-	return result
+	return DeduplicateEmails(result)
 }
 
 func replaceCollectionPhoneNumbers(v any) []model.ScimUserPhoneNumber {

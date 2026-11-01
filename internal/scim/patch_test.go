@@ -782,3 +782,221 @@ func assertStringPtrEquals(t *testing.T, name string, ptr *string, want string) 
 		t.Fatalf("%s = %q, want %q", name, *ptr, want)
 	}
 }
+
+func TestApplyPatchOperations_AddMissingValue_PAT24(t *testing.T) {
+	tests := []struct {
+		name string
+		op   map[string]any
+	}{
+		{
+			name: "missing value key with path",
+			op: map[string]any{
+				"op":   "add",
+				"path": "title",
+			},
+		},
+		{
+			name: "explicit nil value with path",
+			op: map[string]any{
+				"op":    "add",
+				"path":  "title",
+				"value": nil,
+			},
+		},
+		{
+			name: "missing value key without path",
+			op: map[string]any{
+				"op": "add",
+			},
+		},
+		{
+			name: "explicit nil value without path",
+			op: map[string]any{
+				"op":    "add",
+				"value": nil,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			u := newTestUser()
+			err := ApplyPatchOperations(u, []map[string]any{tc.op})
+			if err == nil {
+				t.Fatalf("expected error for PATCH add missing value member (RFC 7644 §3.5.2.1)")
+			}
+			scimErr, ok := err.(*ScimError)
+			if !ok {
+				t.Fatalf("expected *ScimError, got %T: %v", err, err)
+			}
+			if scimErr.Status != 400 {
+				t.Errorf("status = %d, want 400", scimErr.Status)
+			}
+			if scimErr.ScimType != "invalidValue" {
+				t.Errorf("scimType = %q, want invalidValue", scimErr.ScimType)
+			}
+		})
+	}
+}
+
+func TestApplyPatchOperations_PrimaryFlagDemotion_PAT27(t *testing.T) {
+	t.Run("filtered replace .primary sets new primary and demotes existing primary across all collections", func(t *testing.T) {
+		u := newTestUser()
+		u.Emails = []model.ScimUserEmail{
+			{Value: "work@example.com", Type: "work", PrimaryFlag: true},
+			{Value: "home@example.com", Type: "home", PrimaryFlag: false},
+		}
+		u.PhoneNumbers = []model.ScimUserPhoneNumber{
+			{Value: "111", Type: "work", PrimaryFlag: true},
+			{Value: "222", Type: "home", PrimaryFlag: false},
+		}
+		u.Addresses = []model.ScimUserAddress{
+			{StreetAddress: "1 Work Way", Type: "work", PrimaryFlag: true},
+			{StreetAddress: "2 Home Ln", Type: "home", PrimaryFlag: false},
+		}
+		u.Ims = []model.ScimUserIm{
+			{Value: "im1", Type: "aim", PrimaryFlag: true},
+			{Value: "im2", Type: "xmpp", PrimaryFlag: false},
+		}
+		u.Photos = []model.ScimUserPhoto{
+			{Value: "https://example.com/1.png", Type: "photo", PrimaryFlag: true},
+			{Value: "https://example.com/2.png", Type: "thumbnail", PrimaryFlag: false},
+		}
+		u.Entitlements = []model.ScimUserEntitlement{
+			{Value: "ent1", Type: "t1", PrimaryFlag: true},
+			{Value: "ent2", Type: "t2", PrimaryFlag: false},
+		}
+		u.Roles = []model.ScimUserRole{
+			{Value: "role1", Type: "t1", PrimaryFlag: true},
+			{Value: "role2", Type: "t2", PrimaryFlag: false},
+		}
+		u.X509Certificates = []model.ScimUserX509Certificate{
+			{Value: "Y2VydDE=", Type: "t1", PrimaryFlag: true},
+			{Value: "Y2VydDI=", Type: "t2", PrimaryFlag: false},
+		}
+
+		ops := []map[string]any{
+			{"op": "replace", "path": `emails[type eq "home"].primary`, "value": true},
+			{"op": "replace", "path": `phoneNumbers[type eq "home"].primary`, "value": true},
+			{"op": "replace", "path": `addresses[type eq "home"].primary`, "value": true},
+			{"op": "replace", "path": `ims[type eq "xmpp"].primary`, "value": true},
+			{"op": "replace", "path": `photos[type eq "thumbnail"].primary`, "value": true},
+			{"op": "replace", "path": `entitlements[value eq "ent2"].primary`, "value": true},
+			{"op": "replace", "path": `roles[value eq "role2"].primary`, "value": true},
+			{"op": "replace", "path": `x509Certificates[value eq "Y2VydDI="].primary`, "value": true},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+
+		if u.Emails[0].PrimaryFlag || !u.Emails[1].PrimaryFlag {
+			t.Errorf("emails primary flags = [%v, %v], want [false, true]", u.Emails[0].PrimaryFlag, u.Emails[1].PrimaryFlag)
+		}
+		if u.PhoneNumbers[0].PrimaryFlag || !u.PhoneNumbers[1].PrimaryFlag {
+			t.Errorf("phoneNumbers primary flags = [%v, %v], want [false, true]", u.PhoneNumbers[0].PrimaryFlag, u.PhoneNumbers[1].PrimaryFlag)
+		}
+		if u.Addresses[0].PrimaryFlag || !u.Addresses[1].PrimaryFlag {
+			t.Errorf("addresses primary flags = [%v, %v], want [false, true]", u.Addresses[0].PrimaryFlag, u.Addresses[1].PrimaryFlag)
+		}
+		if u.Ims[0].PrimaryFlag || !u.Ims[1].PrimaryFlag {
+			t.Errorf("ims primary flags = [%v, %v], want [false, true]", u.Ims[0].PrimaryFlag, u.Ims[1].PrimaryFlag)
+		}
+		if u.Photos[0].PrimaryFlag || !u.Photos[1].PrimaryFlag {
+			t.Errorf("photos primary flags = [%v, %v], want [false, true]", u.Photos[0].PrimaryFlag, u.Photos[1].PrimaryFlag)
+		}
+		if u.Entitlements[0].PrimaryFlag || !u.Entitlements[1].PrimaryFlag {
+			t.Errorf("entitlements primary flags = [%v, %v], want [false, true]", u.Entitlements[0].PrimaryFlag, u.Entitlements[1].PrimaryFlag)
+		}
+		if u.Roles[0].PrimaryFlag || !u.Roles[1].PrimaryFlag {
+			t.Errorf("roles primary flags = [%v, %v], want [false, true]", u.Roles[0].PrimaryFlag, u.Roles[1].PrimaryFlag)
+		}
+		if u.X509Certificates[0].PrimaryFlag || !u.X509Certificates[1].PrimaryFlag {
+			t.Errorf("x509Certificates primary flags = [%v, %v], want [false, true]", u.X509Certificates[0].PrimaryFlag, u.X509Certificates[1].PrimaryFlag)
+		}
+	})
+
+	t.Run("filtered replace without subAttr object containing primary:true demotes existing primary", func(t *testing.T) {
+		u := newTestUser()
+		u.Emails = []model.ScimUserEmail{
+			{Value: "work@example.com", Type: "work", PrimaryFlag: true},
+			{Value: "home@example.com", Type: "home", PrimaryFlag: false},
+		}
+
+		ops := []map[string]any{
+			{
+				"op":   "replace",
+				"path": `emails[type eq "home"]`,
+				"value": map[string]any{
+					"value":   "home-updated@example.com",
+					"primary": true,
+				},
+			},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+		if u.Emails[0].PrimaryFlag {
+			t.Errorf("expected work email primaryFlag=false, got true")
+		}
+		if !u.Emails[1].PrimaryFlag || u.Emails[1].Value != "home-updated@example.com" {
+			t.Errorf("expected home email updated with primaryFlag=true, got %+v", u.Emails[1])
+		}
+	})
+
+	t.Run("PATCH add new primary email demotes previously primary email", func(t *testing.T) {
+		u := newTestUser()
+		u.Emails = []model.ScimUserEmail{
+			{Value: "work@example.com", Type: "work", PrimaryFlag: true},
+		}
+
+		ops := []map[string]any{
+			{
+				"op":   "add",
+				"path": "emails",
+				"value": []any{
+					map[string]any{"value": "other@example.com", "type": "other", "primary": true},
+				},
+			},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+		if len(u.Emails) != 2 {
+			t.Fatalf("expected 2 emails, got %d", len(u.Emails))
+		}
+		if u.Emails[0].PrimaryFlag {
+			t.Errorf("expected existing email primaryFlag to be demoted to false, got true")
+		}
+		if !u.Emails[1].PrimaryFlag {
+			t.Errorf("expected newly added email primaryFlag=true, got false")
+		}
+	})
+
+	t.Run("PATCH add without path adding primary phoneNumber demotes existing primary", func(t *testing.T) {
+		u := newTestUser()
+		u.PhoneNumbers = []model.ScimUserPhoneNumber{
+			{Value: "111-2222", Type: "work", PrimaryFlag: true},
+		}
+
+		ops := []map[string]any{
+			{
+				"op": "add",
+				"value": map[string]any{
+					"phoneNumbers": []any{
+						map[string]any{"value": "333-4444", "type": "mobile", "primary": true},
+					},
+				},
+			},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+		if len(u.PhoneNumbers) != 2 {
+			t.Fatalf("expected 2 phoneNumbers, got %d", len(u.PhoneNumbers))
+		}
+		if u.PhoneNumbers[0].PrimaryFlag || !u.PhoneNumbers[1].PrimaryFlag {
+			t.Errorf("phoneNumbers primary flags = [%v, %v], want [false, true]", u.PhoneNumbers[0].PrimaryFlag, u.PhoneNumbers[1].PrimaryFlag)
+		}
+	})
+}
+

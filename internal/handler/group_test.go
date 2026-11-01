@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
+	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
@@ -158,4 +159,62 @@ func TestGroupHandler_SearchGroups_NonStringCursor(t *testing.T) {
 	if resp["scimType"] != "invalidCursor" {
 		t.Errorf("scimType = %v, want invalidCursor", resp["scimType"])
 	}
+}
+
+func TestValidateMemberTypeImmutability_GRP21(t *testing.T) {
+	userType := "User"
+	groupType := "Group"
+	memberA := uuid.New()
+	memberB := uuid.New()
+	memberNew := uuid.New()
+
+	existing := []model.ScimGroupMembership{
+		{MemberValue: memberA, MemberType: &userType},
+		{MemberValue: memberB, MemberType: &groupType},
+	}
+
+	t.Run("changing User member type to Group returns 400 mutability ([]any input)", func(t *testing.T) {
+		rawMembers := []any{
+			map[string]any{"value": memberA.String(), "type": "Group"},
+		}
+		err := validateMemberTypeImmutability(existing, rawMembers)
+		if err == nil {
+			t.Fatal("expected mutability error when changing member type from User to Group")
+		}
+		scimErr, ok := err.(*scim.ScimError)
+		if !ok {
+			t.Fatalf("expected *scim.ScimError, got %T: %v", err, err)
+		}
+		if scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "mutability" {
+			t.Fatalf("status=%d scimType=%q, want 400 mutability", scimErr.Status, scimErr.ScimType)
+		}
+	})
+
+	t.Run("changing Group member type to User returns 400 mutability ([]map[string]any input)", func(t *testing.T) {
+		rawMembers := []map[string]any{
+			{"value": memberB.String(), "type": "User"},
+		}
+		err := validateMemberTypeImmutability(existing, rawMembers)
+		if err == nil {
+			t.Fatal("expected mutability error when changing member type from Group to User")
+		}
+		scimErr, ok := err.(*scim.ScimError)
+		if !ok {
+			t.Fatalf("expected *scim.ScimError, got %T: %v", err, err)
+		}
+		if scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "mutability" {
+			t.Fatalf("status=%d scimType=%q, want 400 mutability", scimErr.Status, scimErr.ScimType)
+		}
+	})
+
+	t.Run("preserving member type (case-insensitive) or omitting type succeeds", func(t *testing.T) {
+		rawMembers := []any{
+			map[string]any{"value": memberA.String(), "type": "user"},
+			map[string]any{"value": memberB.String()},
+			map[string]any{"value": memberNew.String(), "type": "Group"},
+		}
+		if err := validateMemberTypeImmutability(existing, rawMembers); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }

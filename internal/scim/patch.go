@@ -54,6 +54,9 @@ func ApplyPatchOperations(user *model.ScimUser, operations []map[string]any) err
 
 		switch opType {
 		case "add":
+			if value == nil {
+				return NewScimError(400, "invalidValue", "PATCH add operation must contain a 'value' member")
+			}
 			if err := applyAdd(user, path, value); err != nil {
 				return err
 			}
@@ -430,35 +433,84 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 	switch attr {
 	case "emails":
 		for _, item := range items {
-			user.Emails = append(user.Emails, buildEmail(item))
+			built := buildEmail(item)
+			if built.PrimaryFlag {
+				for i := range user.Emails {
+					user.Emails[i].PrimaryFlag = false
+				}
+			}
+			user.Emails = append(user.Emails, built)
 		}
+		user.Emails = DeduplicateEmails(user.Emails)
 	case "phonenumbers":
 		for _, item := range items {
-			user.PhoneNumbers = append(user.PhoneNumbers, buildPhoneNumber(item))
+			built := buildPhoneNumber(item)
+			if built.PrimaryFlag {
+				for i := range user.PhoneNumbers {
+					user.PhoneNumbers[i].PrimaryFlag = false
+				}
+			}
+			user.PhoneNumbers = append(user.PhoneNumbers, built)
 		}
 	case "addresses":
 		for _, item := range items {
-			user.Addresses = append(user.Addresses, buildAddress(item))
+			built := buildAddress(item)
+			if built.PrimaryFlag {
+				for i := range user.Addresses {
+					user.Addresses[i].PrimaryFlag = false
+				}
+			}
+			user.Addresses = append(user.Addresses, built)
 		}
 	case "ims":
 		for _, item := range items {
-			user.Ims = append(user.Ims, buildIm(item))
+			built := buildIm(item)
+			if built.PrimaryFlag {
+				for i := range user.Ims {
+					user.Ims[i].PrimaryFlag = false
+				}
+			}
+			user.Ims = append(user.Ims, built)
 		}
 	case "photos":
 		for _, item := range items {
-			user.Photos = append(user.Photos, buildPhoto(item))
+			built := buildPhoto(item)
+			if built.PrimaryFlag {
+				for i := range user.Photos {
+					user.Photos[i].PrimaryFlag = false
+				}
+			}
+			user.Photos = append(user.Photos, built)
 		}
 	case "entitlements":
 		for _, item := range items {
-			user.Entitlements = append(user.Entitlements, buildEntitlement(item))
+			built := buildEntitlement(item)
+			if built.PrimaryFlag {
+				for i := range user.Entitlements {
+					user.Entitlements[i].PrimaryFlag = false
+				}
+			}
+			user.Entitlements = append(user.Entitlements, built)
 		}
 	case "roles":
 		for _, item := range items {
-			user.Roles = append(user.Roles, buildRole(item))
+			built := buildRole(item)
+			if built.PrimaryFlag {
+				for i := range user.Roles {
+					user.Roles[i].PrimaryFlag = false
+				}
+			}
+			user.Roles = append(user.Roles, built)
 		}
 	case "x509certificates":
 		for _, item := range items {
-			user.X509Certificates = append(user.X509Certificates, buildX509Certificate(item))
+			built := buildX509Certificate(item)
+			if built.PrimaryFlag {
+				for i := range user.X509Certificates {
+					user.X509Certificates[i].PrimaryFlag = false
+				}
+			}
+			user.X509Certificates = append(user.X509Certificates, built)
 		}
 	}
 	return nil
@@ -470,6 +522,30 @@ func replaceMultiValued(user *model.ScimUser, attr string, value any) error {
 		return nil
 	}
 	return addToMultiValued(user, attr, value)
+}
+
+// DeduplicateEmails deduplicates identical (type, value) email pairs (USR_22 / RFC 7643 §2.4).
+// Comparison is case-insensitive and whitespace-trimmed on both Type and Value.
+// The first occurrence's raw value and display are preserved; if any duplicate has PrimaryFlag=true,
+// the retained entry's PrimaryFlag is set to true.
+func DeduplicateEmails(emails []model.ScimUserEmail) []model.ScimUserEmail {
+	if len(emails) <= 1 {
+		return emails
+	}
+	result := make([]model.ScimUserEmail, 0, len(emails))
+	seen := make(map[string]int)
+	for _, email := range emails {
+		key := strings.ToLower(strings.TrimSpace(email.Type)) + "\x00" + strings.ToLower(strings.TrimSpace(email.Value))
+		if idx, found := seen[key]; found {
+			if email.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, email)
+	}
+	return result
 }
 
 func clearAttribute(user *model.ScimUser, attr string) error {
@@ -560,25 +636,59 @@ func applyFilteredRemove(user *model.ScimUser, collection, filterExpr string) er
 	return nil
 }
 
+func setsPrimaryTrue(subAttr string, value any) bool {
+	if strings.EqualFold(subAttr, "primary") {
+		return toBool(value)
+	}
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				if strings.EqualFold(k, "primary") && toBool(v) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr string, value any) error {
 	fc := parseEqFilter(filterExpr)
 	if fc == nil {
 		return NewScimError(400, "invalidFilter", "Cannot parse filter: "+filterExpr)
 	}
 	found := false
+	demoteOthers := setsPrimaryTrue(subAttr, value)
 
 	switch collection {
 	case "emails":
 		for i := range user.Emails {
 			if matchesEmailFilter(&user.Emails[i], filterExpr) {
 				setEmailSubAttribute(&user.Emails[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.Emails {
+						if j != i {
+							user.Emails[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
+		}
+		if found {
+			user.Emails = DeduplicateEmails(user.Emails)
 		}
 	case "phonenumbers":
 		for i := range user.PhoneNumbers {
 			if matchesPhoneFilter(&user.PhoneNumbers[i], filterExpr) {
 				setPhoneSubAttribute(&user.PhoneNumbers[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.PhoneNumbers {
+						if j != i {
+							user.PhoneNumbers[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
 		}
@@ -586,6 +696,13 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 		for i := range user.Addresses {
 			if matchesAddressFilter(&user.Addresses[i], filterExpr) {
 				setAddressSubAttribute(&user.Addresses[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.Addresses {
+						if j != i {
+							user.Addresses[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
 		}
@@ -593,6 +710,13 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 		for i := range user.Ims {
 			if matchesImFilter(&user.Ims[i], filterExpr) {
 				setImSubAttribute(&user.Ims[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.Ims {
+						if j != i {
+							user.Ims[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
 		}
@@ -600,6 +724,13 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 		for i := range user.Photos {
 			if matchesPhotoFilter(&user.Photos[i], filterExpr) {
 				setPhotoSubAttribute(&user.Photos[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.Photos {
+						if j != i {
+							user.Photos[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
 		}
@@ -607,6 +738,13 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 		for i := range user.Entitlements {
 			if matchesEntitlementFilter(&user.Entitlements[i], filterExpr) {
 				setEntitlementSubAttribute(&user.Entitlements[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.Entitlements {
+						if j != i {
+							user.Entitlements[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
 		}
@@ -614,6 +752,13 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 		for i := range user.Roles {
 			if matchesRoleFilter(&user.Roles[i], filterExpr) {
 				setRoleSubAttribute(&user.Roles[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.Roles {
+						if j != i {
+							user.Roles[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
 		}
@@ -621,6 +766,13 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 		for i := range user.X509Certificates {
 			if matchesCertFilter(&user.X509Certificates[i], filterExpr) {
 				setCertSubAttribute(&user.X509Certificates[i], subAttr, value)
+				if demoteOthers {
+					for j := range user.X509Certificates {
+						if j != i {
+							user.X509Certificates[j].PrimaryFlag = false
+						}
+					}
+				}
 				found = true
 			}
 		}
@@ -733,6 +885,14 @@ func removeMatching[T any](items []T, filterExpr string, matchFn func(*T, string
 // Sub-attribute setters
 
 func setEmailSubAttribute(e *model.ScimUserEmail, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setEmailSubAttribute(e, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
@@ -747,6 +907,14 @@ func setEmailSubAttribute(e *model.ScimUserEmail, subAttr string, value any) {
 }
 
 func setPhoneSubAttribute(p *model.ScimUserPhoneNumber, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setPhoneSubAttribute(p, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
@@ -761,6 +929,14 @@ func setPhoneSubAttribute(p *model.ScimUserPhoneNumber, subAttr string, value an
 }
 
 func setAddressSubAttribute(a *model.ScimUserAddress, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setAddressSubAttribute(a, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "formatted":
@@ -774,7 +950,7 @@ func setAddressSubAttribute(a *model.ScimUserAddress, subAttr string, value any)
 	case "postalcode":
 		a.PostalCode = s
 	case "country":
-		a.Country = s
+		a.Country = normalizeCountry(s)
 	case "type":
 		a.Type = normalizeCanonical(s, addressTypes)
 	case "primary":
@@ -783,6 +959,14 @@ func setAddressSubAttribute(a *model.ScimUserAddress, subAttr string, value any)
 }
 
 func setImSubAttribute(im *model.ScimUserIm, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setImSubAttribute(im, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
@@ -797,6 +981,14 @@ func setImSubAttribute(im *model.ScimUserIm, subAttr string, value any) {
 }
 
 func setPhotoSubAttribute(p *model.ScimUserPhoto, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setPhotoSubAttribute(p, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
@@ -816,6 +1008,14 @@ func setPhotoSubAttribute(p *model.ScimUserPhoto, subAttr string, value any) {
 }
 
 func setEntitlementSubAttribute(e *model.ScimUserEntitlement, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setEntitlementSubAttribute(e, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
@@ -830,6 +1030,14 @@ func setEntitlementSubAttribute(e *model.ScimUserEntitlement, subAttr string, va
 }
 
 func setRoleSubAttribute(r *model.ScimUserRole, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setRoleSubAttribute(r, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
@@ -844,6 +1052,14 @@ func setRoleSubAttribute(r *model.ScimUserRole, subAttr string, value any) {
 }
 
 func setCertSubAttribute(c *model.ScimUserX509Certificate, subAttr string, value any) {
+	if subAttr == "" {
+		if m, ok := value.(map[string]any); ok {
+			for k, v := range m {
+				setCertSubAttribute(c, k, v)
+			}
+		}
+		return
+	}
 	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
@@ -880,6 +1096,29 @@ func buildPhoneNumber(m map[string]any) model.ScimUserPhoneNumber {
 	}
 }
 
+var isoAlpha3ToAlpha2 = map[string]string{
+	"USA": "US", "GBR": "GB", "DEU": "DE", "FRA": "FR", "CAN": "CA",
+	"AUS": "AU", "JPN": "JP", "SWE": "SE", "CHE": "CH", "AUT": "AT",
+	"ITA": "IT", "ESP": "ES", "NLD": "NL", "BEL": "BE", "DNK": "DK",
+	"NOR": "NO", "FIN": "FI", "POL": "PL", "IRL": "IE", "PRT": "PT",
+	"BRA": "BR", "MEX": "MX", "IND": "IN", "CHN": "CN", "KOR": "KR",
+	"SGP": "SG", "NZL": "NZ",
+}
+
+func normalizeCountry(raw string) string {
+	c := strings.ToUpper(strings.TrimSpace(raw))
+	if c == "" {
+		return ""
+	}
+	if len(c) == 2 && c[0] >= 'A' && c[0] <= 'Z' && c[1] >= 'A' && c[1] <= 'Z' {
+		return c
+	}
+	if alpha2, ok := isoAlpha3ToAlpha2[c]; ok {
+		return alpha2
+	}
+	return ""
+}
+
 func buildAddress(m map[string]any) model.ScimUserAddress {
 	return model.ScimUserAddress{
 		Formatted:     toStr(m["formatted"]),
@@ -887,7 +1126,7 @@ func buildAddress(m map[string]any) model.ScimUserAddress {
 		Locality:      toStr(m["locality"]),
 		Region:        toStr(m["region"]),
 		PostalCode:    toStr(m["postalCode"]),
-		Country:       toStr(m["country"]),
+		Country:       normalizeCountry(toStr(m["country"])),
 		Type:          normalizeCanonical(toStr(m["type"]), addressTypes),
 		PrimaryFlag:   toBool(m["primary"]),
 	}

@@ -585,3 +585,37 @@ func TestParseFilter_UnconsumedTrailingTokens(t *testing.T) {
 		})
 	}
 }
+
+func TestParseUserFilter_ExternalId_CaseExact_FLT45(t *testing.T) {
+	// FLT_45: externalId has caseExact: true per RFC 7643 §3.1.
+	// Filtering on externalId must generate case-sensitive comparison (no LOWER() wrap).
+	res, err := ParseUserFilter(`externalId eq "MyExternalId"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error parsing externalId filter: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil filter result")
+	}
+	if strings.Contains(res.SQL, "LOWER") || strings.Contains(res.SQL, "lower") {
+		t.Fatalf("expected case-exact comparison without LOWER(), got SQL: %s", res.SQL)
+	}
+	expectedSQL := "external_id = $1"
+	if res.SQL != expectedSQL {
+		t.Fatalf("expected SQL %q, got %q", expectedSQL, res.SQL)
+	}
+	if len(res.Args) != 1 || res.Args[0] != "MyExternalId" {
+		t.Fatalf("expected arg 'MyExternalId', got %v", res.Args)
+	}
+
+	// Also verify group filter on externalId
+	gres, err := ParseGroupFilter(`externalId eq "GroupExtId"`, 1)
+	if err != nil {
+		t.Fatalf("unexpected error parsing group externalId filter: %v", err)
+	}
+	if strings.Contains(gres.SQL, "LOWER") || strings.Contains(gres.SQL, "lower") {
+		t.Fatalf("expected case-exact group comparison without LOWER(), got SQL: %s", gres.SQL)
+	}
+	if gres.SQL != expectedSQL {
+		t.Fatalf("expected SQL %q, got %q", expectedSQL, gres.SQL)
+	}
+}

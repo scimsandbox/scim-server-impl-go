@@ -278,6 +278,200 @@ func TestRootSearch_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestDiscovery_MethodNotAllowed_AllowHeader_DSC11_DSC12(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/Schemas", nil)
+	MethodNotAllowed(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", rec.Code)
+	}
+	allow := rec.Header().Get("Allow")
+	if allow != "GET" {
+		t.Fatalf("expected Allow: GET, got %q", allow)
+	}
+
+	recPost := httptest.NewRecorder()
+	reqPost := httptest.NewRequest(http.MethodGet, "/.search", nil)
+	MethodNotAllowedWithAllow("POST")(recPost, reqPost)
+	if recPost.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", recPost.Code)
+	}
+	allowPost := recPost.Header().Get("Allow")
+	if allowPost != "POST" {
+		t.Fatalf("expected Allow: POST, got %q", allowPost)
+	}
+}
+
+func TestRouter_MethodNotAllowed_DynamicAndScopedAllowHeader(t *testing.T) {
+	noop := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	// 1. Verify standalone router using r.MethodNotAllowed(MethodNotAllowed) dynamically computes Allow header
+	standalone := chi.NewRouter()
+	standalone.MethodNotAllowed(MethodNotAllowed)
+	standalone.Get("/Users", noop)
+	standalone.Post("/Users", noop)
+	standalone.Get("/Users/{id}", noop)
+	standalone.Put("/Users/{id}", noop)
+	standalone.Patch("/Users/{id}", noop)
+	standalone.Delete("/Users/{id}", noop)
+	standalone.Post("/Bulk", noop)
+	standalone.Get("/Schemas", noop)
+	standalone.Get("/ServiceProviderConfig", noop)
+
+	standaloneCases := []struct {
+		method    string
+		path      string
+		wantAllow string
+	}{
+		{http.MethodDelete, "/Users", "GET, POST"},
+		{http.MethodPut, "/Users", "GET, POST"},
+		{http.MethodPatch, "/Users", "GET, POST"},
+		{http.MethodPost, "/Users/123", "GET, PUT, PATCH, DELETE"},
+		{http.MethodGet, "/Bulk", "POST"},
+		{http.MethodDelete, "/Bulk", "POST"},
+		{http.MethodDelete, "/Schemas", "GET"},
+		{http.MethodPost, "/ServiceProviderConfig", "GET"},
+	}
+
+	for _, tc := range standaloneCases {
+		t.Run("standalone_"+tc.method+"_"+tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			standalone.ServeHTTP(rec, req)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected 405 for %s %s, got %d", tc.method, tc.path, rec.Code)
+			}
+			if got := rec.Header().Get("Allow"); got != tc.wantAllow {
+				t.Fatalf("Allow header for %s %s = %q, want %q", tc.method, tc.path, got, tc.wantAllow)
+			}
+		})
+	}
+
+	// 2. Verify full SCIM router layout (with /{compat} subrouter) returns accurate Allow headers without falling through
+	scimRouter := chi.NewRouter()
+	registerEndpoints := func(r chi.Router) {
+		r.Post("/Users", noop)
+		r.Get("/Users", noop)
+		r.Put("/Users", MethodNotAllowedWithAllow("GET, POST"))
+		r.Patch("/Users", MethodNotAllowedWithAllow("GET, POST"))
+		r.Delete("/Users", MethodNotAllowedWithAllow("GET, POST"))
+
+		r.Get("/Users/{id}", noop)
+		r.Put("/Users/{id}", noop)
+		r.Patch("/Users/{id}", noop)
+		r.Delete("/Users/{id}", noop)
+		r.Post("/Users/{id}", MethodNotAllowedWithAllow("GET, PUT, PATCH, DELETE"))
+
+		r.Post("/Users/.search", noop)
+		r.Get("/Users/.search", MethodNotAllowedWithAllow("POST"))
+		r.Put("/Users/.search", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/Users/.search", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/Users/.search", MethodNotAllowedWithAllow("POST"))
+
+		r.Post("/Groups", noop)
+		r.Get("/Groups", noop)
+		r.Put("/Groups", MethodNotAllowedWithAllow("GET, POST"))
+		r.Patch("/Groups", MethodNotAllowedWithAllow("GET, POST"))
+		r.Delete("/Groups", MethodNotAllowedWithAllow("GET, POST"))
+
+		r.Get("/Groups/{id}", noop)
+		r.Put("/Groups/{id}", noop)
+		r.Patch("/Groups/{id}", noop)
+		r.Delete("/Groups/{id}", noop)
+		r.Post("/Groups/{id}", MethodNotAllowedWithAllow("GET, PUT, PATCH, DELETE"))
+
+		r.Post("/Groups/.search", noop)
+		r.Get("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+		r.Put("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+
+		r.Get("/", noop)
+		r.Post("/", MethodNotAllowedWithAllow("GET"))
+		r.Put("/", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/", MethodNotAllowedWithAllow("GET"))
+
+		r.Post("/Bulk", noop)
+		r.Get("/Bulk", MethodNotAllowedWithAllow("POST"))
+		r.Put("/Bulk", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/Bulk", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/Bulk", MethodNotAllowedWithAllow("POST"))
+
+		r.Post("/.search", noop)
+		r.Get("/.search", MethodNotAllowedWithAllow("POST"))
+		r.Put("/.search", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/.search", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/.search", MethodNotAllowedWithAllow("POST"))
+
+		r.Get("/ServiceProviderConfig", noop)
+		r.Post("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+		r.Put("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+
+		r.Get("/Schemas", noop)
+		r.Post("/Schemas", MethodNotAllowedWithAllow("GET"))
+		r.Put("/Schemas", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/Schemas", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/Schemas", MethodNotAllowedWithAllow("GET"))
+
+		r.Get("/ResourceTypes", noop)
+		r.Post("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+		r.Put("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+
+		r.MethodNotAllowed(MethodNotAllowed)
+	}
+	scimRouter.Route("/ws/{workspaceId}/scim/v2", func(r chi.Router) {
+		registerEndpoints(r)
+		r.Route("/{compat}", func(r chi.Router) {
+			registerEndpoints(r)
+		})
+	})
+
+	wsPrefix := "/ws/24fb7ccb-3458-44da-b5c8-92b97e2ad702/scim/v2"
+	fullRouterCases := []struct {
+		method    string
+		path      string
+		wantAllow string
+	}{
+		{http.MethodDelete, wsPrefix + "/Users", "GET, POST"},
+		{http.MethodPut, wsPrefix + "/Users", "GET, POST"},
+		{http.MethodPost, wsPrefix + "/Users/123", "GET, PUT, PATCH, DELETE"},
+		{http.MethodGet, wsPrefix + "/Users/.search", "POST"},
+		{http.MethodDelete, wsPrefix + "/Groups", "GET, POST"},
+		{http.MethodPost, wsPrefix + "/Groups/456", "GET, PUT, PATCH, DELETE"},
+		{http.MethodGet, wsPrefix + "/Groups/.search", "POST"},
+		{http.MethodGet, wsPrefix + "/Bulk", "POST"},
+		{http.MethodDelete, wsPrefix + "/Bulk", "POST"},
+		{http.MethodGet, wsPrefix + "/.search", "POST"},
+		{http.MethodDelete, wsPrefix + "/Schemas", "GET"},
+		{http.MethodPost, wsPrefix + "/ServiceProviderConfig", "GET"},
+		{http.MethodDelete, wsPrefix + "/ResourceTypes", "GET"},
+		{http.MethodDelete, wsPrefix + "/ms/Users", "GET, POST"},
+		{http.MethodGet, wsPrefix + "/ms/Bulk", "POST"},
+	}
+
+	for _, tc := range fullRouterCases {
+		t.Run("scim_"+tc.method+"_"+tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			scimRouter.ServeHTTP(rec, req)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected 405 for %s %s, got %d", tc.method, tc.path, rec.Code)
+			}
+			if got := rec.Header().Get("Allow"); got != tc.wantAllow {
+				t.Fatalf("Allow header for %s %s = %q, want %q", tc.method, tc.path, got, tc.wantAllow)
+			}
+		})
+	}
+}
+
 func TestSortResources(t *testing.T) {
 	items := []map[string]any{
 		{"id": "3", "displayName": "Charlie"},

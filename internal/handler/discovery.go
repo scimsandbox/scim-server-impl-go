@@ -98,8 +98,49 @@ func (h *DiscoveryHandler) GlobalSearchNotImplemented(w http.ResponseWriter, _ *
 	scim.WriteScimError(w, scim.NewScimError(http.StatusNotImplemented, "", "Global cross-resource search is not implemented"))
 }
 
-func MethodNotAllowed(w http.ResponseWriter, _ *http.Request) {
+func MethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	allow := "GET"
+	if r != nil {
+		if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.Routes != nil {
+			reqPath := r.URL.RawPath
+			if reqPath == "" {
+				reqPath = r.URL.Path
+			}
+			if reqPath == "" {
+				reqPath = rctx.RoutePath
+			}
+			if reqPath == "" {
+				reqPath = "/"
+			}
+			if !rctx.Routes.Match(chi.NewRouteContext(), r.Method, reqPath) {
+				candidateMethods := []string{
+					http.MethodGet,
+					http.MethodPost,
+					http.MethodPut,
+					http.MethodPatch,
+					http.MethodDelete,
+				}
+				var allowed []string
+				for _, m := range candidateMethods {
+					if rctx.Routes.Match(chi.NewRouteContext(), m, reqPath) {
+						allowed = append(allowed, m)
+					}
+				}
+				if len(allowed) > 0 {
+					allow = strings.Join(allowed, ", ")
+				}
+			}
+		}
+	}
+	w.Header().Set("Allow", allow)
 	scim.WriteScimError(w, scim.NewScimError(http.StatusMethodNotAllowed, "", "Method not allowed"))
+}
+
+func MethodNotAllowedWithAllow(allow string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", allow)
+		scim.WriteScimError(w, scim.NewScimError(http.StatusMethodNotAllowed, "", "Method not allowed"))
+	}
 }
 
 // RootSearch implements root-level querying for GET / and POST /.search (RFC 7644 §3.4.2 & §3.4.3).

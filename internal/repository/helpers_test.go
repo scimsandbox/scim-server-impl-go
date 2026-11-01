@@ -19,15 +19,22 @@ func TestResolveUserSortColumn(t *testing.T) {
 		{"user_name", "user_name"},
 		{"USERNAME", "user_name"},
 		{"name.familyname", "name_family_name"},
+		{"name_family_name", "name_family_name"},
+		{"NAME_FAMILY_NAME", "name_family_name"},
 		{"name.givenname", "name_given_name"},
+		{"name_given_name", "name_given_name"},
 		{"displayname", "display_name"},
+		{"display_name", "display_name"},
 		{"title", "title"},
 		{"emails", userSortEmailsExpression},
 		{"emails.value", userSortEmailsExpression},
 		{"email", userSortEmailsExpression},
 		{"meta.created", "created_at"},
+		{"created_at", "created_at"},
 		{"meta.lastmodified", "last_modified"},
+		{"last_modified", "last_modified"},
 		{"externalid", "external_id"},
+		{"external_id", "external_id"},
 		{"active", "active"},
 		{"", "user_name"},
 		{"unknown_attr", "user_name"},
@@ -251,3 +258,83 @@ func TestMarshalUnmarshalRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip[1].Value = %q, want viewer", got[1].Value)
 	}
 }
+
+func TestReplaceCollectionEmails_Deduplication_USR22(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil or empty slice returns as-is", func(t *testing.T) {
+		if replaceCollectionEmails(nil) != nil {
+			t.Fatal("expected nil for nil input")
+		}
+		empty := []model.ScimUserEmail{}
+		res := replaceCollectionEmails(empty)
+		if len(res) != 0 {
+			t.Fatalf("expected empty slice, got len %d", len(res))
+		}
+	})
+
+	t.Run("single item returned as-is", func(t *testing.T) {
+		single := []model.ScimUserEmail{
+			{Value: "a@example.com", Type: "work"},
+		}
+		res := replaceCollectionEmails(single)
+		if len(res) != 1 || res[0].Value != "a@example.com" {
+			t.Fatalf("unexpected result: %+v", res)
+		}
+	})
+
+	t.Run("duplicate (type, value) entries deduplicated", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "dup@example.com", Type: "work"},
+			{Value: "dup@example.com", Type: "work"},
+			{Value: "other@example.com", Type: "home"},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 2 {
+			t.Fatalf("expected 2 emails after deduplication, got %d: %+v", len(res), res)
+		}
+		if res[0].Value != "dup@example.com" || res[0].Type != "work" {
+			t.Errorf("res[0] = %+v, want dup@example.com", res[0])
+		}
+		if res[1].Value != "other@example.com" || res[1].Type != "home" {
+			t.Errorf("res[1] = %+v, want other@example.com", res[1])
+		}
+	})
+
+	t.Run("case-insensitive duplicate detection and whitespace trimming", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "User@Example.Com ", Type: "WORK"},
+			{Value: " user@example.com", Type: "work"},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 1 {
+			t.Fatalf("expected 1 email after case-insensitive deduplication, got %d: %+v", len(res), res)
+		}
+	})
+
+	t.Run("primaryFlag preserved when duplicate has primaryFlag true", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "dup@example.com", Type: "work", PrimaryFlag: false},
+			{Value: "dup@example.com", Type: "work", PrimaryFlag: true},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 1 {
+			t.Fatalf("expected 1 email after deduplication, got %d", len(res))
+		}
+		if !res[0].PrimaryFlag {
+			t.Errorf("expected primaryFlag to be preserved as true, got false")
+		}
+	})
+
+	t.Run("distinct types with same value are retained", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "common@example.com", Type: "work"},
+			{Value: "common@example.com", Type: "home"},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 2 {
+			t.Fatalf("expected 2 emails with distinct types, got %d", len(res))
+		}
+	})
+}
+

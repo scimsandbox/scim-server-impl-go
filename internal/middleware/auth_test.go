@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,6 +107,21 @@ func TestBearerTokenAuth_MarksAuthenticationFailedWhenAuthorizationIsMissing(t *
 	if state.Authentication != AuthenticationFailed {
 		t.Fatalf("authentication state = %q, want %q", state.Authentication, AuthenticationFailed)
 	}
+	ct := rw.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/scim+json") {
+		t.Fatalf("Content-Type = %q, want application/scim+json (RFC 7644 §3.12 / SEC_27)", ct)
+	}
+	var errBody map[string]any
+	if err := json.Unmarshal(rw.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("failed to parse SCIM error JSON: %v", err)
+	}
+	schemas, ok := errBody["schemas"].([]any)
+	if !ok || len(schemas) == 0 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:Error" {
+		t.Fatalf("schemas = %v, want [urn:ietf:params:scim:api:messages:2.0:Error]", errBody["schemas"])
+	}
+	if errBody["status"] != "401" {
+		t.Fatalf("status = %v, want \"401\"", errBody["status"])
+	}
 }
 
 func TestBearerTokenAuth_MarksAuthenticationOKForValidToken(t *testing.T) {
@@ -144,23 +161,52 @@ func TestBearerTokenAuth_MarksAuthenticationOKForValidToken(t *testing.T) {
 }
 
 func TestExtractWorkspaceID_MarksAuthenticationFailedForInvalidWorkspaceID(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/ws/not-a-uuid/scim/v2/Users", nil)
-	routeCtx := chi.NewRouteContext()
-	routeCtx.URLParams.Add("workspaceId", "not-a-uuid")
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
-	req, state := withRequestMetricsState(req)
-	rw := httptest.NewRecorder()
-
-	handler := ExtractWorkspaceID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	handler.ServeHTTP(rw, req)
-
-	if rw.Code != http.StatusNotFound {
-		t.Fatalf("response status = %d, want %d", rw.Code, http.StatusNotFound)
+	cases := []struct {
+		name  string
+		wsParam string
+	}{
+		{"invalid_uuid", "not-a-uuid"},
+		{"empty_workspace_id", ""},
 	}
-	if state.Authentication != AuthenticationFailed {
-		t.Fatalf("authentication state = %q, want %q", state.Authentication, AuthenticationFailed)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/ws/"+tc.wsParam+"/scim/v2/Users", nil)
+			routeCtx := chi.NewRouteContext()
+			if tc.wsParam != "" {
+				routeCtx.URLParams.Add("workspaceId", tc.wsParam)
+			}
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+			req, state := withRequestMetricsState(req)
+			rw := httptest.NewRecorder()
+
+			handler := ExtractWorkspaceID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			handler.ServeHTTP(rw, req)
+
+			if rw.Code != http.StatusNotFound {
+				t.Fatalf("response status = %d, want %d", rw.Code, http.StatusNotFound)
+			}
+			if state.Authentication != AuthenticationFailed {
+				t.Fatalf("authentication state = %q, want %q", state.Authentication, AuthenticationFailed)
+			}
+			ct := rw.Header().Get("Content-Type")
+			if !strings.HasPrefix(ct, "application/scim+json") {
+				t.Fatalf("Content-Type = %q, want application/scim+json (RFC 7644 §3.12)", ct)
+			}
+			var errBody map[string]any
+			if err := json.Unmarshal(rw.Body.Bytes(), &errBody); err != nil {
+				t.Fatalf("failed to parse SCIM error JSON: %v", err)
+			}
+			schemas, ok := errBody["schemas"].([]any)
+			if !ok || len(schemas) == 0 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:Error" {
+				t.Fatalf("schemas = %v, want [urn:ietf:params:scim:api:messages:2.0:Error]", errBody["schemas"])
+			}
+			if errBody["status"] != "404" {
+				t.Fatalf("status = %v, want \"404\"", errBody["status"])
+			}
+		})
 	}
 }
 

@@ -160,6 +160,10 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	baseURL := buildBaseURL(r)
 	response := scim.UserToScimResponse(user, baseURL, nil)
 
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+	response = applyAttributeProjection(response, attrs, excludedAttrs)
+
 	if getCompatMode(r) == scim.CompatMS {
 		response = scim.ApplyMsCompat(response)
 	}
@@ -391,14 +395,11 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If-Match check
+	// If-Match check (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
 	ifMatch := r.Header.Get("If-Match")
-	if ifMatch != "" {
-		etag := fmt.Sprintf("W/\"%d\"", user.Version)
-		if ifMatch != etag {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-			return
-		}
+	if !checkETagMatch(ifMatch, user.Version) {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
+		return
 	}
 
 	newUserName, _ := input["userName"].(string)
@@ -440,6 +441,10 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 	baseURL := buildBaseURL(r)
 	groups := h.getUserGroups(r.Context(), user.ID, baseURL)
 	response := scim.UserToScimResponse(user, baseURL, groups)
+
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+	response = applyAttributeProjection(response, attrs, excludedAttrs)
 
 	if getCompatMode(r) == scim.CompatMS {
 		response = scim.ApplyMsCompat(response)
@@ -564,14 +569,11 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 
 	oldUserName := user.UserName
 
-	// If-Match check
+	// If-Match check (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
 	ifMatch := r.Header.Get("If-Match")
-	if ifMatch != "" {
-		etag := fmt.Sprintf("W/\"%d\"", user.Version)
-		if ifMatch != etag {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-			return
-		}
+	if !checkETagMatch(ifMatch, user.Version) {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
+		return
 	}
 
 	if err := scim.ApplyPatchOperations(user, operations); err != nil {
@@ -617,6 +619,10 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 	baseURL := buildBaseURL(r)
 	groups := h.getUserGroups(r.Context(), user.ID, baseURL)
 	response := scim.UserToScimResponse(user, baseURL, groups)
+
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+	response = applyAttributeProjection(response, attrs, excludedAttrs)
 
 	if getCompatMode(r) == scim.CompatMS {
 		response = scim.ApplyMsCompat(response)

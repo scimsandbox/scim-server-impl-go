@@ -194,6 +194,10 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	group.Members = memberships
 	response := scim.GroupToScimResponse(group, baseURL)
 
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+	response = applyAttributeProjection(response, attrs, excludedAttrs)
+
 	resourceURL := baseURL + "/Groups/" + group.ID.String()
 	w.Header().Set("Location", resourceURL)
 	w.Header().Set("Content-Location", resourceURL)
@@ -402,6 +406,9 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 				} else {
 					group.ExternalID = nil
 				}
+				if err := h.checkMemberTypeImmutabilityTx(workerCtx, tx, gid, detachedInput["members"]); err != nil {
+					return err
+				}
 				if err := h.membershipRepo.DeleteByGroupIDTx(workerCtx, tx, gid); err != nil {
 					return err
 				}
@@ -450,13 +457,10 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 			return &scim.ScimError{Status: http.StatusNotFound, Detail: "Group not found"}
 		}
 
-		// If-Match
+		// If-Match (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
 		ifMatch := r.Header.Get("If-Match")
-		if ifMatch != "" {
-			etag := fmt.Sprintf("W/\"%d\"", group.Version)
-			if ifMatch != etag {
-				return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
-			}
+		if !checkETagMatch(ifMatch, group.Version) {
+			return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
 		}
 
 		// Uniqueness check
@@ -480,6 +484,11 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			group.ExternalID = nil
+		}
+
+		// GRP_21: RFC 7643 §4.2 - Group member sub-attributes 'value' and 'type' are immutable
+		if err := h.checkMemberTypeImmutabilityTx(r.Context(), tx, group.ID, input["members"]); err != nil {
+			return err
 		}
 
 		// Clear existing members
@@ -534,6 +543,10 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 
 	baseURL := buildBaseURL(r)
 	response := scim.GroupToScimResponse(updatedGroup, baseURL)
+
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+	response = applyAttributeProjection(response, attrs, excludedAttrs)
 
 	w.Header().Set("Content-Location", baseURL+"/Groups/"+updatedGroup.ID.String())
 	w.Header().Set("ETag", fmt.Sprintf("W/\"%d\"", updatedGroup.Version))
@@ -657,13 +670,10 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 			return &scim.ScimError{Status: http.StatusNotFound, Detail: "Group not found"}
 		}
 
-		// If-Match
+		// If-Match (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
 		ifMatch := r.Header.Get("If-Match")
-		if ifMatch != "" {
-			etag := fmt.Sprintf("W/\"%d\"", group.Version)
-			if ifMatch != etag {
-				return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
-			}
+		if !checkETagMatch(ifMatch, group.Version) {
+			return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
 		}
 
 		// Load current members using tx-aware repo
@@ -718,6 +728,10 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 
 	baseURL := buildBaseURL(r)
 	response := scim.GroupToScimResponse(updatedGroup, baseURL)
+
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+	response = applyAttributeProjection(response, attrs, excludedAttrs)
 
 	w.Header().Set("Content-Location", baseURL+"/Groups/"+updatedGroup.ID.String())
 	w.Header().Set("ETag", fmt.Sprintf("W/\"%d\"", updatedGroup.Version))
@@ -1050,6 +1064,9 @@ func (h *GroupHandler) addMissingMembers(ctx context.Context, group *model.ScimG
 }
 
 func (h *GroupHandler) replaceMembers(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, members []map[string]any) error {
+	if err := validateMemberTypeImmutability(group.Members, members); err != nil {
+		return err
+	}
 	if err := h.membershipRepo.DeleteByGroupID(ctx, group.ID); err != nil {
 		return err
 	}
@@ -1062,6 +1079,74 @@ func (h *GroupHandler) replaceMembers(ctx context.Context, group *model.ScimGrou
 	memberships, _ := h.membershipRepo.FindByGroupID(ctx, group.ID)
 	group.Members = memberships
 	return nil
+}
+
+// validateMemberTypeImmutability enforces RFC 7643 §4.2 member 'type' immutability (GRP_21).
+// If a member present in existingMemberships is included in rawMembers with a non-empty 'type'
+// that differs (case-insensitively) from its existing MemberType, a 400 mutability ScimError is returned.
+func validateMemberTypeImmutability(existingMemberships []model.ScimGroupMembership, rawMembers any) error {
+	if len(existingMemberships) == 0 || rawMembers == nil {
+		return nil
+	}
+	existingMemberTypes := make(map[uuid.UUID]string, len(existingMemberships))
+	for _, m := range existingMemberships {
+		if m.MemberType != nil && *m.MemberType != "" {
+			existingMemberTypes[m.MemberValue] = *m.MemberType
+		}
+	}
+	if len(existingMemberTypes) == 0 {
+		return nil
+	}
+
+	var memberMaps []map[string]any
+	switch v := rawMembers.(type) {
+	case []any:
+		for _, item := range v {
+			if mm, ok := item.(map[string]any); ok {
+				memberMaps = append(memberMaps, mm)
+			}
+		}
+	case []map[string]any:
+		memberMaps = v
+	}
+
+	for _, memberMap := range memberMaps {
+		valStr, ok := memberMap["value"].(string)
+		if !ok || valStr == "" {
+			continue
+		}
+		memberUUID, err := uuid.Parse(valStr)
+		if err != nil {
+			continue
+		}
+		existingType, exists := existingMemberTypes[memberUUID]
+		if !exists {
+			continue
+		}
+		newType, ok := memberMap["type"].(string)
+		if !ok || newType == "" {
+			continue
+		}
+		if !strings.EqualFold(existingType, newType) {
+			return &scim.ScimError{
+				Status:   http.StatusBadRequest,
+				ScimType: "mutability",
+				Detail:   "Group member type is immutable and cannot be changed for member: " + valStr,
+			}
+		}
+	}
+	return nil
+}
+
+func (h *GroupHandler) checkMemberTypeImmutabilityTx(ctx context.Context, tx jdbc.Executor, groupID uuid.UUID, rawMembers any) error {
+	if rawMembers == nil {
+		return nil
+	}
+	existingMemberships, err := h.membershipRepo.FindByGroupIDTx(ctx, tx, groupID)
+	if err != nil {
+		return err
+	}
+	return validateMemberTypeImmutability(existingMemberships, rawMembers)
 }
 
 // -- Transactional variants --
@@ -1120,6 +1205,9 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 }
 
 func (h *GroupHandler) replaceMembersTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, members []map[string]any) error {
+	if err := validateMemberTypeImmutability(group.Members, members); err != nil {
+		return err
+	}
 	if err := h.membershipRepo.DeleteByGroupIDTx(ctx, tx, group.ID); err != nil {
 		return err
 	}
@@ -1144,6 +1232,9 @@ func (h *GroupHandler) applyGroupPatchOpTx(ctx context.Context, tx jdbc.Executor
 
 	switch opType {
 	case "add":
+		if value == nil {
+			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "PATCH add operation must contain a 'value' member"}
+		}
 		return h.applyGroupAddTx(ctx, tx, group, wsID, path, value)
 	case "replace":
 		return h.applyGroupReplaceTx(ctx, tx, group, wsID, path, value)

@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
+	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
 type rowScanner interface {
@@ -94,6 +95,7 @@ func (r *UserRepository) Create(ctx context.Context, u *model.ScimUser) error {
 	u.CreatedAt = now
 	u.LastModified = now
 	u.Version = 0
+	u.Emails = replaceCollectionEmails(u.Emails)
 
 	query := `INSERT INTO scim_users (` + userColumns + `)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)`
@@ -119,6 +121,7 @@ func (r *UserRepository) Update(ctx context.Context, u *model.ScimUser) error {
 	u.LastModified = time.Now().UTC()
 	oldVersion := u.Version
 	u.Version++
+	u.Emails = replaceCollectionEmails(u.Emails)
 
 	query := `UPDATE scim_users SET
 		user_name=$1, external_id=$2,
@@ -232,27 +235,37 @@ func resolveUserSortColumn(sortBy string) string {
 	switch strings.ToLower(sortBy) {
 	case "username", "user_name":
 		return "user_name"
-	case "name.familyname":
+	case "name.familyname", "name_family_name":
 		return "name_family_name"
-	case "name.givenname":
+	case "name.givenname", "name_given_name":
 		return "name_given_name"
-	case "displayname":
+	case "displayname", "display_name":
 		return "display_name"
 	case "title":
 		return "title"
 	case "emails", "emails.value", "email":
 		return userSortEmailsExpression
-	case "meta.created":
+	case "meta.created", "created_at":
 		return "created_at"
-	case "meta.lastmodified":
+	case "meta.lastmodified", "last_modified":
 		return "last_modified"
-	case "externalid":
+	case "externalid", "external_id":
 		return "external_id"
 	case "active":
 		return "active"
 	default:
 		return "user_name"
 	}
+}
+
+// ReplaceCollectionEmails deduplicates identical (type, value) email pairs before database persist (USR_22 / RFC 7643 §2.4).
+// Delegates to scim.DeduplicateEmails as the single source of truth across PATCH, mapper, and repository layers.
+func ReplaceCollectionEmails(emails []model.ScimUserEmail) []model.ScimUserEmail {
+	return scim.DeduplicateEmails(emails)
+}
+
+func replaceCollectionEmails(emails []model.ScimUserEmail) []model.ScimUserEmail {
+	return ReplaceCollectionEmails(emails)
 }
 
 // Transactional variants

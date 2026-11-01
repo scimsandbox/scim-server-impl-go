@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -383,6 +384,64 @@ func TestParseBulkTarget_Item(t *testing.T) {
 				if target.id != tc.wantID {
 					t.Errorf("parseBulkTarget(%q, true) id = %v; want %v", tc.path, target.id, tc.wantID)
 				}
+			}
+		})
+	}
+}
+
+func TestBulkHandler_ProcessOperation_BulkIdValidation_BLK20(t *testing.T) {
+	bh := &BulkHandler{}
+	req, _ := http.NewRequest(http.MethodPost, "/Bulk", nil)
+	bulkIdMap := make(map[string]string)
+
+	tests := []struct {
+		name       string
+		op         map[string]any
+		wantStatus string
+	}{
+		{
+			name: "POST without bulkId returns 400 invalidValue",
+			op: map[string]any{
+				"method": "POST",
+				"path":   "/Users",
+				"data": map[string]any{
+					"schemas":  []string{"urn:ietf:params:scim:schemas:core:2.0:User"},
+					"userName": "alice@example.com",
+				},
+			},
+			wantStatus: "400",
+		},
+		{
+			name: "POST with empty whitespace bulkId returns 400 invalidValue",
+			op: map[string]any{
+				"method": "POST",
+				"path":   "/Users",
+				"bulkId": "   ",
+				"data": map[string]any{
+					"schemas":  []string{"urn:ietf:params:scim:schemas:core:2.0:User"},
+					"userName": "alice@example.com",
+				},
+			},
+			wantStatus: "400",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res := bh.processOperation(req, tc.op, uuid.New(), bulkIdMap)
+			if status, _ := res["status"].(string); status != tc.wantStatus {
+				t.Fatalf("expected status %s, got %s", tc.wantStatus, status)
+			}
+			resp, ok := res["response"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected error response map in result")
+			}
+			schemas, _ := resp["schemas"].([]string)
+			if len(schemas) == 0 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:Error" {
+				t.Fatalf("expected error schema in response, got %v", schemas)
+			}
+			if scimType, _ := resp["scimType"].(string); scimType != "invalidValue" {
+				t.Fatalf("expected scimType 'invalidValue', got %q", scimType)
 			}
 		})
 	}

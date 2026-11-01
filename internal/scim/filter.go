@@ -253,7 +253,6 @@ var caseInsensitiveAttrs = map[string]bool{
 	attrMetaResourceType:       true,
 	attrUsername:               true,
 	attrDisplayName:            true,
-	attrExternalID:             true,
 	attrNameFamilyName:         true,
 	attrNameGivenName:          true,
 	attrNameFormatted:          true,

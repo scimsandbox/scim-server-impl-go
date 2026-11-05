@@ -295,7 +295,9 @@ func buildErrorSETJson(
 
 	bytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		fallback := fmt.Sprintf(`{"iss":%q,"iat":%d,"jti":%q,"txn":%q,"events":{%q:{"status":"500","method":%q,"response":{"schemas":["urn:ietf:params:scim:api:messages:2.0:Error"],"status":"500","detail":"Internal server error"}}}}`,
+			baseURL, time.Now().UTC().Unix(), uuid.New().String(), txnID.String(), AsyncRespEventURN, upperMethod)
+		return fallback, nil
 	}
 	return string(bytes), nil
 }
@@ -346,15 +348,17 @@ func (h *AsyncEventHandler) GetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case model.AsyncStatusCompleted:
+		if event.SetPayload == nil || strings.TrimSpace(*event.SetPayload) == "" {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Asynchronous event payload missing"))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		if event.SetPayload != nil {
-			_, _ = w.Write([]byte(*event.SetPayload))
-		}
+		_, _ = w.Write([]byte(*event.SetPayload))
 		return
 
 	case model.AsyncStatusFailed:
-		if event.SetPayload != nil && *event.SetPayload != "" {
+		if event.SetPayload != nil && strings.TrimSpace(*event.SetPayload) != "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(*event.SetPayload))

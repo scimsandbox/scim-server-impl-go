@@ -269,6 +269,24 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		}()
 	}
 
+	// Async event cleanup scheduler
+	asyncEventsEnabled := cfg.Cleanup.Enabled && (cfg.Cleanup.AsyncEvents.Enabled != nil && *cfg.Cleanup.AsyncEvents.Enabled)
+	asyncEventCleanupService := service.NewAsyncEventCleanupService(
+		asyncEventRepo,
+		logger,
+		asyncEventsEnabled,
+		cfg.Cleanup.AsyncEvents.Interval,
+		cfg.Cleanup.AsyncEvents.MaxCount,
+		cfg.Cleanup.AsyncEvents.StalePendingAfter,
+	)
+	if asyncEventsEnabled {
+		cleanupWg.Add(1)
+		go func() {
+			defer cleanupWg.Done()
+			asyncEventCleanupService.Start(serverCtx)
+		}()
+	}
+
 	apiHandler := httpapi.New(apiRouter, httpapi.Config{
 		Logger:    logger,
 		Localizer: localizer,

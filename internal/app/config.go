@@ -46,12 +46,20 @@ type CleanupConfig struct {
 	Interval    time.Duration            `yaml:"interval" env:"GO_CLEANUP_INTERVAL"`
 	StaleAfter  time.Duration            `yaml:"stale_after" env:"GO_CLEANUP_STALE_AFTER"`
 	RequestLogs CleanupRequestLogsConfig `yaml:"request_logs"`
+	AsyncEvents CleanupAsyncEventsConfig `yaml:"async_events"`
 }
 
 type CleanupRequestLogsConfig struct {
 	Enabled  *bool         `yaml:"enabled" env:"GO_CLEANUP_REQUEST_LOGS_ENABLED"`
 	Interval time.Duration `yaml:"interval" env:"GO_CLEANUP_REQUEST_LOGS_INTERVAL"`
 	MaxCount int           `yaml:"max_count" env:"GO_CLEANUP_REQUEST_LOGS_MAX_COUNT"`
+}
+
+type CleanupAsyncEventsConfig struct {
+	Enabled           *bool         `yaml:"enabled" env:"GO_CLEANUP_ASYNC_EVENTS_ENABLED"`
+	Interval          time.Duration `yaml:"interval" env:"GO_CLEANUP_ASYNC_EVENTS_INTERVAL"`
+	MaxCount          int           `yaml:"max_count" env:"GO_CLEANUP_ASYNC_EVENTS_MAX_COUNT"`
+	StalePendingAfter time.Duration `yaml:"stale_pending_after" env:"GO_CLEANUP_ASYNC_EVENTS_STALE_PENDING_AFTER"`
 }
 
 type LoggingConfig struct {

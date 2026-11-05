@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -80,6 +81,22 @@ func (m *mockAsyncEventRepo) UpdateStatusAndPayload(
 		e.CompletedAt = &completedAt
 	}
 	return nil
+}
+
+func (m *mockAsyncEventRepo) ListWorkspaceIDsExceedingEventCount(ctx context.Context, maxCount int) ([]uuid.UUID, error) {
+	return nil, nil
+}
+
+func (m *mockAsyncEventRepo) DeleteOldEventsForWorkspace(ctx context.Context, workspaceID uuid.UUID, maxCount int) (int64, error) {
+	return 0, nil
+}
+
+func (m *mockAsyncEventRepo) FindStalePendingEvents(ctx context.Context, olderThan time.Time, limit int) ([]*model.ScimAsyncEvent, error) {
+	return nil, nil
+}
+
+func (m *mockAsyncEventRepo) TransitionPendingToFailed(ctx context.Context, txnID uuid.UUID, payload string, completedAt time.Time) (bool, error) {
+	return false, nil
 }
 
 func TestIsAsyncPreferred(t *testing.T) {
@@ -439,6 +456,93 @@ func TestGetEvent_Completed(t *testing.T) {
 	}
 	if rec.Body.String() != payload {
 		t.Errorf("body = %s, want %s", rec.Body.String(), payload)
+	}
+}
+
+func TestGetEvent_Completed_NilPayload_Returns500(t *testing.T) {
+	repo := newMockAsyncEventRepo()
+	h := NewAsyncEventHandler(repo)
+
+	wsID := uuid.New()
+	txnID := uuid.New()
+
+	_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+		TxnID:        txnID,
+		WorkspaceID:  wsID,
+		Operation:    "POST",
+		ResourceType: "User",
+		Status:       model.AsyncStatusCompleted,
+		SetPayload:   nil,
+		CreatedAt:    time.Now().UTC(),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/Events/"+txnID.String(), nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("workspaceId", wsID.String())
+	rctx.URLParams.Add("txnId", txnID.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	h.GetEvent(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 for completed event with nil payload", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/scim+json") {
+		t.Errorf("Content-Type = %v, want application/scim+json", ct)
+	}
+	var errResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("unmarshal error response: %v", err)
+	}
+	if errResp["detail"] != "Asynchronous event payload missing" {
+		t.Errorf("detail = %v, want 'Asynchronous event payload missing'", errResp["detail"])
+	}
+}
+
+func TestGetEvent_Completed_WhitespacePayload_Returns500(t *testing.T) {
+	repo := newMockAsyncEventRepo()
+	h := NewAsyncEventHandler(repo)
+
+	wsID := uuid.New()
+	txnID := uuid.New()
+	emptyPayload := "   \t\n  "
+
+	_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+		TxnID:        txnID,
+		WorkspaceID:  wsID,
+		Operation:    "POST",
+		ResourceType: "User",
+		Status:       model.AsyncStatusCompleted,
+		SetPayload:   &emptyPayload,
+		CreatedAt:    time.Now().UTC(),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/Events/"+txnID.String(), nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("workspaceId", wsID.String())
+	rctx.URLParams.Add("txnId", txnID.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	h.GetEvent(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 for completed event with whitespace payload", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/scim+json") {
+		t.Errorf("Content-Type = %v, want application/scim+json", ct)
+	}
+	var errResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("unmarshal error response: %v", err)
+	}
+	if errResp["detail"] != "Asynchronous event payload missing" {
+		t.Errorf("detail = %v, want 'Asynchronous event payload missing'", errResp["detail"])
 	}
 }
 
@@ -977,5 +1081,221 @@ func TestGetEvent_FailedWithErrorSET_Returns200AsyncResp(t *testing.T) {
 		t.Errorf("error scimType = %v, want uniqueness", errResp["scimType"])
 	}
 }
+
+func TestGetEvent_Completed_EmptyStringPayload_Returns500(t *testing.T) {
+	repo := newMockAsyncEventRepo()
+	h := NewAsyncEventHandler(repo)
+
+	wsID := uuid.New()
+	txnID := uuid.New()
+	emptyPayload := ""
+
+	_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+		TxnID:        txnID,
+		WorkspaceID:  wsID,
+		Operation:    "POST",
+		ResourceType: "User",
+		Status:       model.AsyncStatusCompleted,
+		SetPayload:   &emptyPayload,
+		CreatedAt:    time.Now().UTC(),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/Events/"+txnID.String(), nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("workspaceId", wsID.String())
+	rctx.URLParams.Add("txnId", txnID.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	h.GetEvent(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 for completed event with empty string payload", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/scim+json") {
+		t.Errorf("Content-Type = %v, want application/scim+json", ct)
+	}
+	var errResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("unmarshal error response: %v", err)
+	}
+	if errResp["detail"] != "Asynchronous event payload missing" {
+		t.Errorf("detail = %v, want 'Asynchronous event payload missing'", errResp["detail"])
+	}
+	if errResp["status"] != "500" {
+		t.Errorf("status = %v, want '500'", errResp["status"])
+	}
+	schemas, ok := errResp["schemas"].([]any)
+	if !ok || len(schemas) != 1 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:Error" {
+		t.Errorf("schemas = %v, want ['urn:ietf:params:scim:api:messages:2.0:Error']", errResp["schemas"])
+	}
+}
+
+func TestGetEvent_Completed_WhitespaceVariants_Returns500(t *testing.T) {
+	whitespaceCases := []struct {
+		name    string
+		payload string
+	}{
+		{"spaces_only", "    "},
+		{"tab_only", "\t"},
+		{"newline_only", "\n"},
+		{"crlf_only", "\r\n"},
+		{"mixed_tabs_spaces_newlines_cr", "   \t\r\n "},
+	}
+
+	for _, tc := range whitespaceCases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newMockAsyncEventRepo()
+			h := NewAsyncEventHandler(repo)
+
+			wsID := uuid.New()
+			txnID := uuid.New()
+			p := tc.payload
+
+			_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+				TxnID:        txnID,
+				WorkspaceID:  wsID,
+				Operation:    "POST",
+				ResourceType: "User",
+				Status:       model.AsyncStatusCompleted,
+				SetPayload:   &p,
+				CreatedAt:    time.Now().UTC(),
+			})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/Events/"+txnID.String(), nil)
+			req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("workspaceId", wsID.String())
+			rctx.URLParams.Add("txnId", txnID.String())
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+			h.GetEvent(rec, req)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500 for payload %q", rec.Code, tc.payload)
+			}
+			if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/scim+json") {
+				t.Errorf("Content-Type = %v, want application/scim+json", ct)
+			}
+			var errResp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+				t.Fatalf("unmarshal error response: %v", err)
+			}
+			if errResp["detail"] != "Asynchronous event payload missing" {
+				t.Errorf("detail = %v, want 'Asynchronous event payload missing'", errResp["detail"])
+			}
+			if errResp["status"] != "500" {
+				t.Errorf("status = %v, want '500'", errResp["status"])
+			}
+		})
+	}
+}
+
+func TestGetEvent_Completed_ValidPayload_Integrity(t *testing.T) {
+	repo := newMockAsyncEventRepo()
+	h := NewAsyncEventHandler(repo)
+
+	wsID := uuid.New()
+	txnID := uuid.New()
+	complexPayload := `{"iss":"https://example.com/ws/123","iat":1730790000,"jti":"abc-123","txn":"` + txnID.String() + `","events":{"urn:ietf:params:scim:event:prov:create:full":{"data":{"userName":"bjensen@example.com","name":{"formatted":"Ms. Barbara J Jensen"}}}},"sub_id":{"format":"uri","uri":"https://example.com/ws/123/Users/def-456"}}`
+
+	_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+		TxnID:        txnID,
+		WorkspaceID:  wsID,
+		Operation:    "POST",
+		ResourceType: "User",
+		Status:       model.AsyncStatusCompleted,
+		SetPayload:   &complexPayload,
+		CreatedAt:    time.Now().UTC(),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/Events/"+txnID.String(), nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("workspaceId", wsID.String())
+	rctx.URLParams.Add("txnId", txnID.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	h.GetEvent(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %v, want application/json", ct)
+	}
+	if rec.Body.String() != complexPayload {
+		t.Errorf("body does not match intact payload:\ngot  %s\nwant %s", rec.Body.String(), complexPayload)
+	}
+}
+
+func TestBuildErrorSETJson_FallbackFormatting(t *testing.T) {
+	methods := []string{"POST", "PUT", "PATCH", "DELETE", "post", "patch"}
+
+	for _, method := range methods {
+		t.Run("Method_"+method, func(t *testing.T) {
+			baseURL := "https://example.com/ws/123/scim/v2"
+			txnID := uuid.New()
+			upperMethod := strings.ToUpper(method)
+
+			fallback := fmt.Sprintf(`{"iss":%q,"iat":%d,"jti":%q,"txn":%q,"events":{%q:{"status":"500","method":%q,"response":{"schemas":["urn:ietf:params:scim:api:messages:2.0:Error"],"status":"500","detail":"Internal server error"}}}}`,
+				baseURL, time.Now().UTC().Unix(), uuid.New().String(), txnID.String(), AsyncRespEventURN, upperMethod)
+
+			var decoded map[string]any
+			if err := json.Unmarshal([]byte(fallback), &decoded); err != nil {
+				t.Fatalf("fallback json unmarshal failed: %v", err)
+			}
+
+			if decoded["iss"] != baseURL {
+				t.Errorf("iss = %v, want %s", decoded["iss"], baseURL)
+			}
+			if decoded["txn"] != txnID.String() {
+				t.Errorf("txn = %v, want %s", decoded["txn"], txnID.String())
+			}
+			if _, ok := decoded["iat"].(float64); !ok {
+				t.Errorf("iat missing or not a number: %v", decoded["iat"])
+			}
+			if jtiStr, ok := decoded["jti"].(string); !ok || jtiStr == "" {
+				t.Errorf("jti missing or invalid: %v", decoded["jti"])
+			}
+
+			events, ok := decoded["events"].(map[string]any)
+			if !ok {
+				t.Fatalf("events missing or not a map: %v", decoded["events"])
+			}
+			asyncResp, ok := events[AsyncRespEventURN].(map[string]any)
+			if !ok {
+				t.Fatalf("missing %s in events: %v", AsyncRespEventURN, events)
+			}
+			if asyncResp["status"] != "500" {
+				t.Errorf("status = %v, want 500", asyncResp["status"])
+			}
+			if asyncResp["method"] != upperMethod {
+				t.Errorf("method = %v, want %s", asyncResp["method"], upperMethod)
+			}
+			resp, ok := asyncResp["response"].(map[string]any)
+			if !ok {
+				t.Fatalf("response missing or not a map: %v", asyncResp["response"])
+			}
+			if resp["status"] != "500" {
+				t.Errorf("response.status = %v, want 500", resp["status"])
+			}
+			if resp["detail"] != "Internal server error" {
+				t.Errorf("response.detail = %v, want 'Internal server error'", resp["detail"])
+			}
+			schemas, ok := resp["schemas"].([]any)
+			if !ok || len(schemas) != 1 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:Error" {
+				t.Errorf("response.schemas = %v, want ['urn:ietf:params:scim:api:messages:2.0:Error']", resp["schemas"])
+			}
+		})
+	}
+}
+
 
 

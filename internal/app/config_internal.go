@@ -56,6 +56,19 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.Cleanup.RequestLogs.MaxCount == 0 {
 		cfg.Cleanup.RequestLogs.MaxCount = service.DefaultRequestLogCleanupMaxCount
 	}
+	if cfg.Cleanup.AsyncEvents.Enabled == nil {
+		defaultEnabled := true
+		cfg.Cleanup.AsyncEvents.Enabled = &defaultEnabled
+	}
+	if cfg.Cleanup.AsyncEvents.Interval == 0 {
+		cfg.Cleanup.AsyncEvents.Interval = service.DefaultAsyncEventCleanupInterval
+	}
+	if cfg.Cleanup.AsyncEvents.MaxCount == 0 {
+		cfg.Cleanup.AsyncEvents.MaxCount = service.DefaultAsyncEventCleanupMaxCount
+	}
+	if cfg.Cleanup.AsyncEvents.StalePendingAfter == 0 {
+		cfg.Cleanup.AsyncEvents.StalePendingAfter = service.DefaultAsyncEventStalePendingAfter
+	}
 }
 
 func validateConfig(cfg Config) error {
@@ -70,6 +83,15 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.Cleanup.RequestLogs.MaxCount <= 0 {
 		return fmt.Errorf("cleanup.request_logs.max_count must be greater than 0")
+	}
+	if cfg.Cleanup.AsyncEvents.Interval <= 0 {
+		return fmt.Errorf("cleanup.async_events.interval must be greater than 0")
+	}
+	if cfg.Cleanup.AsyncEvents.MaxCount <= 0 {
+		return fmt.Errorf("cleanup.async_events.max_count must be greater than 0")
+	}
+	if cfg.Cleanup.AsyncEvents.StalePendingAfter <= 0 {
+		return fmt.Errorf("cleanup.async_events.stale_pending_after must be greater than 0")
 	}
 
 	return nil

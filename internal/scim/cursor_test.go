@@ -214,3 +214,33 @@ func TestDecodeCursor_MissingExpiresAt(t *testing.T) {
 		t.Errorf("detail = %q, want 'missing expiration timestamp'", scimErr.Detail)
 	}
 }
+
+func TestDecodeCursor_TamperAndStrictBase64Detection(t *testing.T) {
+	wsID := uuid.New()
+	token, err := EncodeCursor(wsID, 1, 3600)
+	if err != nil {
+		t.Fatalf("EncodeCursor failed: %v", err)
+	}
+
+	// Flip the very last character (e.g., 'Q' <-> 'a'), which in non-strict base64url
+	// could only affect unused trailing bits if Strict() + HMAC were not enforced.
+	last := token[len(token)-1]
+	replacement := byte('a')
+	if last == 'a' {
+		replacement = 'b'
+	}
+	tampered := token[:len(token)-1] + string(replacement)
+	if _, err := DecodeCursor(tampered, wsID); err == nil {
+		t.Fatalf("expected tampered cursor %q (from %q) to be rejected", tampered, token)
+	}
+
+	// Forge a syntactically valid unsigned JSON payload with matching workspace, valid offset, and future exp
+	offset := 2
+	futureExp := time.Now().UTC().Add(time.Hour).Unix()
+	unsignedJSON := fmt.Sprintf(`{"w":"%s","o":%d,"exp":%d}`, wsID.String(), offset, futureExp)
+	forged := CursorPrefix + base64.RawURLEncoding.EncodeToString([]byte(unsignedJSON))
+	if _, err := DecodeCursor(forged, wsID); err == nil {
+		t.Fatal("expected forged unsigned cursor to fail HMAC integrity check")
+	}
+}
+

@@ -38,11 +38,25 @@ func (h *DiscoveryHandler) SetHandlers(userHandler *UserHandler, groupHandler *G
 	h.groupHandler = groupHandler
 }
 
+func rejectDiscoveryFilter(w http.ResponseWriter, r *http.Request) bool {
+	if strings.TrimSpace(r.URL.Query().Get("filter")) != "" {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusForbidden, "invalidFilter", "Filtering is not supported on discovery endpoints"))
+		return true
+	}
+	return false
+}
+
 func (h *DiscoveryHandler) GetServiceProviderConfig(w http.ResponseWriter, r *http.Request) {
+	if rejectDiscoveryFilter(w, r) {
+		return
+	}
 	writeJSON(w, http.StatusOK, scim.ServiceProviderConfig())
 }
 
 func (h *DiscoveryHandler) GetSchemas(w http.ResponseWriter, r *http.Request) {
+	if rejectDiscoveryFilter(w, r) {
+		return
+	}
 	schemas := scim.AllSchemas()
 	response := map[string]any{
 		"schemas":      []string{"urn:ietf:params:scim:api:messages:2.0:ListResponse"},
@@ -55,6 +69,9 @@ func (h *DiscoveryHandler) GetSchemas(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DiscoveryHandler) GetSchemaByID(w http.ResponseWriter, r *http.Request) {
+	if rejectDiscoveryFilter(w, r) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if decoded, err := url.PathUnescape(id); err == nil {
 		id = decoded
@@ -68,6 +85,9 @@ func (h *DiscoveryHandler) GetSchemaByID(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *DiscoveryHandler) GetResourceTypes(w http.ResponseWriter, r *http.Request) {
+	if rejectDiscoveryFilter(w, r) {
+		return
+	}
 	baseURL := buildBaseURL(r)
 	rts := scim.ResourceTypes(baseURL)
 	response := map[string]any{
@@ -81,6 +101,9 @@ func (h *DiscoveryHandler) GetResourceTypes(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *DiscoveryHandler) GetResourceTypeByID(w http.ResponseWriter, r *http.Request) {
+	if rejectDiscoveryFilter(w, r) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if decoded, err := url.PathUnescape(id); err == nil {
 		id = decoded
@@ -216,78 +239,26 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 	var groupFilterResult *scim.FilterResult
 
 	if filterStr != "" {
-		lower := strings.ToLower(filterStr)
-		if strings.Contains(lower, "meta.resourcetype") {
-			isUserScoped := (strings.Contains(lower, `eq "user"`) || strings.Contains(lower, `eq 'user'`)) && !strings.Contains(lower, "group")
-			isGroupScoped := (strings.Contains(lower, `eq "group"`) || strings.Contains(lower, `eq 'group'`)) && !strings.Contains(lower, "user")
-			if isUserScoped {
-				hasGroup = false
-			} else if isGroupScoped {
-				hasUser = false
-			}
-		}
-
-		var userErr, groupErr error
-		if hasUser {
-			userFilterResult, userErr = scim.ParseUserFilter(filterStr, 2)
-		}
-		if hasGroup {
-			groupFilterResult, groupErr = scim.ParseGroupFilter(filterStr, 2)
-		}
-
-		if hasUser && userErr != nil {
-			if strings.Contains(strings.ToLower(userErr.Error()), "unknown attribute") {
-				hasUser = false
-				userFilterResult = nil
+		uf, uErr := scim.ParseUserFilterForRoot(filterStr, 2)
+		if uErr != nil {
+			if scimErr, ok := uErr.(*scim.ScimError); ok {
+				scim.WriteScimError(w, scimErr)
 			} else {
-				// Syntax, operator, or invalid token error on user filter -> immediately 400 invalidFilter
-				if scimErr, ok := userErr.(*scim.ScimError); ok {
-					scim.WriteScimError(w, scimErr)
-				} else {
-					scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+userErr.Error()))
-				}
-				return
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+uErr.Error()))
 			}
-		}
-		if hasGroup && groupErr != nil {
-			if strings.Contains(strings.ToLower(groupErr.Error()), "unknown attribute") {
-				hasGroup = false
-				groupFilterResult = nil
-			} else {
-				// Syntax, operator, or invalid token error on group filter -> immediately 400 invalidFilter
-				if scimErr, ok := groupErr.(*scim.ScimError); ok {
-					scim.WriteScimError(w, scimErr)
-				} else {
-					scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+groupErr.Error()))
-				}
-				return
-			}
-		}
-
-		if !hasUser && !hasGroup {
-			errMsg := "Invalid filter: attribute does not match any resource type"
-			if userErr != nil {
-				if scimErr, ok := userErr.(*scim.ScimError); ok {
-					errMsg = scimErr.Detail
-				} else {
-					errMsg = "Invalid filter: " + userErr.Error()
-				}
-			} else if groupErr != nil {
-				if scimErr, ok := groupErr.(*scim.ScimError); ok {
-					errMsg = scimErr.Detail
-				} else {
-					errMsg = "Invalid filter: " + groupErr.Error()
-				}
-			}
-			scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", errMsg))
 			return
 		}
-
-		// Invariant defense-in-depth: if filter was provided, an eligible resource handler MUST have a valid filterResult
-		if (hasUser && userFilterResult == nil) || (hasGroup && groupFilterResult == nil) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter"))
+		gf, gErr := scim.ParseGroupFilterForRoot(filterStr, 2)
+		if gErr != nil {
+			if scimErr, ok := gErr.(*scim.ScimError); ok {
+				scim.WriteScimError(w, scimErr)
+			} else {
+				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidFilter", "Invalid filter: "+gErr.Error()))
+			}
 			return
 		}
+		userFilterResult = uf
+		groupFilterResult = gf
 	}
 
 	baseURL := buildBaseURL(r)
@@ -498,11 +469,31 @@ func (h *DiscoveryHandler) queryGroups(
 	return totalCount, resources, nil
 }
 
+func isCaseExactSortAttr(sortBy string) bool {
+	lower := strings.ToLower(strings.TrimSpace(sortBy))
+	entPrefix := strings.ToLower(scim.EnterpriseSchemaURN) + ":"
+	userPrefix := strings.ToLower(scim.UserSchemaURN) + ":"
+	groupPrefix := strings.ToLower(scim.GroupSchemaURN) + ":"
+	if strings.HasPrefix(lower, entPrefix) {
+		lower = lower[len(entPrefix):]
+	} else if strings.HasPrefix(lower, userPrefix) {
+		lower = lower[len(userPrefix):]
+	} else if strings.HasPrefix(lower, groupPrefix) {
+		lower = lower[len(groupPrefix):]
+	}
+	switch lower {
+	case "id", "externalid", "profileurl", "meta.version", "meta.location", "manager.value", "manager.$ref":
+		return true
+	}
+	return false
+}
+
 func sortResources(items []map[string]any, sortBy, sortOrder string) {
 	if len(items) <= 1 || sortBy == "" {
 		return
 	}
 	isDesc := strings.EqualFold(sortOrder, "descending")
+	caseExact := isCaseExactSortAttr(sortBy)
 	sort.SliceStable(items, func(i, j int) bool {
 		valI, okI := extractSortAttr(items[i], sortBy)
 		valJ, okJ := extractSortAttr(items[j], sortBy)
@@ -516,7 +507,14 @@ func sortResources(items []map[string]any, sortBy, sortOrder string) {
 			if !okJ {
 				return false
 			}
-			return strings.ToLower(valI) > strings.ToLower(valJ)
+			if caseExact {
+				return valI > valJ
+			}
+			li, lj := strings.ToLower(valI), strings.ToLower(valJ)
+			if li != lj {
+				return li > lj
+			}
+			return valI > valJ
 		}
 		if !okI {
 			return false
@@ -524,7 +522,14 @@ func sortResources(items []map[string]any, sortBy, sortOrder string) {
 		if !okJ {
 			return true
 		}
-		return strings.ToLower(valI) < strings.ToLower(valJ)
+		if caseExact {
+			return valI < valJ
+		}
+		li, lj := strings.ToLower(valI), strings.ToLower(valJ)
+		if li != lj {
+			return li < lj
+		}
+		return valI < valJ
 	})
 }
 
@@ -532,8 +537,32 @@ func extractSortAttr(res map[string]any, sortBy string) (string, bool) {
 	if res == nil {
 		return "", false
 	}
-	parts := strings.Split(sortBy, ".")
 	var current any = res
+	path := strings.TrimSpace(sortBy)
+	lower := strings.ToLower(path)
+	entPrefix := strings.ToLower(scim.EnterpriseSchemaURN) + ":"
+	userPrefix := strings.ToLower(scim.UserSchemaURN) + ":"
+	groupPrefix := strings.ToLower(scim.GroupSchemaURN) + ":"
+	if strings.HasPrefix(lower, entPrefix) {
+		var entMap any
+		for k, v := range res {
+			if strings.EqualFold(k, scim.EnterpriseSchemaURN) {
+				entMap = v
+				break
+			}
+		}
+		if entMap == nil {
+			return "", false
+		}
+		current = entMap
+		path = path[len(entPrefix):]
+	} else if strings.HasPrefix(lower, userPrefix) {
+		path = path[len(userPrefix):]
+	} else if strings.HasPrefix(lower, groupPrefix) {
+		path = path[len(groupPrefix):]
+	}
+
+	parts := strings.Split(path, ".")
 	for _, part := range parts {
 		m, ok := current.(map[string]any)
 		if !ok {

@@ -322,3 +322,65 @@ func TestBuildListResponse_CursorFinalPage_CUR03(t *testing.T) {
 		t.Errorf("nextCursor must be omitted on final page of results")
 	}
 }
+
+func TestParsePagination_StrictIntegerAndNegativeClamping(t *testing.T) {
+	wsID := uuid.New()
+
+	if _, err := parsePagination(url.Values{"count": []string{"not-a-number"}}, nil, wsID, 10); err == nil || err.ScimType != "invalidValue" {
+		t.Fatalf("expected 400 invalidValue for non-integer count, got %v", err)
+	}
+
+	if _, err := parsePagination(url.Values{"startIndex": []string{"abc"}}, nil, wsID, 10); err == nil || err.ScimType != "invalidValue" {
+		t.Fatalf("expected 400 invalidValue for non-integer startIndex, got %v", err)
+	}
+
+	if _, err := parsePagination(url.Values{}, map[string]any{"count": 1.5}, wsID, 10); err == nil || err.ScimType != "invalidValue" {
+		t.Fatalf("expected 400 invalidValue for fractional count in body, got %v", err)
+	}
+
+	pag, err := parsePagination(url.Values{"count": []string{"-1"}, "startIndex": []string{"0"}}, nil, wsID, 10)
+	if err != nil {
+		t.Fatalf("negative count / zero startIndex should clamp without error, got %v", err)
+	}
+	if pag.Count != 0 || pag.StartIndex != 1 {
+		t.Fatalf("got Count=%d StartIndex=%d, want Count=0 StartIndex=1", pag.Count, pag.StartIndex)
+	}
+}
+
+// Traced RFC requirements (Group 5):
+//   - RFC7644-3.4.2.1-145a1a: maxResults cap (200) clamped on index pagination.
+//   - RFC7644-3.12-40cb84: 400 tooMany on excessive cursor count (> maxPageSize).
+func TestParsePagination_MaxResultsAndCursorTooMany_Group5(t *testing.T) {
+	wsID := uuid.New()
+
+	// Index pagination: count=500 is clamped to maxResults=200
+	pag, err := parsePagination(url.Values{"count": []string{"500"}}, nil, wsID, 10)
+	if err != nil {
+		t.Fatalf("unexpected error on index count=500: %v", err)
+	}
+	if pag.IsCursor {
+		t.Fatalf("expected IsCursor=false")
+	}
+	if pag.Count != 200 {
+		t.Fatalf("index Count = %d, want 200", pag.Count)
+	}
+
+	// Cursor pagination (query): count=500 (> maxPageSize 200) -> 400 tooMany
+	_, err = parsePagination(url.Values{"cursor": []string{""}, "count": []string{"500"}}, nil, wsID, 10)
+	if err == nil {
+		t.Fatal("expected 400 tooMany for cursor count=500, got nil")
+	}
+	if err.Status != http.StatusBadRequest || err.ScimType != "tooMany" {
+		t.Fatalf("got status=%d scimType=%q, want 400 tooMany", err.Status, err.ScimType)
+	}
+
+	// Cursor pagination (POST /.search body): count=201 (> maxPageSize 200) -> 400 tooMany
+	_, err = parsePagination(url.Values{}, map[string]any{"cursor": "", "count": float64(201)}, wsID, 10)
+	if err == nil {
+		t.Fatal("expected 400 tooMany for POST /.search cursor count=201, got nil")
+	}
+	if err.Status != http.StatusBadRequest || err.ScimType != "tooMany" {
+		t.Fatalf("got status=%d scimType=%q, want 400 tooMany", err.Status, err.ScimType)
+	}
+}
+

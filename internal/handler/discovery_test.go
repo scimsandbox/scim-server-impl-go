@@ -572,8 +572,8 @@ func TestServiceProviderConfig_PaginationAdvertised_CUR06(t *testing.T) {
 	if pag["index"] != true {
 		t.Errorf("pagination.index = %v, want true", pag["index"])
 	}
-	if pag["defaultPaginationMode"] != "index" {
-		t.Errorf("pagination.defaultPaginationMode = %v, want index", pag["defaultPaginationMode"])
+	if pag["defaultPaginationMethod"] != "index" {
+		t.Errorf("pagination.defaultPaginationMethod = %v, want index", pag["defaultPaginationMethod"])
 	}
 	if pag["cursorTimeout"] != float64(3600) {
 		t.Errorf("pagination.cursorTimeout = %v, want 3600", pag["cursorTimeout"])
@@ -647,4 +647,55 @@ func TestRootSearch_InvalidCursor_CUR04(t *testing.T) {
 		t.Errorf("scimType = %v, want invalidCursor", resp["scimType"])
 	}
 }
+
+func TestDiscoveryEndpoints_RejectFilterWith403(t *testing.T) {
+	dh := NewDiscoveryHandler()
+	endpoints := []struct {
+		name string
+		fn   http.HandlerFunc
+		path string
+	}{
+		{"ServiceProviderConfig", dh.GetServiceProviderConfig, "/ServiceProviderConfig?filter=patch.supported+eq+true"},
+		{"Schemas", dh.GetSchemas, "/Schemas?filter=id+pr"},
+		{"ResourceTypes", dh.GetResourceTypes, "/ResourceTypes?filter=name+eq+%22User%22"},
+	}
+	for _, ep := range endpoints {
+		t.Run(ep.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, ep.path, nil)
+			ep.fn(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("%s with filter returned %d, want 403", ep.name, rec.Code)
+			}
+		})
+	}
+}
+
+func TestServiceProviderConfig_AllowsAnonymousGET(t *testing.T) {
+	dh := NewDiscoveryHandler()
+	wsID := uuid.New()
+	r := chi.NewRouter()
+	r.Route("/ws/{workspaceId}/scim/v2", func(sub chi.Router) {
+		sub.Use(middleware.ExtractWorkspaceID)
+		sub.Use(middleware.BearerTokenAuth(nil, nil))
+		sub.Get("/ServiceProviderConfig", dh.GetServiceProviderConfig)
+		sub.Get("/Schemas", dh.GetSchemas)
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/ServiceProviderConfig", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anonymous GET /ServiceProviderConfig returned %d, want 200", rec.Code)
+	}
+
+	// Other endpoints still require Bearer authentication
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/Schemas", nil)
+	r.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous GET /Schemas returned %d, want 401", rec2.Code)
+	}
+}
+
 

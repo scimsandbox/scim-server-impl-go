@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
+	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
 type mockAsyncEventRepo struct {
@@ -166,54 +167,74 @@ func TestBuildSETJson(t *testing.T) {
 	txnID := uuid.New()
 	resourceID := uuid.New()
 
+	// Updated per RFC 9967 §2.2, §2.4, §2.4.4, §2.5.1.3:
+	// - Completion SETs include urn:ietf:params:scim:event:misc:asyncresp
+	// - :full events (create:full, put:full) carry "data" (resource object)
+	// - :notice events (patch:notice) carry "attributes" (list of modified attrPaths)
+	// - delete uses urn:ietf:params:scim:event:prov:delete (no :full/:notice suffix) with empty {}
 	ops := []struct {
-		method       string
-		resourceType string
-		wantEventURN string
-		hasAttrs     bool
+		method         string
+		resourceType   string
+		wantEventURN   string
+		wantStatus     string
+		wantDataMap    bool
+		wantNoticeList bool
+		patchPaths     []string
 	}{
 		{
 			method:       "POST",
 			resourceType: "User",
 			wantEventURN: "urn:ietf:params:scim:event:prov:create:full",
-			hasAttrs:     true,
+			wantStatus:   "201",
+			wantDataMap:  true,
 		},
 		{
 			method:       "PUT",
 			resourceType: "User",
 			wantEventURN: "urn:ietf:params:scim:event:prov:put:full",
-			hasAttrs:     true,
+			wantStatus:   "200",
+			wantDataMap:  true,
 		},
 		{
-			method:       "PATCH",
-			resourceType: "User",
-			wantEventURN: "urn:ietf:params:scim:event:prov:patch:full",
-			hasAttrs:     true,
+			method:         "PATCH",
+			resourceType:   "User",
+			wantEventURN:   "urn:ietf:params:scim:event:prov:patch:notice",
+			wantStatus:     "200",
+			wantNoticeList: true,
+			patchPaths:     []string{"displayName", "name.givenName"},
 		},
 		{
 			method:       "DELETE",
 			resourceType: "User",
-			wantEventURN: "urn:ietf:params:scim:event:prov:delete:full",
-			hasAttrs:     false,
+			wantEventURN: "urn:ietf:params:scim:event:prov:delete",
+			wantStatus:   "204",
 		},
 		{
 			method:       "POST",
 			resourceType: "Group",
 			wantEventURN: "urn:ietf:params:scim:event:prov:create:full",
-			hasAttrs:     true,
+			wantStatus:   "201",
+			wantDataMap:  true,
 		},
 		{
 			method:       "DELETE",
 			resourceType: "Group",
-			wantEventURN: "urn:ietf:params:scim:event:prov:delete:full",
-			hasAttrs:     false,
+			wantEventURN: "urn:ietf:params:scim:event:prov:delete",
+			wantStatus:   "204",
 		},
 	}
 
 	for _, op := range ops {
 		t.Run(op.method+"_"+op.resourceType, func(t *testing.T) {
-			attrs := map[string]any{"id": resourceID.String(), "userName": "alice"}
-			setJSON, err := buildSETJson(baseURL, txnID, op.resourceType, resourceID, op.method, attrs)
+			var resMap map[string]any
+			if op.method != "DELETE" {
+				resMap = map[string]any{
+					"id":       resourceID.String(),
+					"userName": "alice",
+					"meta":     map[string]any{"version": `W/"1"`},
+				}
+			}
+			setJSON, err := buildSETJson(baseURL, txnID, op.resourceType, resourceID, op.method, resMap, op.patchPaths...)
 			if err != nil {
 				t.Fatalf("buildSETJson failed: %v", err)
 			}
@@ -256,18 +277,41 @@ func TestBuildSETJson(t *testing.T) {
 			if !ok {
 				t.Fatalf("events missing or not a map")
 			}
+
+			asyncResp, ok := events[AsyncRespEventURN].(map[string]any)
+			if !ok {
+				t.Fatalf("event URN %s missing from events map: %v", AsyncRespEventURN, events)
+			}
+			if asyncResp["status"] != op.wantStatus {
+				t.Errorf("asyncresp status = %v, want %v", asyncResp["status"], op.wantStatus)
+			}
+			if asyncResp["method"] != op.method {
+				t.Errorf("asyncresp method = %v, want %v", asyncResp["method"], op.method)
+			}
+
 			eventData, ok := events[op.wantEventURN].(map[string]any)
 			if !ok {
 				t.Fatalf("event URN %s missing from events map: %v", op.wantEventURN, events)
 			}
 
-			if op.hasAttrs {
-				if _, ok := eventData["attributes"]; !ok {
-					t.Errorf("expected attributes in eventData for %s", op.method)
+			if op.wantDataMap {
+				if _, ok := eventData["data"].(map[string]any); !ok {
+					t.Errorf("expected 'data' map in :full eventData for %s, got %v", op.method, eventData)
+				}
+				if _, ok := eventData["attributes"]; ok {
+					t.Errorf("unexpected 'attributes' in :full eventData for %s", op.method)
+				}
+			} else if op.wantNoticeList {
+				attrSlice, ok := eventData["attributes"].([]any)
+				if !ok || len(attrSlice) == 0 {
+					t.Errorf("expected non-empty 'attributes' slice in :notice eventData, got %v", eventData)
+				}
+				if _, ok := eventData["data"]; ok {
+					t.Errorf("unexpected 'data' in :notice eventData")
 				}
 			} else {
-				if _, ok := eventData["attributes"]; ok {
-					t.Errorf("expected no attributes in eventData for %s", op.method)
+				if len(eventData) != 0 {
+					t.Errorf("expected empty event payload for %s, got %v", op.method, eventData)
 				}
 			}
 		})
@@ -858,4 +902,80 @@ func TestEventsRoute_MethodNotAllowed(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldExecuteAsync_WaitPreference(t *testing.T) {
+	reqSync, _ := http.NewRequest(http.MethodPost, "/Users", nil)
+	reqSync.Header.Set("Prefer", "respond-async, wait=10")
+	if async, _ := shouldExecuteAsync(reqSync); async {
+		t.Fatal("expected Prefer: respond-async, wait=10 to execute synchronously within wait budget")
+	}
+
+	reqSyncSemi, _ := http.NewRequest(http.MethodPost, "/Users", nil)
+	reqSyncSemi.Header.Set("Prefer", "respond-async; wait=5")
+	if async, _ := shouldExecuteAsync(reqSyncSemi); async {
+		t.Fatal("expected Prefer: respond-async; wait=5 to execute synchronously within wait budget")
+	}
+
+	reqZero, _ := http.NewRequest(http.MethodPost, "/Users", nil)
+	reqZero.Header.Set("Prefer", "respond-async, wait=0")
+	if async, hdr := shouldExecuteAsync(reqZero); !async || hdr != "respond-async, wait=0" {
+		t.Fatalf("got (%v, %q), want (true, \"respond-async, wait=0\")", async, hdr)
+	}
+}
+
+func TestGetEvent_FailedWithErrorSET_Returns200AsyncResp(t *testing.T) {
+	repo := newMockAsyncEventRepo()
+	h := NewAsyncEventHandler(repo)
+
+	wsID := uuid.New()
+	txnID := uuid.New()
+	baseURL := "http://example.com/ws/" + wsID.String() + "/scim/v2"
+
+	errSet, err := buildErrorSETJson(baseURL, txnID, "User", nil, "POST",
+		scim.NewScimError(http.StatusConflict, "uniqueness", "User already exists"))
+	if err != nil {
+		t.Fatalf("buildErrorSETJson failed: %v", err)
+	}
+
+	_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+		TxnID:        txnID,
+		WorkspaceID:  wsID,
+		Operation:    "POST",
+		ResourceType: "User",
+		Status:       model.AsyncStatusFailed,
+		SetPayload:   &errSet,
+		CreatedAt:    time.Now().UTC(),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ws/"+wsID.String()+"/scim/v2/Events/"+txnID.String(), nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("workspaceId", wsID.String())
+	rctx.URLParams.Add("txnId", txnID.String())
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	h.GetEvent(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for error SET delivery", rec.Code)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("unmarshal SET: %v", err)
+	}
+	events, _ := decoded["events"].(map[string]any)
+	asyncResp, ok := events[AsyncRespEventURN].(map[string]any)
+	if !ok {
+		t.Fatalf("missing %s in error SET: %v", AsyncRespEventURN, events)
+	}
+	if asyncResp["status"] != "409" {
+		t.Errorf("asyncresp status = %v, want 409", asyncResp["status"])
+	}
+	errResp, _ := asyncResp["response"].(map[string]any)
+	if errResp["scimType"] != "uniqueness" {
+		t.Errorf("error scimType = %v, want uniqueness", errResp["scimType"])
+	}
+}
+
 

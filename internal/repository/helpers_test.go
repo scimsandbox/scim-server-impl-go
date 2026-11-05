@@ -61,6 +61,8 @@ func TestUserSortEmailsExpressionConstant(t *testing.T) {
 }
 
 // --- buildOrderClause ---
+// Updated per RFC 7644 §3.4.2.3: string attributes with caseExact:false sort via LOWER(col)
+// with deterministic COLLATE "C" and id tie-breakers, while caseExact:true attributes use COLLATE "C".
 
 func TestBuildOrderClause(t *testing.T) {
 	t.Parallel()
@@ -71,18 +73,21 @@ func TestBuildOrderClause(t *testing.T) {
 		dir  string
 		want string
 	}{
-		{"default_ascending", "user_name", "", "ORDER BY user_name ASC NULLS LAST"},
-		{"explicit_asc", "user_name", "ASC", "ORDER BY user_name ASC NULLS LAST"},
-		{"lowercase_asc", "user_name", "asc", "ORDER BY user_name ASC NULLS LAST"},
-		{"full_ascending", "user_name", "ascending", "ORDER BY user_name ASC NULLS LAST"},
-		{"explicit_desc", "user_name", "DESC", "ORDER BY user_name DESC NULLS FIRST"},
-		{"lowercase_desc", "user_name", "desc", "ORDER BY user_name DESC NULLS FIRST"},
-		{"full_descending", "user_name", "descending", "ORDER BY user_name DESC NULLS FIRST"},
-		{"mixed_case_descending", "user_name", "Descending", "ORDER BY user_name DESC NULLS FIRST"},
-		{"group_display_name_asc", "display_name", "ascending", "ORDER BY display_name ASC NULLS LAST"},
-		{"group_display_name_desc", "display_name", "descending", "ORDER BY display_name DESC NULLS FIRST"},
-		{"emails_expression_asc", userSortEmailsExpression, "ascending", "ORDER BY " + userSortEmailsExpression + " ASC NULLS LAST"},
-		{"emails_expression_desc", userSortEmailsExpression, "descending", "ORDER BY " + userSortEmailsExpression + " DESC NULLS FIRST"},
+		{"default_ascending", "user_name", "", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"explicit_asc", "user_name", "ASC", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"lowercase_asc", "user_name", "asc", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"full_ascending", "user_name", "ascending", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"explicit_desc", "user_name", "DESC", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"lowercase_desc", "user_name", "desc", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"full_descending", "user_name", "descending", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"mixed_case_descending", "user_name", "Descending", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"group_display_name_asc", "display_name", "ascending", `ORDER BY LOWER(display_name) ASC NULLS LAST, display_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"group_display_name_desc", "display_name", "descending", `ORDER BY LOWER(display_name) DESC NULLS FIRST, display_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"emails_expression_asc", userSortEmailsExpression, "ascending", "ORDER BY LOWER(" + userSortEmailsExpression + ") ASC NULLS LAST, id ASC"},
+		{"emails_expression_desc", userSortEmailsExpression, "descending", "ORDER BY LOWER(" + userSortEmailsExpression + ") DESC NULLS FIRST, id ASC"},
+		{"case_exact_external_id_asc", "external_id", "ascending", `ORDER BY external_id COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"case_exact_id_desc", "id", "descending", `ORDER BY id::text COLLATE "C" DESC`},
+		{"non_string_created_at_asc", "created_at", "ascending", `ORDER BY created_at ASC NULLS LAST, id ASC`},
 	}
 
 	for _, tc := range cases {

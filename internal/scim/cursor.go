@@ -1,8 +1,12 @@
 package scim
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -18,11 +22,27 @@ const (
 	DefaultCursorTimeoutSeconds = 3600
 )
 
+var cursorSecretKey = func() []byte {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		panic("failed to initialize cursor HMAC secret: " + err.Error())
+	}
+	return key
+}()
+
+func computeCursorHMAC(wsID string, offset int, exp int64) string {
+	mac := hmac.New(sha256.New, cursorSecretKey)
+	_, _ = fmt.Fprintf(mac, "%s|%d|%d", wsID, offset, exp)
+	sum := mac.Sum(nil)
+	return base64.RawURLEncoding.EncodeToString(sum[:16])
+}
+
 // CursorPayload represents the claims embedded inside the stateless opaque cursor token.
 type CursorPayload struct {
 	WorkspaceID string `json:"w"`
 	Offset      *int   `json:"o"`
 	ExpiresAt   *int64 `json:"exp"`
+	Sig         string `json:"s,omitempty"`
 }
 
 // EncodeCursor constructs a URL-safe unpadded Base64URL token prefixed with "scim_cur_".
@@ -35,10 +55,12 @@ func EncodeCursor(workspaceID uuid.UUID, offset int, timeoutSeconds int) (string
 	}
 
 	exp := time.Now().UTC().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
+	wsStr := workspaceID.String()
 	payload := CursorPayload{
-		WorkspaceID: workspaceID.String(),
+		WorkspaceID: wsStr,
 		Offset:      &offset,
 		ExpiresAt:   &exp,
+		Sig:         computeCursorHMAC(wsStr, offset, exp),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -60,10 +82,7 @@ func DecodeCursor(token string, workspaceID uuid.UUID) (int, error) {
 	}
 
 	raw := strings.TrimPrefix(token, CursorPrefix)
-	data, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		data, err = base64.URLEncoding.DecodeString(raw)
-	}
+	data, err := base64.RawURLEncoding.Strict().DecodeString(raw)
 	if err != nil {
 		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Invalid cursor: malformed base64url encoding")
 	}
@@ -92,6 +111,11 @@ func DecodeCursor(token string, workspaceID uuid.UUID) (int, error) {
 
 	if *p.ExpiresAt <= time.Now().UTC().Unix() {
 		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Cursor has expired")
+	}
+
+	expectedSig := computeCursorHMAC(p.WorkspaceID, *p.Offset, *p.ExpiresAt)
+	if p.Sig == "" || !hmac.Equal([]byte(p.Sig), []byte(expectedSig)) {
+		return 0, NewScimError(http.StatusBadRequest, "invalidCursor", "Invalid cursor: integrity check failed")
 	}
 
 	return *p.Offset, nil

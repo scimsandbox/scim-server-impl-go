@@ -2,6 +2,8 @@ package scim
 
 import (
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -78,34 +80,70 @@ func ApplyFromScimInput(user *model.ScimUser, input map[string]any) error {
 	if err := applySimpleAttributes(user, input); err != nil {
 		return err
 	}
-	applyNameAttribute(user, input)
+	if err := applyNameAttribute(user, input); err != nil {
+		return err
+	}
 
 	if v, ok := input["emails"]; ok {
-		user.Emails = replaceCollectionEmails(v)
+		col, err := replaceCollectionEmails(v)
+		if err != nil {
+			return err
+		}
+		user.Emails = col
 	}
 	if v, ok := input["phoneNumbers"]; ok {
-		user.PhoneNumbers = replaceCollectionPhoneNumbers(v)
+		col, err := replaceCollectionPhoneNumbers(v)
+		if err != nil {
+			return err
+		}
+		user.PhoneNumbers = col
 	}
 	if v, ok := input["addresses"]; ok {
-		user.Addresses = replaceCollectionAddresses(v)
+		col, err := replaceCollectionAddresses(v)
+		if err != nil {
+			return err
+		}
+		user.Addresses = col
 	}
 	if v, ok := input["ims"]; ok {
-		user.Ims = replaceCollectionIms(v)
+		col, err := replaceCollectionIms(v)
+		if err != nil {
+			return err
+		}
+		user.Ims = col
 	}
 	if v, ok := input["photos"]; ok {
-		user.Photos = replaceCollectionPhotos(v)
+		col, err := replaceCollectionPhotos(v)
+		if err != nil {
+			return err
+		}
+		user.Photos = col
 	}
 	if v, ok := input["entitlements"]; ok {
-		user.Entitlements = replaceCollectionEntitlements(v)
+		col, err := replaceCollectionEntitlements(v)
+		if err != nil {
+			return err
+		}
+		user.Entitlements = col
 	}
 	if v, ok := input["roles"]; ok {
-		user.Roles = replaceCollectionRoles(v)
+		col, err := replaceCollectionRoles(v)
+		if err != nil {
+			return err
+		}
+		user.Roles = col
 	}
 	if v, ok := input["x509Certificates"]; ok {
-		user.X509Certificates = replaceCollectionX509Certificates(v)
+		col, err := replaceCollectionX509Certificates(v)
+		if err != nil {
+			return err
+		}
+		user.X509Certificates = col
 	}
 
-	applyEnterpriseExtension(user, input)
+	if err := applyEnterpriseExtension(user, input); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -143,6 +181,130 @@ func ClearMutableAttributes(user *model.ScimUser) {
 	user.EnterpriseManagerValue = nil
 	user.EnterpriseManagerRef = nil
 	user.EnterpriseManagerDisplay = nil
+}
+
+// CloneScimUser returns a deep copy of a ScimUser for before/after mutation comparison.
+func CloneScimUser(u *model.ScimUser) *model.ScimUser {
+	if u == nil {
+		return nil
+	}
+	cp := *u
+	cp.ExternalID = cloneStrPtr(u.ExternalID)
+	cp.NameFormatted = cloneStrPtr(u.NameFormatted)
+	cp.NameFamilyName = cloneStrPtr(u.NameFamilyName)
+	cp.NameGivenName = cloneStrPtr(u.NameGivenName)
+	cp.NameMiddleName = cloneStrPtr(u.NameMiddleName)
+	cp.NameHonorificPrefix = cloneStrPtr(u.NameHonorificPrefix)
+	cp.NameHonorificSuffix = cloneStrPtr(u.NameHonorificSuffix)
+	cp.DisplayName = cloneStrPtr(u.DisplayName)
+	cp.NickName = cloneStrPtr(u.NickName)
+	cp.ProfileUrl = cloneStrPtr(u.ProfileUrl)
+	cp.Title = cloneStrPtr(u.Title)
+	cp.UserType = cloneStrPtr(u.UserType)
+	cp.PreferredLanguage = cloneStrPtr(u.PreferredLanguage)
+	cp.Locale = cloneStrPtr(u.Locale)
+	cp.Timezone = cloneStrPtr(u.Timezone)
+	cp.Password = cloneStrPtr(u.Password)
+	cp.EnterpriseEmployeeNumber = cloneStrPtr(u.EnterpriseEmployeeNumber)
+	cp.EnterpriseCostCenter = cloneStrPtr(u.EnterpriseCostCenter)
+	cp.EnterpriseOrganization = cloneStrPtr(u.EnterpriseOrganization)
+	cp.EnterpriseDivision = cloneStrPtr(u.EnterpriseDivision)
+	cp.EnterpriseDepartment = cloneStrPtr(u.EnterpriseDepartment)
+	cp.EnterpriseManagerValue = cloneStrPtr(u.EnterpriseManagerValue)
+	cp.EnterpriseManagerRef = cloneStrPtr(u.EnterpriseManagerRef)
+	cp.EnterpriseManagerDisplay = cloneStrPtr(u.EnterpriseManagerDisplay)
+
+	if u.Emails != nil {
+		cp.Emails = append([]model.ScimUserEmail(nil), u.Emails...)
+	}
+	if u.PhoneNumbers != nil {
+		cp.PhoneNumbers = append([]model.ScimUserPhoneNumber(nil), u.PhoneNumbers...)
+	}
+	if u.Addresses != nil {
+		cp.Addresses = append([]model.ScimUserAddress(nil), u.Addresses...)
+	}
+	if u.Entitlements != nil {
+		cp.Entitlements = append([]model.ScimUserEntitlement(nil), u.Entitlements...)
+	}
+	if u.Roles != nil {
+		cp.Roles = append([]model.ScimUserRole(nil), u.Roles...)
+	}
+	if u.Ims != nil {
+		cp.Ims = append([]model.ScimUserIm(nil), u.Ims...)
+	}
+	if u.Photos != nil {
+		cp.Photos = append([]model.ScimUserPhoto(nil), u.Photos...)
+	}
+	if u.X509Certificates != nil {
+		cp.X509Certificates = append([]model.ScimUserX509Certificate(nil), u.X509Certificates...)
+	}
+	return &cp
+}
+
+func cloneStrPtr(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	v := *s
+	return &v
+}
+
+func strPtrEqual(a, b *string) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func sliceEqual[T any](a, b []T) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// ScimUserMutableEqual reports whether all mutable SCIM attributes of a and b are identical.
+func ScimUserMutableEqual(a, b *model.ScimUser) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.UserName == b.UserName &&
+		strPtrEqual(a.ExternalID, b.ExternalID) &&
+		strPtrEqual(a.NameFormatted, b.NameFormatted) &&
+		strPtrEqual(a.NameFamilyName, b.NameFamilyName) &&
+		strPtrEqual(a.NameGivenName, b.NameGivenName) &&
+		strPtrEqual(a.NameMiddleName, b.NameMiddleName) &&
+		strPtrEqual(a.NameHonorificPrefix, b.NameHonorificPrefix) &&
+		strPtrEqual(a.NameHonorificSuffix, b.NameHonorificSuffix) &&
+		strPtrEqual(a.DisplayName, b.DisplayName) &&
+		strPtrEqual(a.NickName, b.NickName) &&
+		strPtrEqual(a.ProfileUrl, b.ProfileUrl) &&
+		strPtrEqual(a.Title, b.Title) &&
+		strPtrEqual(a.UserType, b.UserType) &&
+		strPtrEqual(a.PreferredLanguage, b.PreferredLanguage) &&
+		strPtrEqual(a.Locale, b.Locale) &&
+		strPtrEqual(a.Timezone, b.Timezone) &&
+		a.Active == b.Active &&
+		strPtrEqual(a.Password, b.Password) &&
+		strPtrEqual(a.EnterpriseEmployeeNumber, b.EnterpriseEmployeeNumber) &&
+		strPtrEqual(a.EnterpriseCostCenter, b.EnterpriseCostCenter) &&
+		strPtrEqual(a.EnterpriseOrganization, b.EnterpriseOrganization) &&
+		strPtrEqual(a.EnterpriseDivision, b.EnterpriseDivision) &&
+		strPtrEqual(a.EnterpriseDepartment, b.EnterpriseDepartment) &&
+		strPtrEqual(a.EnterpriseManagerValue, b.EnterpriseManagerValue) &&
+		strPtrEqual(a.EnterpriseManagerRef, b.EnterpriseManagerRef) &&
+		strPtrEqual(a.EnterpriseManagerDisplay, b.EnterpriseManagerDisplay) &&
+		sliceEqual(a.Emails, b.Emails) &&
+		sliceEqual(a.PhoneNumbers, b.PhoneNumbers) &&
+		sliceEqual(a.Addresses, b.Addresses) &&
+		sliceEqual(a.Entitlements, b.Entitlements) &&
+		sliceEqual(a.Roles, b.Roles) &&
+		sliceEqual(a.Ims, b.Ims) &&
+		sliceEqual(a.Photos, b.Photos) &&
+		sliceEqual(a.X509Certificates, b.X509Certificates)
 }
 
 func hasEnterpriseData(user *model.ScimUser) bool {
@@ -196,43 +358,101 @@ func putCollection(m map[string]any, key string, items []map[string]any) {
 }
 
 func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
-	if v, ok := input["userName"].(string); ok {
-		user.UserName = v
+	if rawUN, ok := input["userName"]; ok && rawUN != nil {
+		s, err := parseStrictStringPtr(rawUN, "userName")
+		if err != nil {
+			return err
+		}
+		if s == nil || *s == "" {
+			return NewScimError(400, "invalidValue", "userName is required")
+		}
+		user.UserName = *s
+	} else if _, ok := input["userName"]; ok && input["userName"] == nil {
+		return NewScimError(400, "invalidValue", "userName is required")
 	}
 	if v, ok := input["externalId"]; ok {
-		user.ExternalID = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "externalId")
+		if err != nil {
+			return err
+		}
+		user.ExternalID = s
 	}
 	if v, ok := input["displayName"]; ok {
-		user.DisplayName = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "displayName")
+		if err != nil {
+			return err
+		}
+		user.DisplayName = s
 	}
 	if v, ok := input["nickName"]; ok {
-		user.NickName = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "nickName")
+		if err != nil {
+			return err
+		}
+		user.NickName = s
 	}
 	if v, ok := input["profileUrl"]; ok {
-		user.ProfileUrl = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "profileUrl")
+		if err != nil {
+			return err
+		}
+		if s != nil && *s != "" {
+			if err := validateReference(*s); err != nil {
+				return err
+			}
+		}
+		user.ProfileUrl = s
 	}
 	if v, ok := input["title"]; ok {
-		user.Title = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "title")
+		if err != nil {
+			return err
+		}
+		user.Title = s
 	}
 	if v, ok := input["userType"]; ok {
-		user.UserType = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "userType")
+		if err != nil {
+			return err
+		}
+		user.UserType = s
 	}
 	if v, ok := input["preferredLanguage"]; ok {
-		user.PreferredLanguage = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "preferredLanguage")
+		if err != nil {
+			return err
+		}
+		user.PreferredLanguage = s
 	}
 	if v, ok := input["locale"]; ok {
-		user.Locale = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "locale")
+		if err != nil {
+			return err
+		}
+		user.Locale = s
 	}
 	if v, ok := input["timezone"]; ok {
-		user.Timezone = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "timezone")
+		if err != nil {
+			return err
+		}
+		user.Timezone = s
 	}
-	if v, ok := input["active"]; ok {
-		user.Active = toBool(v)
+	if v, ok := input["active"]; ok && v != nil {
+		b, err := parseStrictBool(v, "active")
+		if err != nil {
+			return err
+		}
+		user.Active = b
 	} else {
 		user.Active = true
 	}
 	if v, ok := input["password"]; ok {
-		pw, err := HashPassword(toStringPtr(v))
+		rawPw, err := parseRawStringPtr(v, "password")
+		if err != nil {
+			return err
+		}
+		pw, err := HashPassword(rawPw)
 		if err != nil {
 			return err
 		}
@@ -241,185 +461,375 @@ func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
 	return nil
 }
 
-func applyNameAttribute(user *model.ScimUser, input map[string]any) {
+func applyNameAttribute(user *model.ScimUser, input map[string]any) error {
 	nameRaw, ok := input["name"]
-	if !ok {
-		return
+	if !ok || nameRaw == nil {
+		return nil
 	}
 	nameMap, ok := nameRaw.(map[string]any)
 	if !ok {
-		return
+		return NewScimError(400, "invalidValue", "Attribute 'name' must be an object")
 	}
 	if v, ok := nameMap["formatted"]; ok {
-		user.NameFormatted = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "name.formatted")
+		if err != nil {
+			return err
+		}
+		user.NameFormatted = s
 	}
 	if v, ok := nameMap["familyName"]; ok {
-		user.NameFamilyName = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "name.familyName")
+		if err != nil {
+			return err
+		}
+		user.NameFamilyName = s
 	}
 	if v, ok := nameMap["givenName"]; ok {
-		user.NameGivenName = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "name.givenName")
+		if err != nil {
+			return err
+		}
+		user.NameGivenName = s
 	}
 	if v, ok := nameMap["middleName"]; ok {
-		user.NameMiddleName = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "name.middleName")
+		if err != nil {
+			return err
+		}
+		user.NameMiddleName = s
 	}
 	if v, ok := nameMap["honorificPrefix"]; ok {
-		user.NameHonorificPrefix = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "name.honorificPrefix")
+		if err != nil {
+			return err
+		}
+		user.NameHonorificPrefix = s
 	}
 	if v, ok := nameMap["honorificSuffix"]; ok {
-		user.NameHonorificSuffix = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "name.honorificSuffix")
+		if err != nil {
+			return err
+		}
+		user.NameHonorificSuffix = s
 	}
+	return nil
 }
 
-func applyEnterpriseExtension(user *model.ScimUser, input map[string]any) {
-	extRaw, ok := input[EnterpriseSchemaURN]
-	if !ok {
-		return
+func applyEnterpriseExtension(user *model.ScimUser, input map[string]any) error {
+	var extRaw any
+	found := false
+	for k, val := range input {
+		if strings.EqualFold(k, EnterpriseSchemaURN) {
+			extRaw = val
+			found = true
+			break
+		}
+	}
+	if !found || extRaw == nil {
+		return nil
 	}
 	ext, ok := extRaw.(map[string]any)
 	if !ok {
-		return
+		return NewScimError(400, "invalidValue", "Enterprise extension must be an object")
 	}
 	if v, ok := ext["employeeNumber"]; ok {
-		user.EnterpriseEmployeeNumber = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "employeeNumber")
+		if err != nil {
+			return err
+		}
+		user.EnterpriseEmployeeNumber = s
 	}
 	if v, ok := ext["costCenter"]; ok {
-		user.EnterpriseCostCenter = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "costCenter")
+		if err != nil {
+			return err
+		}
+		user.EnterpriseCostCenter = s
 	}
 	if v, ok := ext["organization"]; ok {
-		user.EnterpriseOrganization = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "organization")
+		if err != nil {
+			return err
+		}
+		user.EnterpriseOrganization = s
 	}
 	if v, ok := ext["division"]; ok {
-		user.EnterpriseDivision = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "division")
+		if err != nil {
+			return err
+		}
+		user.EnterpriseDivision = s
 	}
 	if v, ok := ext["department"]; ok {
-		user.EnterpriseDepartment = toStringPtr(v)
+		s, err := parseStrictStringPtr(v, "department")
+		if err != nil {
+			return err
+		}
+		user.EnterpriseDepartment = s
 	}
 	if mgrRaw, ok := ext["manager"]; ok {
-		applyEnterpriseManager(user, mgrRaw)
+		if err := applyEnterpriseManager(user, mgrRaw); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func applyEnterpriseManager(user *model.ScimUser, mgrRaw any) {
+// ExtractUUIDFromRef extracts a canonical lowercase resource UUID from a SCIM $ref URI
+// (RFC 7643 §2.4), accepting absolute or relative URIs with versioned (e.g., .../scim/v1/Users/<id>,
+// .../scim/v2/Users/<id>) or unversioned (e.g., /Users/<id>, /Groups/<id>) paths.
+// Returns "" if ref does not contain a path ending in a valid UUID.
+func ExtractUUIDFromRef(ref string) string {
+	s := strings.TrimSpace(ref)
+	if s == "" {
+		return ""
+	}
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	if schemeIdx := strings.Index(s, "://"); schemeIdx >= 0 {
+		rest := s[schemeIdx+3:]
+		slashIdx := strings.IndexByte(rest, '/')
+		if slashIdx < 0 {
+			return ""
+		}
+		s = rest[slashIdx:]
+	}
+	s = strings.TrimRight(s, "/")
+	idx := strings.LastIndexByte(s, '/')
+	if idx < 0 || idx+1 >= len(s) {
+		return ""
+	}
+	candidate := s[idx+1:]
+	if parsed, err := uuid.Parse(candidate); err == nil {
+		return parsed.String()
+	}
+	return ""
+}
+
+func applyEnterpriseManager(user *model.ScimUser, mgrRaw any) error {
 	if mgrRaw == nil {
 		user.EnterpriseManagerValue = nil
 		user.EnterpriseManagerRef = nil
 		user.EnterpriseManagerDisplay = nil
-		return
+		return nil
 	}
 	switch mgr := mgrRaw.(type) {
 	case string:
-		user.EnterpriseManagerValue = &mgr
+		normStr := NormalizeNFC(mgr)
+		user.EnterpriseManagerValue = &normStr
+		user.EnterpriseManagerDisplay = nil
 	case map[string]any:
+		var parsedVal *string
+		valProvided := false
 		if v, ok := mgr["value"]; ok {
-			user.EnterpriseManagerValue = toStringPtr(v)
+			valProvided = true
+			s, err := parseStrictStringPtr(v, "manager.value")
+			if err != nil {
+				return err
+			}
+			parsedVal = s
+			user.EnterpriseManagerValue = s
 		}
 		if v, ok := mgr["$ref"]; ok {
-			user.EnterpriseManagerRef = toStringPtr(v)
+			s, err := parseStrictStringPtr(v, "manager.$ref")
+			if err != nil {
+				return err
+			}
+			user.EnterpriseManagerRef = s
+			if s != nil && strings.TrimSpace(*s) != "" {
+				refUUID := ExtractUUIDFromRef(*s)
+				if valProvided && parsedVal != nil && strings.TrimSpace(*parsedVal) != "" {
+					if refUUID != "" && !strings.EqualFold(refUUID, strings.TrimSpace(*parsedVal)) {
+						return NewScimError(400, "invalidValue", "manager.value and manager.$ref refer to different resource IDs")
+					}
+				} else if refUUID != "" && (!valProvided || user.EnterpriseManagerValue == nil || strings.TrimSpace(*user.EnterpriseManagerValue) == "") {
+					user.EnterpriseManagerValue = &refUUID
+				}
+			}
 		}
-		if v, ok := mgr["displayName"]; ok {
-			user.EnterpriseManagerDisplay = toStringPtr(v)
-		}
+		// RFC 7643 §4.3: manager.displayName has mutability "readOnly" and MUST be ignored in client input.
+		user.EnterpriseManagerDisplay = nil
+	default:
+		return NewScimError(400, "invalidValue", "Attribute 'manager' must be an object or string")
 	}
+	return nil
 }
 
 // Collection replace helpers
 
-func replaceCollectionEmails(v any) []model.ScimUserEmail {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserEmail, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildEmail(m))
-		}
-	}
-	return DeduplicateEmails(result)
-}
-
-func replaceCollectionPhoneNumbers(v any) []model.ScimUserPhoneNumber {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserPhoneNumber, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildPhoneNumber(m))
-		}
-	}
-	return result
-}
-
-func replaceCollectionAddresses(v any) []model.ScimUserAddress {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserAddress, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildAddress(m))
-		}
-	}
-	return result
-}
-
-func replaceCollectionIms(v any) []model.ScimUserIm {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserIm, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildIm(m))
-		}
-	}
-	return result
-}
-
-func replaceCollectionPhotos(v any) []model.ScimUserPhoto {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserPhoto, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildPhoto(m))
-		}
-	}
-	return result
-}
-
-func replaceCollectionEntitlements(v any) []model.ScimUserEntitlement {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserEntitlement, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildEntitlement(m))
-		}
-	}
-	return result
-}
-
-func replaceCollectionRoles(v any) []model.ScimUserRole {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserRole, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildRole(m))
-		}
-	}
-	return result
-}
-
-func replaceCollectionX509Certificates(v any) []model.ScimUserX509Certificate {
-	items := toAnySlice(v)
-	result := make([]model.ScimUserX509Certificate, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, buildX509Certificate(m))
-		}
-	}
-	return result
-}
-
-func toAnySlice(v any) []any {
+func extractMapSlice(v any, attrName string) ([]map[string]any, error) {
 	if v == nil {
-		return nil
+		return nil, nil
 	}
-	if s, ok := v.([]any); ok {
-		return s
+	switch raw := v.(type) {
+	case []any:
+		res := make([]map[string]any, 0, len(raw))
+		for _, item := range raw {
+			m, ok := item.(map[string]any)
+			if !ok {
+				return nil, NewScimError(400, "invalidValue", fmt.Sprintf("Elements of '%s' must be JSON objects", attrName))
+			}
+			res = append(res, m)
+		}
+		return res, nil
+	case []map[string]any:
+		return raw, nil
+	default:
+		return nil, NewScimError(400, "invalidValue", fmt.Sprintf("Attribute '%s' must be an array", attrName))
 	}
-	return nil
+}
+
+func replaceCollectionEmails(v any) ([]model.ScimUserEmail, error) {
+	items, err := extractMapSlice(v, "emails")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserEmail, 0, len(items))
+	for _, m := range items {
+		built, err := buildEmail(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicateEmails(result), nil
+}
+
+func replaceCollectionPhoneNumbers(v any) ([]model.ScimUserPhoneNumber, error) {
+	items, err := extractMapSlice(v, "phoneNumbers")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserPhoneNumber, 0, len(items))
+	for _, m := range items {
+		built, err := buildPhoneNumber(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicatePhoneNumbers(result), nil
+}
+
+func replaceCollectionAddresses(v any) ([]model.ScimUserAddress, error) {
+	items, err := extractMapSlice(v, "addresses")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserAddress, 0, len(items))
+	for _, m := range items {
+		built, err := buildAddress(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicateAddresses(result), nil
+}
+
+func replaceCollectionIms(v any) ([]model.ScimUserIm, error) {
+	items, err := extractMapSlice(v, "ims")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserIm, 0, len(items))
+	for _, m := range items {
+		built, err := buildIm(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicateIms(result), nil
+}
+
+func replaceCollectionPhotos(v any) ([]model.ScimUserPhoto, error) {
+	items, err := extractMapSlice(v, "photos")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserPhoto, 0, len(items))
+	for _, m := range items {
+		built, err := buildPhoto(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicatePhotos(result), nil
+}
+
+func replaceCollectionEntitlements(v any) ([]model.ScimUserEntitlement, error) {
+	items, err := extractMapSlice(v, "entitlements")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserEntitlement, 0, len(items))
+	for _, m := range items {
+		built, err := buildEntitlement(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicateEntitlements(result), nil
+}
+
+func replaceCollectionRoles(v any) ([]model.ScimUserRole, error) {
+	items, err := extractMapSlice(v, "roles")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserRole, 0, len(items))
+	for _, m := range items {
+		built, err := buildRole(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicateRoles(result), nil
+}
+
+func replaceCollectionX509Certificates(v any) ([]model.ScimUserX509Certificate, error) {
+	items, err := extractMapSlice(v, "x509Certificates")
+	if err != nil || items == nil {
+		return nil, err
+	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return nil, err
+	}
+	result := make([]model.ScimUserX509Certificate, 0, len(items))
+	for _, m := range items {
+		built, err := buildX509Certificate(m)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, built)
+	}
+	return DeduplicateX509Certificates(result), nil
 }
 
 // Multi-valued to map conversions

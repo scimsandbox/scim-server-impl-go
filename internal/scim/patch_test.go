@@ -168,7 +168,10 @@ func TestApplyPatchOperations_AddEnterpriseAttributes(t *testing.T) {
 	}
 	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, "alice")
 	assertStringPtrEquals(t, "managerRef", u.EnterpriseManagerRef, "http://example.com/Users/alice")
-	assertStringPtrEquals(t, "managerDisplay", u.EnterpriseManagerDisplay, "Alice")
+	// RFC 7643 §4.3: manager.displayName is readOnly and must not be populated from client input
+	if u.EnterpriseManagerDisplay != nil {
+		t.Fatalf("expected EnterpriseManagerDisplay to remain nil on client input (readOnly), got %q", *u.EnterpriseManagerDisplay)
+	}
 
 	// Unknown enterprise attribute
 	opsErr := []map[string]any{{"op": "add", "path": prefix + "unknown", "value": "Val"}}
@@ -999,4 +1002,156 @@ func TestApplyPatchOperations_PrimaryFlagDemotion_PAT27(t *testing.T) {
 		}
 	})
 }
+
+func TestStrictTypeMutabilityAndNoOpPatch(t *testing.T) {
+	t.Run("PATCH replace active with non-boolean returns 400 invalidValue", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "replace", "path": "active", "value": "not-a-boolean"},
+		})
+		if err == nil {
+			t.Fatal("expected error for non-boolean active")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+			t.Fatalf("got %v, want 400 invalidValue", err)
+		}
+	})
+
+	t.Run("PATCH add with two primary=true emails returns 400 invalidValue", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{
+				"op":   "add",
+				"path": "emails",
+				"value": []any{
+					map[string]any{"value": "one@example.com", "primary": true},
+					map[string]any{"value": "two@example.com", "primary": true},
+				},
+			},
+		})
+		if err == nil {
+			t.Fatal("expected error for multiple primary=true emails")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+			t.Fatalf("got %v, want 400 invalidValue", err)
+		}
+	})
+
+	t.Run("PATCH remove on required userName returns 400 mutability", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "remove", "path": "userName"},
+		})
+		if err == nil {
+			t.Fatal("expected error when removing required userName")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "mutability" {
+			t.Fatalf("got %v, want 400 mutability", err)
+		}
+	})
+
+	t.Run("PATCH replace on readOnly manager.displayName returns 400 mutability", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "replace", "path": EnterpriseSchemaURN + ":manager.displayName", "value": "Spoofed"},
+		})
+		if err == nil {
+			t.Fatal("expected error when modifying readOnly manager.displayName")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "mutability" {
+			t.Fatalf("got %v, want 400 mutability", err)
+		}
+	})
+
+	t.Run("ScimUserMutableEqual detects no-op PATCH and duplicate multi-valued add", func(t *testing.T) {
+		u := newTestUser()
+		dn := "Existing Display"
+		u.DisplayName = &dn
+		u.PhoneNumbers = []model.ScimUserPhoneNumber{{Value: "+155733333333", Type: "work"}}
+
+		before := CloneScimUser(u)
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "replace", "path": "displayName", "value": "Existing Display"},
+			{"op": "add", "path": "phoneNumbers", "value": []any{map[string]any{"value": "+155733333333", "type": "work"}}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ScimUserMutableEqual(before, u) {
+			t.Fatal("expected ScimUserMutableEqual to be true for no-op PATCH")
+		}
+		if len(u.PhoneNumbers) != 1 {
+			t.Fatalf("expected duplicate phoneNumber not to be appended, got %d items", len(u.PhoneNumbers))
+		}
+	})
+}
+
+func TestEnterpriseManagerVersionAgnosticRefAndConflict_RFC7643_2_4(t *testing.T) {
+	mgrA := "11111111-1111-1111-1111-111111111111"
+	mgrB := "22222222-2222-2222-2222-222222222222"
+
+	// 1. ApplyFromScimInput: $ref-only manager (v1 URI) extracts manager.value
+	u := newTestUser()
+	if err := ApplyFromScimInput(u, map[string]any{
+		"userName": "emp1@example.com",
+		EnterpriseSchemaURN: map[string]any{
+			"manager": map[string]any{
+				"$ref": "https://legacy.idp.example/scim/v1/Users/" + mgrA,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyFromScimInput $ref-only manager failed: %v", err)
+	}
+	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, mgrA)
+
+	// 2. ApplyFromScimInput: conflicting value vs $ref UUID -> 400 invalidValue
+	if err := ApplyFromScimInput(newTestUser(), map[string]any{
+		"userName": "emp2@example.com",
+		EnterpriseSchemaURN: map[string]any{
+			"manager": map[string]any{
+				"value": mgrA,
+				"$ref":  "/Users/" + mgrB,
+			},
+		},
+	}); err == nil {
+		t.Fatal("expected 400 invalidValue for conflicting manager.value and manager.$ref")
+	} else if se, ok := err.(*ScimError); !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+		t.Fatalf("got %v, want 400 invalidValue", err)
+	}
+
+	// 3. ApplyPatchOperations: manager.$ref path with omitted-version URI updates EnterpriseManagerValue
+	if err := ApplyPatchOperations(u, []map[string]any{
+		{"op": "replace", "path": EnterpriseSchemaURN + ":manager.$ref", "value": "/Users/" + mgrB},
+	}); err != nil {
+		t.Fatalf("PATCH manager.$ref failed: %v", err)
+	}
+	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, mgrB)
+
+	// 4. ApplyPatchOperations: manager object with $ref-only v1 URI updates EnterpriseManagerValue
+	if err := ApplyPatchOperations(u, []map[string]any{
+		{"op": "replace", "path": EnterpriseSchemaURN + ":manager", "value": map[string]any{
+			"$ref": "https://legacy.idp.example/scim/v1/Users/" + mgrA,
+		}},
+	}); err != nil {
+		t.Fatalf("PATCH manager $ref-only object failed: %v", err)
+	}
+	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, mgrA)
+
+	// 5. ApplyPatchOperations: conflicting value vs $ref UUID -> 400 invalidValue
+	if err := ApplyPatchOperations(u, []map[string]any{
+		{"op": "replace", "path": EnterpriseSchemaURN + ":manager", "value": map[string]any{
+			"value": mgrA,
+			"$ref":  "https://legacy.idp.example/scim/v1/Users/" + mgrB,
+		}},
+	}); err == nil {
+		t.Fatal("expected 400 invalidValue on PATCH manager with conflicting value and $ref")
+	} else if se, ok := err.(*ScimError); !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+		t.Fatalf("got %v, want 400 invalidValue", err)
+	}
+}
+
 

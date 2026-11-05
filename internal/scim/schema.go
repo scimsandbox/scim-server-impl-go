@@ -16,12 +16,12 @@ func ServiceProviderConfig() map[string]any {
 			"maxResults": 200,
 		},
 		"pagination": map[string]any{
-			"cursor":                true,
-			"index":                 true,
-			"defaultPaginationMode": "index",
-			"defaultPageSize":       10,
-			"maxPageSize":           200,
-			"cursorTimeout":         3600,
+			"cursor":                  true,
+			"index":                   true,
+			"defaultPaginationMethod": "index",
+			"defaultPageSize":         10,
+			"maxPageSize":             200,
+			"cursorTimeout":           3600,
 		},
 		"changePassword": map[string]any{"supported": true},
 		"sort":           map[string]any{"supported": true},
@@ -31,10 +31,11 @@ func ServiceProviderConfig() map[string]any {
 			"asyncRequest": "request",
 		},
 		"authenticationSchemes": []map[string]any{{
-			"type":        "oauthbearertoken",
-			"name":        "OAuth Bearer Token",
-			"description": "Authentication scheme using the OAuth Bearer Token Standard",
-			"specUri":     "http://www.rfc-editor.org/info/rfc6750",
+			"type":             "oauthbearertoken",
+			"name":             "OAuth Bearer Token",
+			"description":      "Authentication scheme using the OAuth Bearer Token Standard",
+			"specUri":          "https://www.rfc-editor.org/info/rfc6750",
+			"documentationUri": "https://datatracker.ietf.org/doc/html/rfc6750",
 		}},
 	}
 }
@@ -114,7 +115,7 @@ func userSchema() map[string]any {
 	attrs := []map[string]any{
 		withReturned(withCaseExact(attr("id", "string", true, "readOnly", "server",
 			"A unique identifier for a SCIM resource", false)), "always"),
-		withCaseExact(attr("externalId", "string", false, "readWrite", "server",
+		withCaseExact(attr("externalId", "string", false, "readWrite", "none",
 			"An identifier for the resource as defined by the provisioning client", false)),
 		attr("userName", "string", true, "readWrite", "server",
 			"Unique identifier for the User", false),
@@ -180,7 +181,7 @@ func groupSchema() map[string]any {
 	attrs := []map[string]any{
 		withReturned(withCaseExact(attr("id", "string", true, "readOnly", "server",
 			"Unique identifier", false)), "always"),
-		withCaseExact(attr("externalId", "string", false, "readWrite", "server",
+		withCaseExact(attr("externalId", "string", false, "readWrite", "none",
 			"External identifier", false)),
 		attr("displayName", "string", true, "readWrite", "none",
 			"A human-readable name for the Group", false),
@@ -248,7 +249,7 @@ func serviceProviderConfigSchema() map[string]any {
 		attr("supported", "boolean", true, "readOnly", "none", "Whether filtering is supported", false),
 		attr("maxResults", "integer", true, "readOnly", "none", "Maximum results", false))
 
-	paginationMode := attr("defaultPaginationMode", "string", false, "readOnly", "none", "Default pagination mode", false)
+	paginationMode := attr("defaultPaginationMethod", "string", false, "readOnly", "none", "Default pagination method", false)
 	paginationMode["canonicalValues"] = []string{"cursor", "index"}
 	delete(paginationMode, "uniqueness")
 

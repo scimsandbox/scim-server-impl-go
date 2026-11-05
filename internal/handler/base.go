@@ -90,31 +90,263 @@ func readJSON(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
+type projectionSpec struct {
+	whole    map[string]bool
+	subs     map[string]map[string]bool
+	entAll   bool
+	entWhole map[string]bool
+	entSubs  map[string]map[string]bool
+}
+
+func parseProjectionSpec(raw string) projectionSpec {
+	spec := projectionSpec{
+		whole:    make(map[string]bool),
+		subs:     make(map[string]map[string]bool),
+		entWhole: make(map[string]bool),
+		entSubs:  make(map[string]map[string]bool),
+	}
+	entURNLower := strings.ToLower(scim.EnterpriseSchemaURN)
+	entPrefixLower := entURNLower + ":"
+	userPrefixLower := strings.ToLower(scim.UserSchemaURN) + ":"
+	groupPrefixLower := strings.ToLower(scim.GroupSchemaURN) + ":"
+
+	for _, tok := range parseAttrList(raw) {
+		lower := strings.ToLower(tok)
+		if lower == entURNLower {
+			spec.entAll = true
+			continue
+		}
+		if strings.HasPrefix(lower, entPrefixLower) {
+			rem := strings.TrimSpace(tok[len(entPrefixLower):])
+			addPathToMaps(rem, spec.entWhole, spec.entSubs)
+			continue
+		}
+		corePath := tok
+		if strings.HasPrefix(lower, userPrefixLower) {
+			corePath = strings.TrimSpace(tok[len(userPrefixLower):])
+		} else if strings.HasPrefix(lower, groupPrefixLower) {
+			corePath = strings.TrimSpace(tok[len(groupPrefixLower):])
+		}
+		addPathToMaps(corePath, spec.whole, spec.subs)
+	}
+	return spec
+}
+
+func addPathToMaps(attrPath string, whole map[string]bool, subs map[string]map[string]bool) {
+	if attrPath == "" {
+		return
+	}
+	parts := strings.SplitN(attrPath, ".", 2)
+	parent := strings.ToLower(strings.TrimSpace(parts[0]))
+	if parent == "" {
+		return
+	}
+	if len(parts) == 1 {
+		whole[parent] = true
+		return
+	}
+	sub := strings.ToLower(strings.TrimSpace(parts[1]))
+	if sub == "" {
+		whole[parent] = true
+		return
+	}
+	if subs[parent] == nil {
+		subs[parent] = make(map[string]bool)
+	}
+	subs[parent][sub] = true
+}
+
+func toMapSlice(v any) ([]map[string]any, bool) {
+	switch s := v.(type) {
+	case []map[string]any:
+		return s, true
+	case []any:
+		out := make([]map[string]any, 0, len(s))
+		for _, elem := range s {
+			m, ok := elem.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, m)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func projectObjectMapWhitelist(m map[string]any, whole map[string]bool, subs map[string]map[string]bool, defaultKeep map[string]bool) {
+	for k, v := range m {
+		kl := strings.ToLower(k)
+		if whole[kl] {
+			continue
+		}
+		if subSet, hasSubs := subs[kl]; hasSubs {
+			if subMap, ok := v.(map[string]any); ok {
+				filtered := make(map[string]any)
+				for sk, sv := range subMap {
+					if subSet[strings.ToLower(sk)] {
+						filtered[sk] = sv
+					}
+				}
+				if len(filtered) > 0 {
+					m[k] = filtered
+				} else if !defaultKeep[kl] {
+					delete(m, k)
+				}
+				continue
+			}
+			if sliceMaps, ok := toMapSlice(v); ok {
+				projected := make([]map[string]any, 0, len(sliceMaps))
+				for _, em := range sliceMaps {
+					filtered := make(map[string]any)
+					for sk, sv := range em {
+						if subSet[strings.ToLower(sk)] {
+							filtered[sk] = sv
+						}
+					}
+					if len(filtered) > 0 {
+						projected = append(projected, filtered)
+					}
+				}
+				if len(projected) > 0 {
+					m[k] = projected
+				} else {
+					delete(m, k)
+				}
+				continue
+			}
+		}
+		if defaultKeep[kl] {
+			continue
+		}
+		delete(m, k)
+	}
+}
+
+func projectObjectMapBlacklist(m map[string]any, whole map[string]bool, subs map[string]map[string]bool, protected map[string]bool) {
+	for k, v := range m {
+		kl := strings.ToLower(k)
+		if protected[kl] {
+			continue
+		}
+		if whole[kl] {
+			delete(m, k)
+			continue
+		}
+		if subSet, hasSubs := subs[kl]; hasSubs {
+			if subMap, ok := v.(map[string]any); ok {
+				filtered := make(map[string]any, len(subMap))
+				for sk, sv := range subMap {
+					if !subSet[strings.ToLower(sk)] {
+						filtered[sk] = sv
+					}
+				}
+				if len(filtered) > 0 {
+					m[k] = filtered
+				} else {
+					delete(m, k)
+				}
+				continue
+			}
+			if sliceMaps, ok := toMapSlice(v); ok {
+				projected := make([]map[string]any, 0, len(sliceMaps))
+				for _, em := range sliceMaps {
+					filtered := make(map[string]any, len(em))
+					for sk, sv := range em {
+						if !subSet[strings.ToLower(sk)] {
+							filtered[sk] = sv
+						}
+					}
+					if len(filtered) > 0 {
+						projected = append(projected, filtered)
+					}
+				}
+				if len(projected) > 0 {
+					m[k] = projected
+				} else {
+					delete(m, k)
+				}
+			}
+		}
+	}
+}
+
+func findKeyCaseInsensitive(m map[string]any, target string) (string, bool) {
+	for k := range m {
+		if strings.EqualFold(k, target) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
 func applyAttributeProjection(response map[string]any, attributes, excludedAttributes string) map[string]any {
-	// Always remove password
+	// Always remove password (returned: never)
 	delete(response, "password")
 
-	alwaysReturn := map[string]bool{"schemas": true, "id": true, "meta": true}
+	if strings.TrimSpace(attributes) != "" {
+		spec := parseProjectionSpec(attributes)
 
-	if attributes != "" {
-		attrList := parseAttrList(attributes)
-		attrSet := make(map[string]bool)
-		for _, a := range attrList {
-			attrSet[resolveUrnPrefixedAttribute(a)] = true
-		}
-		for k := range response {
-			if !alwaysReturn[k] && !attrSet[k] {
-				delete(response, k)
+		// Handle enterprise extension block first
+		if entKey, hasEnt := findKeyCaseInsensitive(response, scim.EnterpriseSchemaURN); hasEnt {
+			if spec.entAll {
+				// Keep entire enterprise extension map intact; mark it to survive core pruning
+				spec.whole[strings.ToLower(entKey)] = true
+			} else if len(spec.entWhole) > 0 || len(spec.entSubs) > 0 {
+				if entMap, ok := response[entKey].(map[string]any); ok {
+					entCopy := make(map[string]any, len(entMap))
+					for ek, ev := range entMap {
+						entCopy[ek] = ev
+					}
+					projectObjectMapWhitelist(entCopy, spec.entWhole, spec.entSubs, nil)
+					if len(entCopy) > 0 {
+						response[entKey] = entCopy
+						spec.whole[strings.ToLower(entKey)] = true
+					} else {
+						delete(response, entKey)
+					}
+				} else {
+					delete(response, entKey)
+				}
+			} else {
+				delete(response, entKey)
 			}
 		}
-	} else if excludedAttributes != "" {
-		attrList := parseAttrList(excludedAttributes)
-		for _, a := range attrList {
-			resolved := resolveUrnPrefixedAttribute(a)
-			if !alwaysReturn[resolved] {
-				delete(response, resolved)
+
+		alwaysKeep := map[string]bool{"schemas": true, "id": true, "meta": true}
+		// Never allow schemas or id to be stripped even via sub-attribute selector
+		delete(spec.subs, "schemas")
+		delete(spec.subs, "id")
+		projectObjectMapWhitelist(response, spec.whole, spec.subs, alwaysKeep)
+	} else if strings.TrimSpace(excludedAttributes) != "" {
+		spec := parseProjectionSpec(excludedAttributes)
+
+		if entKey, hasEnt := findKeyCaseInsensitive(response, scim.EnterpriseSchemaURN); hasEnt {
+			if spec.entAll {
+				delete(response, entKey)
+			} else if len(spec.entWhole) > 0 || len(spec.entSubs) > 0 {
+				if entMap, ok := response[entKey].(map[string]any); ok {
+					entCopy := make(map[string]any, len(entMap))
+					for ek, ev := range entMap {
+						entCopy[ek] = ev
+					}
+					projectObjectMapBlacklist(entCopy, spec.entWhole, spec.entSubs, nil)
+					if len(entCopy) > 0 {
+						response[entKey] = entCopy
+					} else {
+						delete(response, entKey)
+					}
+				}
 			}
 		}
+
+		protected := map[string]bool{
+			"schemas":                             true,
+			"id":                                  true,
+			strings.ToLower(scim.EnterpriseSchemaURN): true,
+		}
+		projectObjectMapBlacklist(response, spec.whole, spec.subs, protected)
 	}
 
 	return response
@@ -130,20 +362,6 @@ func parseAttrList(s string) []string {
 		}
 	}
 	return result
-}
-
-func resolveUrnPrefixedAttribute(attr string) string {
-	enterprisePrefix := scim.EnterpriseSchemaURN + ":"
-	if strings.HasPrefix(attr, enterprisePrefix) {
-		return attr[len(enterprisePrefix):]
-	}
-
-	corePrefix := scim.UserSchemaURN + ":"
-	if strings.HasPrefix(attr, corePrefix) {
-		return attr[len(corePrefix):]
-	}
-
-	return attr
 }
 
 func getCompatMode(r *http.Request) scim.CompatMode {

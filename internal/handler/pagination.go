@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -28,13 +30,38 @@ func parsePagination(
 	hasCursor := query.Has("cursor")
 	cursorVal := query.Get("cursor")
 
-	hasStartIndex := query.Has("startIndex") && strings.TrimSpace(query.Get("startIndex")) != ""
-	startIndexVal := clampInt(query.Get("startIndex"), 1, 1)
+	startIndexVal := 1
+	hasStartIndex := false
+	if query.Has("startIndex") {
+		rawSI := strings.TrimSpace(query.Get("startIndex"))
+		if rawSI != "" {
+			hasStartIndex = true
+			parsedSI, err := strconv.Atoi(rawSI)
+			if err != nil {
+				return nil, scim.NewScimError(http.StatusBadRequest, "invalidValue", "Invalid startIndex parameter: must be an integer")
+			}
+			startIndexVal = max(1, parsedSI)
+		}
+	}
 
-	count := clampIntMax(query.Get("count"), defaultCount, 0, 200)
+	count := defaultCount
+	hasExplicitCount := false
+	rawExplicitCount := 0
+	if query.Has("count") {
+		rawCount := strings.TrimSpace(query.Get("count"))
+		if rawCount != "" {
+			parsedCount, err := strconv.Atoi(rawCount)
+			if err != nil {
+				return nil, scim.NewScimError(http.StatusBadRequest, "invalidValue", "Invalid count parameter: must be an integer")
+			}
+			hasExplicitCount = true
+			rawExplicitCount = parsedCount
+			count = max(0, min(200, parsedCount))
+		}
+	}
 
 	if body != nil {
-		if c, exists := body["cursor"]; exists {
+		if c, exists := body["cursor"]; exists && c != nil {
 			if str, ok := c.(string); ok {
 				hasCursor = true
 				cursorVal = str
@@ -42,18 +69,22 @@ func parsePagination(
 				return nil, scim.NewScimError(http.StatusBadRequest, "invalidCursor", "cursor must be a string")
 			}
 		}
-		if si, exists := body["startIndex"]; exists {
-			if num, ok := si.(float64); ok {
-				hasStartIndex = true
-				startIndexVal = max(1, int(num))
-			} else {
+		if si, exists := body["startIndex"]; exists && si != nil {
+			num, ok := si.(float64)
+			if !ok || math.IsNaN(num) || math.IsInf(num, 0) || num != math.Trunc(num) {
 				return nil, scim.NewScimError(http.StatusBadRequest, "invalidValue", "startIndex must be an integer")
 			}
+			hasStartIndex = true
+			startIndexVal = max(1, int(num))
 		}
-		if cnt, exists := body["count"]; exists {
-			if num, ok := cnt.(float64); ok {
-				count = max(0, min(200, int(num)))
+		if cnt, exists := body["count"]; exists && cnt != nil {
+			num, ok := cnt.(float64)
+			if !ok || math.IsNaN(num) || math.IsInf(num, 0) || num != math.Trunc(num) {
+				return nil, scim.NewScimError(http.StatusBadRequest, "invalidValue", "count must be an integer")
 			}
+			hasExplicitCount = true
+			rawExplicitCount = int(num)
+			count = max(0, min(200, int(num)))
 		}
 	}
 
@@ -68,6 +99,9 @@ func parsePagination(
 				return nil, scimErr
 			}
 			return nil, scim.NewScimError(http.StatusBadRequest, "invalidCursor", err.Error())
+		}
+		if hasExplicitCount && rawExplicitCount > 200 {
+			return nil, scim.NewScimError(http.StatusBadRequest, "tooMany", "Requested count exceeds maxPageSize (200)")
 		}
 		return &PaginationRequest{
 			IsCursor: true,

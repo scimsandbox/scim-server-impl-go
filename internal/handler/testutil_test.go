@@ -21,6 +21,7 @@ import (
 	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
 	"github.com/scimsandbox/scim-server-impl-go/internal/repository"
+	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 	"github.com/scimsandbox/scim-server-impl-go/internal/testsupport"
 )
 
@@ -42,7 +43,10 @@ func setupTestEnv(t *testing.T) *testEnv {
 			"POSTGRES_PASSWORD": "postgres",
 			"POSTGRES_DB":       "scim_test",
 		},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
+		WaitingFor: wait.ForAll(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			wait.ForListeningPort("5432/tcp"),
+		).WithDeadline(60 * time.Second),
 	}
 
 	pgc, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -78,11 +82,13 @@ func setupTestEnv(t *testing.T) *testEnv {
 	workspaceRepo := repository.NewWorkspaceRepository()
 	tokenRepo := repository.NewTokenRepository()
 	requestLogRepo := repository.NewRequestLogRepository()
+	asyncEventRepo := repository.NewAsyncEventRepository()
 
-	userHandler := NewUserHandler(userRepo, membershipRepo, workspaceRepo)
-	groupHandler := NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo)
+	userHandler := NewUserHandler(userRepo, membershipRepo, workspaceRepo, asyncEventRepo)
+	groupHandler := NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo, asyncEventRepo)
 	bulkHandler := NewBulkHandler(userHandler, groupHandler)
 	discoveryHandler := NewDiscoveryHandler(userHandler, groupHandler)
+	asyncEventHandler := NewAsyncEventHandler(asyncEventRepo)
 
 	r := chi.NewRouter()
 
@@ -141,6 +147,12 @@ func setupTestEnv(t *testing.T) *testEnv {
 		r.Patch("/.search", MethodNotAllowedWithAllow("POST"))
 		r.Delete("/.search", MethodNotAllowedWithAllow("POST"))
 
+		r.Get("/Events/{txnId}", asyncEventHandler.GetEvent)
+		r.Post("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
+		r.Put("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
+
 		r.Get("/ServiceProviderConfig", discoveryHandler.GetServiceProviderConfig)
 		r.Post("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
 		r.Put("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
@@ -173,6 +185,11 @@ func setupTestEnv(t *testing.T) *testEnv {
 
 		r.MethodNotAllowed(MethodNotAllowed)
 	}
+
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Requested SCIM endpoint or protocol version not found"))
+	})
+	r.MethodNotAllowed(MethodNotAllowed)
 
 	r.Route("/ws/{workspaceId}/scim/v2", func(r chi.Router) {
 		r.Use(middleware.ExtractWorkspaceID)

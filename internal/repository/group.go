@@ -145,13 +145,15 @@ func (r *GroupRepository) List(ctx context.Context, workspaceID uuid.UUID, where
 
 func resolveGroupSortColumn(sortBy string) string {
 	switch strings.ToLower(sortBy) {
+	case "id":
+		return "id"
 	case "displayname", "display_name":
 		return "display_name"
-	case "meta.created":
+	case "meta.created", "created_at":
 		return "created_at"
-	case "meta.lastmodified":
+	case "meta.lastmodified", "last_modified":
 		return "last_modified"
-	case "externalid":
+	case "externalid", "external_id":
 		return "external_id"
 	default:
 		return "display_name"
@@ -365,6 +367,13 @@ func (r *MembershipRepository) DeleteByGroupIDAndMemberValues(ctx context.Contex
 	return err
 }
 
+func (r *MembershipRepository) UpdateMemberType(ctx context.Context, membershipID, wsID uuid.UUID, memberType string) error {
+	_, err := jdbc.ExecContext(ctx,
+		`UPDATE scim_group_memberships SET member_type = $1 WHERE id = $2 AND workspace_id = $3`,
+		memberType, membershipID, wsID)
+	return err
+}
+
 // Transactional variants for memberships
 
 func (r *MembershipRepository) FindByGroupIDTx(ctx context.Context, tx jdbc.Executor, groupID uuid.UUID) ([]model.ScimGroupMembership, error) {
@@ -417,6 +426,13 @@ func (r *MembershipRepository) DeleteByGroupIDAndMemberValuesTx(ctx context.Cont
 	query := fmt.Sprintf(`DELETE FROM scim_group_memberships WHERE group_id = $1 AND member_value IN (%s)`,
 		strings.Join(placeholders, ","))
 	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func (r *MembershipRepository) UpdateMemberTypeTx(ctx context.Context, tx jdbc.Executor, membershipID, wsID uuid.UUID, memberType string) error {
+	_, err := tx.ExecContext(ctx,
+		`UPDATE scim_group_memberships SET member_type = $1 WHERE id = $2 AND workspace_id = $3`,
+		memberType, membershipID, wsID)
 	return err
 }
 

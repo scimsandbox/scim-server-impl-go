@@ -7,13 +7,15 @@ import (
 	"regexp"
 	"strings"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 )
 
 var readOnlyAttrs = map[string]bool{
 	"id": true, "meta": true, "meta.created": true, "meta.lastmodified": true,
 	"meta.location": true, "meta.resourcetype": true, "meta.version": true,
-	"groups": true,
+	"groups": true, "manager.displayname": true,
 }
 
 var filteredPathRegex = regexp.MustCompile(`^(\w+)\[(.+)\](?:\.(\w+))?$`)
@@ -106,7 +108,7 @@ func applyAdd(user *model.ScimUser, path string, value any) error {
 	if lower == "name" {
 		return setNameAttribute(user, value)
 	}
-	if strings.HasPrefix(lower, enterpriseSchemaURN) || isEnterpriseAttr(path) {
+	if strings.EqualFold(path, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(path) {
 		return setEnterpriseAttribute(user, path, value)
 	}
 	if strings.Contains(path, ".") {
@@ -130,7 +132,7 @@ func applyReplace(user *model.ScimUser, path string, value any) error {
 	if lower == "name" {
 		return setNameAttribute(user, value)
 	}
-	if strings.HasPrefix(lower, enterpriseSchemaURN) || isEnterpriseAttr(path) {
+	if strings.EqualFold(path, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(path) {
 		return setEnterpriseAttribute(user, path, value)
 	}
 	if strings.Contains(path, ".") {
@@ -154,7 +156,7 @@ func applyRemove(user *model.ScimUser, path string, _ any) error {
 	if lower == "name" {
 		return setNameAttribute(user, nil)
 	}
-	if strings.HasPrefix(lower, enterpriseSchemaURN) || isEnterpriseAttr(path) {
+	if strings.EqualFold(path, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(path) {
 		return clearEnterpriseAttribute(user, path)
 	}
 	if strings.Contains(path, ".") {
@@ -176,9 +178,16 @@ func isEnterpriseAttr(path string) bool {
 }
 
 func setSingleAttribute(user *model.ScimUser, path string, value any) error {
-	s := toStringPtr(value)
-	switch strings.ToLower(path) {
+	lower := strings.ToLower(path)
+	if readOnlyAttrs[lower] || strings.HasPrefix(lower, "meta.") {
+		return NewScimError(400, "mutability", "Attribute '"+path+"' is read-only")
+	}
+	switch lower {
 	case "username":
+		s, err := parseStrictStringPtr(value, "userName")
+		if err != nil {
+			return err
+		}
 		if s == nil {
 			return NewScimError(400, "invalidValue", "userName cannot be null")
 		}
@@ -190,32 +199,79 @@ func setSingleAttribute(user *model.ScimUser, path string, value any) error {
 		}
 		user.UserName = *s
 	case "externalid":
+		s, err := parseStrictStringPtr(value, "externalId")
+		if err != nil {
+			return err
+		}
 		user.ExternalID = s
 	case "displayname":
+		s, err := parseStrictStringPtr(value, "displayName")
+		if err != nil {
+			return err
+		}
 		user.DisplayName = s
 	case "nickname":
+		s, err := parseStrictStringPtr(value, "nickName")
+		if err != nil {
+			return err
+		}
 		user.NickName = s
 	case "profileurl":
-		if s != nil {
+		s, err := parseStrictStringPtr(value, "profileUrl")
+		if err != nil {
+			return err
+		}
+		if s != nil && *s != "" {
 			if err := validateReference(*s); err != nil {
 				return err
 			}
 		}
 		user.ProfileUrl = s
 	case "title":
+		s, err := parseStrictStringPtr(value, "title")
+		if err != nil {
+			return err
+		}
 		user.Title = s
 	case "usertype":
+		s, err := parseStrictStringPtr(value, "userType")
+		if err != nil {
+			return err
+		}
 		user.UserType = s
 	case "preferredlanguage":
+		s, err := parseStrictStringPtr(value, "preferredLanguage")
+		if err != nil {
+			return err
+		}
 		user.PreferredLanguage = s
 	case "locale":
+		s, err := parseStrictStringPtr(value, "locale")
+		if err != nil {
+			return err
+		}
 		user.Locale = s
 	case "timezone":
+		s, err := parseStrictStringPtr(value, "timezone")
+		if err != nil {
+			return err
+		}
 		user.Timezone = s
 	case "active":
-		user.Active = toBool(value)
+		b, err := parseStrictBool(value, "active")
+		if err != nil {
+			return err
+		}
+		user.Active = b
 	case "password":
-		pw, err := HashPassword(s)
+		rawPw, err := parseRawStringPtr(value, "password")
+		if err != nil {
+			return err
+		}
+		if user.Password != nil && rawPw != nil && *rawPw != "" && bcrypt.CompareHashAndPassword([]byte(*user.Password), []byte(*rawPw)) == nil {
+			return nil
+		}
+		pw, err := HashPassword(rawPw)
 		if err != nil {
 			return err
 		}
@@ -234,11 +290,17 @@ func setSubAttribute(user *model.ScimUser, path string, value any) error {
 	parent := strings.ToLower(parts[0])
 	sub := strings.ToLower(parts[1])
 
+	if parent == "meta" {
+		return NewScimError(400, "mutability", "Attribute '"+path+"' is read-only")
+	}
 	if parent != "name" {
 		return NewScimError(400, "invalidPath", "Unknown complex attribute: "+parts[0])
 	}
 
-	s := toStringPtr(value)
+	s, err := parseStrictStringPtr(value, path)
+	if err != nil {
+		return err
+	}
 	switch sub {
 	case "formatted":
 		user.NameFormatted = s
@@ -273,7 +335,10 @@ func setNameAttribute(user *model.ScimUser, value any) error {
 		return NewScimError(400, "invalidValue", "Attribute 'name' must be an object")
 	}
 	for subAttr, subVal := range m {
-		s := toStringPtr(subVal)
+		s, err := parseStrictStringPtr(subVal, "name."+subAttr)
+		if err != nil {
+			return err
+		}
 		switch strings.ToLower(subAttr) {
 		case "formatted":
 			user.NameFormatted = s
@@ -296,32 +361,68 @@ func setNameAttribute(user *model.ScimUser, value any) error {
 
 func setEnterpriseAttribute(user *model.ScimUser, path string, value any) error {
 	attr := path
-	if strings.HasPrefix(path, enterpriseSchemaURN+":") {
+	lowerPath := strings.ToLower(path)
+	lowerEnt := strings.ToLower(enterpriseSchemaURN)
+	if strings.HasPrefix(lowerPath, lowerEnt+":") {
 		attr = path[len(enterpriseSchemaURN)+1:]
-	} else if path == enterpriseSchemaURN {
+	} else if lowerPath == lowerEnt {
 		return applyEnterpriseValueMap(user, value)
 	}
 
-	s := toStringPtr(value)
 	switch strings.ToLower(attr) {
 	case "employeenumber":
+		s, err := parseStrictStringPtr(value, "employeeNumber")
+		if err != nil {
+			return err
+		}
 		user.EnterpriseEmployeeNumber = s
 	case "costcenter":
+		s, err := parseStrictStringPtr(value, "costCenter")
+		if err != nil {
+			return err
+		}
 		user.EnterpriseCostCenter = s
 	case "organization":
+		s, err := parseStrictStringPtr(value, "organization")
+		if err != nil {
+			return err
+		}
 		user.EnterpriseOrganization = s
 	case "division":
+		s, err := parseStrictStringPtr(value, "division")
+		if err != nil {
+			return err
+		}
 		user.EnterpriseDivision = s
 	case "department":
+		s, err := parseStrictStringPtr(value, "department")
+		if err != nil {
+			return err
+		}
 		user.EnterpriseDepartment = s
 	case "manager":
 		return setEnterpriseManager(user, value)
 	case "manager.value":
+		s, err := parseStrictStringPtr(value, "manager.value")
+		if err != nil {
+			return err
+		}
 		user.EnterpriseManagerValue = s
+		user.EnterpriseManagerDisplay = nil
 	case "manager.$ref":
+		s, err := parseStrictStringPtr(value, "manager.$ref")
+		if err != nil {
+			return err
+		}
 		user.EnterpriseManagerRef = s
+		if s != nil && strings.TrimSpace(*s) != "" {
+			if refUUID := ExtractUUIDFromRef(*s); refUUID != "" {
+				user.EnterpriseManagerValue = &refUUID
+				user.EnterpriseManagerDisplay = nil
+			}
+		}
 	case "manager.displayname":
-		user.EnterpriseManagerDisplay = s
+		return NewScimError(400, "mutability", "Attribute 'manager.displayName' is readOnly and cannot be modified")
 	default:
 		return NewScimError(400, "invalidPath", "Unknown enterprise attribute: "+attr)
 	}
@@ -337,25 +438,58 @@ func setEnterpriseManager(user *model.ScimUser, value any) error {
 	}
 	switch v := value.(type) {
 	case string:
-		user.EnterpriseManagerValue = &v
+		normStr := NormalizeNFC(v)
+		user.EnterpriseManagerValue = &normStr
+		user.EnterpriseManagerDisplay = nil
 	case map[string]any:
+		var parsedVal *string
+		valProvided := false
 		if val, ok := v["value"]; ok {
-			user.EnterpriseManagerValue = toStringPtr(val)
+			valProvided = true
+			s, err := parseStrictStringPtr(val, "manager.value")
+			if err != nil {
+				return err
+			}
+			parsedVal = s
+			user.EnterpriseManagerValue = s
 		}
 		if ref, ok := v["$ref"]; ok {
-			user.EnterpriseManagerRef = toStringPtr(ref)
+			s, err := parseStrictStringPtr(ref, "manager.$ref")
+			if err != nil {
+				return err
+			}
+			user.EnterpriseManagerRef = s
+			if s != nil && strings.TrimSpace(*s) != "" {
+				refUUID := ExtractUUIDFromRef(*s)
+				if valProvided && parsedVal != nil && strings.TrimSpace(*parsedVal) != "" {
+					if refUUID != "" && !strings.EqualFold(refUUID, strings.TrimSpace(*parsedVal)) {
+						return NewScimError(400, "invalidValue", "manager.value and manager.$ref refer to different resource IDs")
+					}
+				} else if refUUID != "" && (!valProvided || parsedVal == nil || strings.TrimSpace(*parsedVal) == "") {
+					user.EnterpriseManagerValue = &refUUID
+				}
+			}
 		}
-		if disp, ok := v["displayName"]; ok {
-			user.EnterpriseManagerDisplay = toStringPtr(disp)
-		}
+		// RFC 7643 §4.3: manager.displayName is readOnly; ignore client-supplied values in manager object.
+		user.EnterpriseManagerDisplay = nil
 	default:
-		s := fmt.Sprintf("%v", value)
-		user.EnterpriseManagerValue = &s
+		return NewScimError(400, "invalidValue", "Attribute 'manager' must be an object or string")
 	}
 	return nil
 }
 
 func applyEnterpriseValueMap(user *model.ScimUser, value any) error {
+	if value == nil {
+		user.EnterpriseEmployeeNumber = nil
+		user.EnterpriseCostCenter = nil
+		user.EnterpriseOrganization = nil
+		user.EnterpriseDivision = nil
+		user.EnterpriseDepartment = nil
+		user.EnterpriseManagerValue = nil
+		user.EnterpriseManagerRef = nil
+		user.EnterpriseManagerDisplay = nil
+		return nil
+	}
 	m, ok := value.(map[string]any)
 	if !ok {
 		return NewScimError(400, "invalidValue", "Enterprise extension value must be an object")
@@ -370,9 +504,11 @@ func applyEnterpriseValueMap(user *model.ScimUser, value any) error {
 
 func clearEnterpriseAttribute(user *model.ScimUser, path string) error {
 	attr := path
-	if strings.HasPrefix(path, enterpriseSchemaURN+":") {
+	lowerPath := strings.ToLower(path)
+	lowerEnt := strings.ToLower(enterpriseSchemaURN)
+	if strings.HasPrefix(lowerPath, lowerEnt+":") {
 		attr = path[len(enterpriseSchemaURN)+1:]
-	} else if strings.EqualFold(path, enterpriseSchemaURN) {
+	} else if lowerPath == lowerEnt {
 		user.EnterpriseEmployeeNumber = nil
 		user.EnterpriseCostCenter = nil
 		user.EnterpriseOrganization = nil
@@ -394,11 +530,14 @@ func applyValueMap(user *model.ScimUser, value any, isReplace bool) error {
 	for k, v := range m {
 		key := stripPatchURNPrefix(k)
 		lower := strings.ToLower(key)
+		if readOnlyAttrs[lower] || strings.HasPrefix(lower, "meta.") {
+			return NewScimError(400, "mutability", "Attribute '"+k+"' is read-only")
+		}
 		if lower == "name" {
 			if err := setNameAttribute(user, v); err != nil {
 				return err
 			}
-		} else if key == enterpriseSchemaURN || strings.HasPrefix(key, enterpriseSchemaURN) || isEnterpriseAttr(key) {
+		} else if strings.EqualFold(key, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(key) {
 			if err := setEnterpriseAttribute(user, key, v); err != nil {
 				return err
 			}
@@ -430,10 +569,16 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 	if err != nil {
 		return err
 	}
+	if err := ValidateSinglePrimary(items); err != nil {
+		return err
+	}
 	switch attr {
 	case "emails":
 		for _, item := range items {
-			built := buildEmail(item)
+			built, err := buildEmail(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.Emails {
 					user.Emails[i].PrimaryFlag = false
@@ -444,7 +589,10 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 		user.Emails = DeduplicateEmails(user.Emails)
 	case "phonenumbers":
 		for _, item := range items {
-			built := buildPhoneNumber(item)
+			built, err := buildPhoneNumber(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.PhoneNumbers {
 					user.PhoneNumbers[i].PrimaryFlag = false
@@ -452,9 +600,13 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 			}
 			user.PhoneNumbers = append(user.PhoneNumbers, built)
 		}
+		user.PhoneNumbers = DeduplicatePhoneNumbers(user.PhoneNumbers)
 	case "addresses":
 		for _, item := range items {
-			built := buildAddress(item)
+			built, err := buildAddress(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.Addresses {
 					user.Addresses[i].PrimaryFlag = false
@@ -462,9 +614,13 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 			}
 			user.Addresses = append(user.Addresses, built)
 		}
+		user.Addresses = DeduplicateAddresses(user.Addresses)
 	case "ims":
 		for _, item := range items {
-			built := buildIm(item)
+			built, err := buildIm(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.Ims {
 					user.Ims[i].PrimaryFlag = false
@@ -472,9 +628,13 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 			}
 			user.Ims = append(user.Ims, built)
 		}
+		user.Ims = DeduplicateIms(user.Ims)
 	case "photos":
 		for _, item := range items {
-			built := buildPhoto(item)
+			built, err := buildPhoto(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.Photos {
 					user.Photos[i].PrimaryFlag = false
@@ -482,9 +642,13 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 			}
 			user.Photos = append(user.Photos, built)
 		}
+		user.Photos = DeduplicatePhotos(user.Photos)
 	case "entitlements":
 		for _, item := range items {
-			built := buildEntitlement(item)
+			built, err := buildEntitlement(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.Entitlements {
 					user.Entitlements[i].PrimaryFlag = false
@@ -492,9 +656,13 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 			}
 			user.Entitlements = append(user.Entitlements, built)
 		}
+		user.Entitlements = DeduplicateEntitlements(user.Entitlements)
 	case "roles":
 		for _, item := range items {
-			built := buildRole(item)
+			built, err := buildRole(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.Roles {
 					user.Roles[i].PrimaryFlag = false
@@ -502,9 +670,13 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 			}
 			user.Roles = append(user.Roles, built)
 		}
+		user.Roles = DeduplicateRoles(user.Roles)
 	case "x509certificates":
 		for _, item := range items {
-			built := buildX509Certificate(item)
+			built, err := buildX509Certificate(item)
+			if err != nil {
+				return err
+			}
 			if built.PrimaryFlag {
 				for i := range user.X509Certificates {
 					user.X509Certificates[i].PrimaryFlag = false
@@ -512,12 +684,15 @@ func addToMultiValued(user *model.ScimUser, attr string, value any) error {
 			}
 			user.X509Certificates = append(user.X509Certificates, built)
 		}
+		user.X509Certificates = DeduplicateX509Certificates(user.X509Certificates)
 	}
 	return nil
 }
 
 func replaceMultiValued(user *model.ScimUser, attr string, value any) error {
-	clearAttribute(user, attr)
+	if err := clearAttribute(user, attr); err != nil {
+		return err
+	}
 	if value == nil {
 		return nil
 	}
@@ -548,8 +723,160 @@ func DeduplicateEmails(emails []model.ScimUserEmail) []model.ScimUserEmail {
 	return result
 }
 
+func DeduplicatePhoneNumbers(phones []model.ScimUserPhoneNumber) []model.ScimUserPhoneNumber {
+	if len(phones) <= 1 {
+		return phones
+	}
+	result := make([]model.ScimUserPhoneNumber, 0, len(phones))
+	seen := make(map[string]int)
+	for _, p := range phones {
+		key := strings.ToLower(strings.TrimSpace(p.Type)) + "\x00" + strings.ToLower(strings.TrimSpace(p.Value))
+		if idx, found := seen[key]; found {
+			if p.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, p)
+	}
+	return result
+}
+
+func DeduplicateIms(ims []model.ScimUserIm) []model.ScimUserIm {
+	if len(ims) <= 1 {
+		return ims
+	}
+	result := make([]model.ScimUserIm, 0, len(ims))
+	seen := make(map[string]int)
+	for _, im := range ims {
+		key := strings.ToLower(strings.TrimSpace(im.Type)) + "\x00" + strings.ToLower(strings.TrimSpace(im.Value))
+		if idx, found := seen[key]; found {
+			if im.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, im)
+	}
+	return result
+}
+
+func DeduplicatePhotos(photos []model.ScimUserPhoto) []model.ScimUserPhoto {
+	if len(photos) <= 1 {
+		return photos
+	}
+	result := make([]model.ScimUserPhoto, 0, len(photos))
+	seen := make(map[string]int)
+	for _, p := range photos {
+		key := strings.ToLower(strings.TrimSpace(p.Type)) + "\x00" + strings.TrimSpace(p.Value)
+		if idx, found := seen[key]; found {
+			if p.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, p)
+	}
+	return result
+}
+
+func DeduplicateEntitlements(ents []model.ScimUserEntitlement) []model.ScimUserEntitlement {
+	if len(ents) <= 1 {
+		return ents
+	}
+	result := make([]model.ScimUserEntitlement, 0, len(ents))
+	seen := make(map[string]int)
+	for _, e := range ents {
+		key := strings.ToLower(strings.TrimSpace(e.Type)) + "\x00" + strings.ToLower(strings.TrimSpace(e.Value))
+		if idx, found := seen[key]; found {
+			if e.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, e)
+	}
+	return result
+}
+
+func DeduplicateRoles(roles []model.ScimUserRole) []model.ScimUserRole {
+	if len(roles) <= 1 {
+		return roles
+	}
+	result := make([]model.ScimUserRole, 0, len(roles))
+	seen := make(map[string]int)
+	for _, r := range roles {
+		key := strings.ToLower(strings.TrimSpace(r.Type)) + "\x00" + strings.ToLower(strings.TrimSpace(r.Value))
+		if idx, found := seen[key]; found {
+			if r.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, r)
+	}
+	return result
+}
+
+func DeduplicateX509Certificates(certs []model.ScimUserX509Certificate) []model.ScimUserX509Certificate {
+	if len(certs) <= 1 {
+		return certs
+	}
+	result := make([]model.ScimUserX509Certificate, 0, len(certs))
+	seen := make(map[string]int)
+	for _, c := range certs {
+		key := strings.ToLower(strings.TrimSpace(c.Type)) + "\x00" + strings.TrimSpace(c.Value)
+		if idx, found := seen[key]; found {
+			if c.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, c)
+	}
+	return result
+}
+
+func DeduplicateAddresses(addrs []model.ScimUserAddress) []model.ScimUserAddress {
+	if len(addrs) <= 1 {
+		return addrs
+	}
+	result := make([]model.ScimUserAddress, 0, len(addrs))
+	seen := make(map[string]int)
+	for _, a := range addrs {
+		key := strings.Join([]string{
+			strings.ToLower(strings.TrimSpace(a.Type)),
+			strings.ToLower(strings.TrimSpace(a.Formatted)),
+			strings.ToLower(strings.TrimSpace(a.StreetAddress)),
+			strings.ToLower(strings.TrimSpace(a.Locality)),
+			strings.ToLower(strings.TrimSpace(a.Region)),
+			strings.ToLower(strings.TrimSpace(a.PostalCode)),
+			strings.ToLower(strings.TrimSpace(a.Country)),
+		}, "\x00")
+		if idx, found := seen[key]; found {
+			if a.PrimaryFlag {
+				result[idx].PrimaryFlag = true
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, a)
+	}
+	return result
+}
+
 func clearAttribute(user *model.ScimUser, attr string) error {
 	switch strings.ToLower(attr) {
+	case "username":
+		return NewScimError(400, "mutability", "Required attribute 'userName' cannot be removed")
+	case "id", "meta", "groups":
+		return NewScimError(400, "mutability", "Attribute '"+attr+"' is read-only and cannot be removed")
 	case "name":
 		return setNameAttribute(user, nil)
 	case "externalid":
@@ -638,13 +965,16 @@ func applyFilteredRemove(user *model.ScimUser, collection, filterExpr string) er
 
 func setsPrimaryTrue(subAttr string, value any) bool {
 	if strings.EqualFold(subAttr, "primary") {
-		return toBool(value)
+		b, ok := value.(bool)
+		return ok && b
 	}
 	if subAttr == "" {
 		if m, ok := value.(map[string]any); ok {
 			for k, v := range m {
-				if strings.EqualFold(k, "primary") && toBool(v) {
-					return true
+				if strings.EqualFold(k, "primary") {
+					if b, ok := v.(bool); ok && b {
+						return true
+					}
 				}
 			}
 		}
@@ -664,7 +994,9 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 	case "emails":
 		for i := range user.Emails {
 			if matchesEmailFilter(&user.Emails[i], filterExpr) {
-				setEmailSubAttribute(&user.Emails[i], subAttr, value)
+				if err := setEmailSubAttribute(&user.Emails[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.Emails {
 						if j != i {
@@ -681,7 +1013,9 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 	case "phonenumbers":
 		for i := range user.PhoneNumbers {
 			if matchesPhoneFilter(&user.PhoneNumbers[i], filterExpr) {
-				setPhoneSubAttribute(&user.PhoneNumbers[i], subAttr, value)
+				if err := setPhoneSubAttribute(&user.PhoneNumbers[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.PhoneNumbers {
 						if j != i {
@@ -692,10 +1026,15 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 				found = true
 			}
 		}
+		if found {
+			user.PhoneNumbers = DeduplicatePhoneNumbers(user.PhoneNumbers)
+		}
 	case "addresses":
 		for i := range user.Addresses {
 			if matchesAddressFilter(&user.Addresses[i], filterExpr) {
-				setAddressSubAttribute(&user.Addresses[i], subAttr, value)
+				if err := setAddressSubAttribute(&user.Addresses[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.Addresses {
 						if j != i {
@@ -706,10 +1045,15 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 				found = true
 			}
 		}
+		if found {
+			user.Addresses = DeduplicateAddresses(user.Addresses)
+		}
 	case "ims":
 		for i := range user.Ims {
 			if matchesImFilter(&user.Ims[i], filterExpr) {
-				setImSubAttribute(&user.Ims[i], subAttr, value)
+				if err := setImSubAttribute(&user.Ims[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.Ims {
 						if j != i {
@@ -720,10 +1064,15 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 				found = true
 			}
 		}
+		if found {
+			user.Ims = DeduplicateIms(user.Ims)
+		}
 	case "photos":
 		for i := range user.Photos {
 			if matchesPhotoFilter(&user.Photos[i], filterExpr) {
-				setPhotoSubAttribute(&user.Photos[i], subAttr, value)
+				if err := setPhotoSubAttribute(&user.Photos[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.Photos {
 						if j != i {
@@ -734,10 +1083,15 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 				found = true
 			}
 		}
+		if found {
+			user.Photos = DeduplicatePhotos(user.Photos)
+		}
 	case "entitlements":
 		for i := range user.Entitlements {
 			if matchesEntitlementFilter(&user.Entitlements[i], filterExpr) {
-				setEntitlementSubAttribute(&user.Entitlements[i], subAttr, value)
+				if err := setEntitlementSubAttribute(&user.Entitlements[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.Entitlements {
 						if j != i {
@@ -748,10 +1102,15 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 				found = true
 			}
 		}
+		if found {
+			user.Entitlements = DeduplicateEntitlements(user.Entitlements)
+		}
 	case "roles":
 		for i := range user.Roles {
 			if matchesRoleFilter(&user.Roles[i], filterExpr) {
-				setRoleSubAttribute(&user.Roles[i], subAttr, value)
+				if err := setRoleSubAttribute(&user.Roles[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.Roles {
 						if j != i {
@@ -762,10 +1121,15 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 				found = true
 			}
 		}
+		if found {
+			user.Roles = DeduplicateRoles(user.Roles)
+		}
 	case "x509certificates":
 		for i := range user.X509Certificates {
 			if matchesCertFilter(&user.X509Certificates[i], filterExpr) {
-				setCertSubAttribute(&user.X509Certificates[i], subAttr, value)
+				if err := setCertSubAttribute(&user.X509Certificates[i], subAttr, value); err != nil {
+					return err
+				}
 				if demoteOthers {
 					for j := range user.X509Certificates {
 						if j != i {
@@ -776,6 +1140,11 @@ func applyFilteredUpdate(user *model.ScimUser, collection, filterExpr, subAttr s
 				found = true
 			}
 		}
+		if found {
+			user.X509Certificates = DeduplicateX509Certificates(user.X509Certificates)
+		}
+	default:
+		return NewScimError(400, "invalidPath", "Unknown collection: "+collection)
 	}
 
 	if !found {
@@ -797,7 +1166,7 @@ func parseEqFilter(expr string) *filterClause {
 	if m == nil {
 		return nil
 	}
-	return &filterClause{attr: strings.ToLower(m[1]), value: m[2]}
+	return &filterClause{attr: strings.ToLower(m[1]), value: NormalizeNFC(m[2])}
 }
 
 func matchesGenericFilter(filterExpr string, value, typ, display string, primary bool) bool {
@@ -884,216 +1253,452 @@ func removeMatching[T any](items []T, filterExpr string, matchFn func(*T, string
 
 // Sub-attribute setters
 
-func setEmailSubAttribute(e *model.ScimUserEmail, subAttr string, value any) {
+func setEmailSubAttribute(e *model.ScimUserEmail, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setEmailSubAttribute(e, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for emails item")
+		}
+		for k, v := range m {
+			if err := setEmailSubAttribute(e, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
-		e.Value = s
+		s, err := parseStrictString(value, "emails.value")
+		if err != nil {
+			return err
+		}
+		e.Value = CanonicalizeEmail(s)
 	case "type":
-		e.Type = normalizeCanonical(s, emailTypes)
+		s, err := parseStrictString(value, "emails.type")
+		if err != nil {
+			return err
+		}
+		ct := normalizeCanonical(strings.TrimSpace(s), emailTypes)
+		if ct == "" {
+			ct = "work"
+		}
+		e.Type = ct
 	case "display":
+		s, err := parseStrictString(value, "emails.display")
+		if err != nil {
+			return err
+		}
 		e.Display = s
 	case "primary":
-		e.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "emails.primary")
+		if err != nil {
+			return err
+		}
+		e.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown emails sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
-func setPhoneSubAttribute(p *model.ScimUserPhoneNumber, subAttr string, value any) {
+func setPhoneSubAttribute(p *model.ScimUserPhoneNumber, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setPhoneSubAttribute(p, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for phoneNumbers item")
+		}
+		for k, v := range m {
+			if err := setPhoneSubAttribute(p, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
-		p.Value = s
+		s, err := parseStrictString(value, "phoneNumbers.value")
+		if err != nil {
+			return err
+		}
+		p.Value = CanonicalizePhoneNumber(s)
 	case "type":
+		s, err := parseStrictString(value, "phoneNumbers.type")
+		if err != nil {
+			return err
+		}
 		p.Type = normalizeCanonical(s, phoneTypes)
 	case "display":
+		s, err := parseStrictString(value, "phoneNumbers.display")
+		if err != nil {
+			return err
+		}
 		p.Display = s
 	case "primary":
-		p.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "phoneNumbers.primary")
+		if err != nil {
+			return err
+		}
+		p.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown phoneNumbers sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
-func setAddressSubAttribute(a *model.ScimUserAddress, subAttr string, value any) {
+func setAddressSubAttribute(a *model.ScimUserAddress, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setAddressSubAttribute(a, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for addresses item")
+		}
+		for k, v := range m {
+			if err := setAddressSubAttribute(a, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "formatted":
+		s, err := parseStrictString(value, "addresses.formatted")
+		if err != nil {
+			return err
+		}
 		a.Formatted = s
 	case "streetaddress":
+		s, err := parseStrictString(value, "addresses.streetAddress")
+		if err != nil {
+			return err
+		}
 		a.StreetAddress = s
 	case "locality":
+		s, err := parseStrictString(value, "addresses.locality")
+		if err != nil {
+			return err
+		}
 		a.Locality = s
 	case "region":
+		s, err := parseStrictString(value, "addresses.region")
+		if err != nil {
+			return err
+		}
 		a.Region = s
 	case "postalcode":
+		s, err := parseStrictString(value, "addresses.postalCode")
+		if err != nil {
+			return err
+		}
 		a.PostalCode = s
 	case "country":
+		s, err := parseStrictString(value, "addresses.country")
+		if err != nil {
+			return err
+		}
 		a.Country = normalizeCountry(s)
 	case "type":
+		s, err := parseStrictString(value, "addresses.type")
+		if err != nil {
+			return err
+		}
 		a.Type = normalizeCanonical(s, addressTypes)
 	case "primary":
-		a.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "addresses.primary")
+		if err != nil {
+			return err
+		}
+		a.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown addresses sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
-func setImSubAttribute(im *model.ScimUserIm, subAttr string, value any) {
+func setImSubAttribute(im *model.ScimUserIm, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setImSubAttribute(im, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for ims item")
+		}
+		for k, v := range m {
+			if err := setImSubAttribute(im, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
-		im.Value = s
+		s, err := parseStrictString(value, "ims.value")
+		if err != nil {
+			return err
+		}
+		im.Value = CanonicalizeIM(s)
 	case "type":
+		s, err := parseStrictString(value, "ims.type")
+		if err != nil {
+			return err
+		}
 		im.Type = normalizeCanonical(s, imTypes)
 	case "display":
+		s, err := parseStrictString(value, "ims.display")
+		if err != nil {
+			return err
+		}
 		im.Display = s
 	case "primary":
-		im.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "ims.primary")
+		if err != nil {
+			return err
+		}
+		im.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown ims sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
-func setPhotoSubAttribute(p *model.ScimUserPhoto, subAttr string, value any) {
+func setPhotoSubAttribute(p *model.ScimUserPhoto, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setPhotoSubAttribute(p, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for photos item")
+		}
+		for k, v := range m {
+			if err := setPhotoSubAttribute(p, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
+		s, err := parseStrictString(value, "photos.value")
+		if err != nil {
+			return err
+		}
 		if s != "" {
 			if err := validateReference(s); err != nil {
-				return
+				return err
 			}
 		}
 		p.Value = s
 	case "type":
+		s, err := parseStrictString(value, "photos.type")
+		if err != nil {
+			return err
+		}
 		p.Type = normalizeCanonical(s, photoTypes)
 	case "display":
+		s, err := parseStrictString(value, "photos.display")
+		if err != nil {
+			return err
+		}
 		p.Display = s
 	case "primary":
-		p.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "photos.primary")
+		if err != nil {
+			return err
+		}
+		p.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown photos sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
-func setEntitlementSubAttribute(e *model.ScimUserEntitlement, subAttr string, value any) {
+func setEntitlementSubAttribute(e *model.ScimUserEntitlement, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setEntitlementSubAttribute(e, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for entitlements item")
+		}
+		for k, v := range m {
+			if err := setEntitlementSubAttribute(e, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
+		s, err := parseStrictString(value, "entitlements.value")
+		if err != nil {
+			return err
+		}
 		e.Value = s
 	case "type":
+		s, err := parseStrictString(value, "entitlements.type")
+		if err != nil {
+			return err
+		}
 		e.Type = s
 	case "display":
+		s, err := parseStrictString(value, "entitlements.display")
+		if err != nil {
+			return err
+		}
 		e.Display = s
 	case "primary":
-		e.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "entitlements.primary")
+		if err != nil {
+			return err
+		}
+		e.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown entitlements sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
-func setRoleSubAttribute(r *model.ScimUserRole, subAttr string, value any) {
+func setRoleSubAttribute(r *model.ScimUserRole, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setRoleSubAttribute(r, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for roles item")
+		}
+		for k, v := range m {
+			if err := setRoleSubAttribute(r, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
+		s, err := parseStrictString(value, "roles.value")
+		if err != nil {
+			return err
+		}
 		r.Value = s
 	case "type":
+		s, err := parseStrictString(value, "roles.type")
+		if err != nil {
+			return err
+		}
 		r.Type = s
 	case "display":
+		s, err := parseStrictString(value, "roles.display")
+		if err != nil {
+			return err
+		}
 		r.Display = s
 	case "primary":
-		r.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "roles.primary")
+		if err != nil {
+			return err
+		}
+		r.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown roles sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
-func setCertSubAttribute(c *model.ScimUserX509Certificate, subAttr string, value any) {
+func setCertSubAttribute(c *model.ScimUserX509Certificate, subAttr string, value any) error {
 	if subAttr == "" {
-		if m, ok := value.(map[string]any); ok {
-			for k, v := range m {
-				setCertSubAttribute(c, k, v)
+		m, ok := value.(map[string]any)
+		if !ok {
+			return NewScimError(400, "invalidValue", "Expected object value for x509Certificates item")
+		}
+		for k, v := range m {
+			if err := setCertSubAttribute(c, k, v); err != nil {
+				return err
 			}
 		}
-		return
+		return nil
 	}
-	s := toStr(value)
 	switch strings.ToLower(subAttr) {
 	case "value":
-		if s != "" {
-			validateBinary(s)
+		rawPtr, err := parseRawStringPtr(value, "x509Certificates.value")
+		if err != nil {
+			return err
 		}
-		c.Value = s
+		rawStr := ""
+		if rawPtr != nil {
+			rawStr = *rawPtr
+		}
+		if err := ValidateX509CertificateValue(rawStr); err != nil {
+			return err
+		}
+		c.Value = rawStr
 	case "type":
+		s, err := parseStrictString(value, "x509Certificates.type")
+		if err != nil {
+			return err
+		}
 		c.Type = s
 	case "display":
+		s, err := parseStrictString(value, "x509Certificates.display")
+		if err != nil {
+			return err
+		}
 		c.Display = s
 	case "primary":
-		c.PrimaryFlag = toBool(value)
+		b, err := parseStrictBool(value, "x509Certificates.primary")
+		if err != nil {
+			return err
+		}
+		c.PrimaryFlag = b
+	default:
+		return NewScimError(400, "invalidPath", "Unknown x509Certificates sub-attribute: "+subAttr)
 	}
+	return nil
 }
 
 // Builders
 
-func buildEmail(m map[string]any) model.ScimUserEmail {
-	return model.ScimUserEmail{
-		Value:       toStr(m["value"]),
-		Type:        normalizeCanonical(toStr(m["type"]), emailTypes),
-		Display:     toStr(m["display"]),
-		PrimaryFlag: toBool(m["primary"]),
+func buildEmail(m map[string]any) (model.ScimUserEmail, error) {
+	val, err := parseStrictString(m["value"], "emails.value")
+	if err != nil {
+		return model.ScimUserEmail{}, err
 	}
+	rawType, err := parseStrictString(m["type"], "emails.type")
+	if err != nil {
+		return model.ScimUserEmail{}, err
+	}
+	disp, err := parseStrictString(m["display"], "emails.display")
+	if err != nil {
+		return model.ScimUserEmail{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "emails.primary")
+	if err != nil {
+		return model.ScimUserEmail{}, err
+	}
+	emailType := normalizeCanonical(strings.TrimSpace(rawType), emailTypes)
+	if emailType == "" {
+		emailType = "work"
+	}
+	return model.ScimUserEmail{
+		Value:       CanonicalizeEmail(val),
+		Type:        emailType,
+		Display:     disp,
+		PrimaryFlag: prim,
+	}, nil
 }
 
-func buildPhoneNumber(m map[string]any) model.ScimUserPhoneNumber {
-	return model.ScimUserPhoneNumber{
-		Value:       toStr(m["value"]),
-		Type:        normalizeCanonical(toStr(m["type"]), phoneTypes),
-		Display:     toStr(m["display"]),
-		PrimaryFlag: toBool(m["primary"]),
+func buildPhoneNumber(m map[string]any) (model.ScimUserPhoneNumber, error) {
+	val, err := parseStrictString(m["value"], "phoneNumbers.value")
+	if err != nil {
+		return model.ScimUserPhoneNumber{}, err
 	}
+	rawType, err := parseStrictString(m["type"], "phoneNumbers.type")
+	if err != nil {
+		return model.ScimUserPhoneNumber{}, err
+	}
+	disp, err := parseStrictString(m["display"], "phoneNumbers.display")
+	if err != nil {
+		return model.ScimUserPhoneNumber{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "phoneNumbers.primary")
+	if err != nil {
+		return model.ScimUserPhoneNumber{}, err
+	}
+	return model.ScimUserPhoneNumber{
+		Value:       CanonicalizePhoneNumber(val),
+		Type:        normalizeCanonical(rawType, phoneTypes),
+		Display:     disp,
+		PrimaryFlag: prim,
+	}, nil
 }
 
 var isoAlpha3ToAlpha2 = map[string]string{
@@ -1119,70 +1724,188 @@ func normalizeCountry(raw string) string {
 	return ""
 }
 
-func buildAddress(m map[string]any) model.ScimUserAddress {
+func buildAddress(m map[string]any) (model.ScimUserAddress, error) {
+	formatted, err := parseStrictString(m["formatted"], "addresses.formatted")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
+	street, err := parseStrictString(m["streetAddress"], "addresses.streetAddress")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
+	locality, err := parseStrictString(m["locality"], "addresses.locality")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
+	region, err := parseStrictString(m["region"], "addresses.region")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
+	postal, err := parseStrictString(m["postalCode"], "addresses.postalCode")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
+	country, err := parseStrictString(m["country"], "addresses.country")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
+	rawType, err := parseStrictString(m["type"], "addresses.type")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "addresses.primary")
+	if err != nil {
+		return model.ScimUserAddress{}, err
+	}
 	return model.ScimUserAddress{
-		Formatted:     toStr(m["formatted"]),
-		StreetAddress: toStr(m["streetAddress"]),
-		Locality:      toStr(m["locality"]),
-		Region:        toStr(m["region"]),
-		PostalCode:    toStr(m["postalCode"]),
-		Country:       normalizeCountry(toStr(m["country"])),
-		Type:          normalizeCanonical(toStr(m["type"]), addressTypes),
-		PrimaryFlag:   toBool(m["primary"]),
-	}
+		Formatted:     formatted,
+		StreetAddress: street,
+		Locality:      locality,
+		Region:        region,
+		PostalCode:    postal,
+		Country:       normalizeCountry(country),
+		Type:          normalizeCanonical(rawType, addressTypes),
+		PrimaryFlag:   prim,
+	}, nil
 }
 
-func buildIm(m map[string]any) model.ScimUserIm {
+func buildIm(m map[string]any) (model.ScimUserIm, error) {
+	val, err := parseStrictString(m["value"], "ims.value")
+	if err != nil {
+		return model.ScimUserIm{}, err
+	}
+	rawType, err := parseStrictString(m["type"], "ims.type")
+	if err != nil {
+		return model.ScimUserIm{}, err
+	}
+	disp, err := parseStrictString(m["display"], "ims.display")
+	if err != nil {
+		return model.ScimUserIm{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "ims.primary")
+	if err != nil {
+		return model.ScimUserIm{}, err
+	}
 	return model.ScimUserIm{
-		Value:       toStr(m["value"]),
-		Type:        normalizeCanonical(toStr(m["type"]), imTypes),
-		Display:     toStr(m["display"]),
-		PrimaryFlag: toBool(m["primary"]),
-	}
+		Value:       CanonicalizeIM(val),
+		Type:        normalizeCanonical(rawType, imTypes),
+		Display:     disp,
+		PrimaryFlag: prim,
+	}, nil
 }
 
-func buildPhoto(m map[string]any) model.ScimUserPhoto {
-	v := toStr(m["value"])
+func buildPhoto(m map[string]any) (model.ScimUserPhoto, error) {
+	v, err := parseStrictString(m["value"], "photos.value")
+	if err != nil {
+		return model.ScimUserPhoto{}, err
+	}
 	if v != "" {
-		validateReference(v)
+		if err := validateReference(v); err != nil {
+			return model.ScimUserPhoto{}, err
+		}
+	}
+	rawType, err := parseStrictString(m["type"], "photos.type")
+	if err != nil {
+		return model.ScimUserPhoto{}, err
+	}
+	disp, err := parseStrictString(m["display"], "photos.display")
+	if err != nil {
+		return model.ScimUserPhoto{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "photos.primary")
+	if err != nil {
+		return model.ScimUserPhoto{}, err
 	}
 	return model.ScimUserPhoto{
 		Value:       v,
-		Type:        normalizeCanonical(toStr(m["type"]), photoTypes),
-		Display:     toStr(m["display"]),
-		PrimaryFlag: toBool(m["primary"]),
-	}
+		Type:        normalizeCanonical(rawType, photoTypes),
+		Display:     disp,
+		PrimaryFlag: prim,
+	}, nil
 }
 
-func buildEntitlement(m map[string]any) model.ScimUserEntitlement {
+func buildEntitlement(m map[string]any) (model.ScimUserEntitlement, error) {
+	val, err := parseStrictString(m["value"], "entitlements.value")
+	if err != nil {
+		return model.ScimUserEntitlement{}, err
+	}
+	rawType, err := parseStrictString(m["type"], "entitlements.type")
+	if err != nil {
+		return model.ScimUserEntitlement{}, err
+	}
+	disp, err := parseStrictString(m["display"], "entitlements.display")
+	if err != nil {
+		return model.ScimUserEntitlement{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "entitlements.primary")
+	if err != nil {
+		return model.ScimUserEntitlement{}, err
+	}
 	return model.ScimUserEntitlement{
-		Value:       toStr(m["value"]),
-		Type:        toStr(m["type"]),
-		Display:     toStr(m["display"]),
-		PrimaryFlag: toBool(m["primary"]),
-	}
+		Value:       val,
+		Type:        rawType,
+		Display:     disp,
+		PrimaryFlag: prim,
+	}, nil
 }
 
-func buildRole(m map[string]any) model.ScimUserRole {
+func buildRole(m map[string]any) (model.ScimUserRole, error) {
+	val, err := parseStrictString(m["value"], "roles.value")
+	if err != nil {
+		return model.ScimUserRole{}, err
+	}
+	rawType, err := parseStrictString(m["type"], "roles.type")
+	if err != nil {
+		return model.ScimUserRole{}, err
+	}
+	disp, err := parseStrictString(m["display"], "roles.display")
+	if err != nil {
+		return model.ScimUserRole{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "roles.primary")
+	if err != nil {
+		return model.ScimUserRole{}, err
+	}
 	return model.ScimUserRole{
-		Value:       toStr(m["value"]),
-		Type:        toStr(m["type"]),
-		Display:     toStr(m["display"]),
-		PrimaryFlag: toBool(m["primary"]),
-	}
+		Value:       val,
+		Type:        rawType,
+		Display:     disp,
+		PrimaryFlag: prim,
+	}, nil
 }
 
-func buildX509Certificate(m map[string]any) model.ScimUserX509Certificate {
-	v := toStr(m["value"])
-	if v != "" {
-		validateBinary(v)
+func buildX509Certificate(m map[string]any) (model.ScimUserX509Certificate, error) {
+	rawPtr, err := parseRawStringPtr(m["value"], "x509Certificates.value")
+	if err != nil {
+		return model.ScimUserX509Certificate{}, err
+	}
+	v := ""
+	if rawPtr != nil {
+		v = *rawPtr
+	}
+	if _, hasVal := m["value"]; hasVal || v != "" {
+		if err := ValidateX509CertificateValue(v); err != nil {
+			return model.ScimUserX509Certificate{}, err
+		}
+	}
+	rawType, err := parseStrictString(m["type"], "x509Certificates.type")
+	if err != nil {
+		return model.ScimUserX509Certificate{}, err
+	}
+	disp, err := parseStrictString(m["display"], "x509Certificates.display")
+	if err != nil {
+		return model.ScimUserX509Certificate{}, err
+	}
+	prim, err := parseStrictOptionalBool(m["primary"], "x509Certificates.primary")
+	if err != nil {
+		return model.ScimUserX509Certificate{}, err
 	}
 	return model.ScimUserX509Certificate{
 		Value:       v,
-		Type:        toStr(m["type"]),
-		Display:     toStr(m["display"]),
-		PrimaryFlag: toBool(m["primary"]),
-	}
+		Type:        rawType,
+		Display:     disp,
+		PrimaryFlag: prim,
+	}, nil
 }
 
 // Helpers
@@ -1192,9 +1915,11 @@ func toItemList(value any) ([]map[string]any, error) {
 	case []any:
 		result := make([]map[string]any, 0, len(v))
 		for _, item := range v {
-			if m, ok := item.(map[string]any); ok {
-				result = append(result, m)
+			m, ok := item.(map[string]any)
+			if !ok {
+				return nil, NewScimError(400, "invalidValue", "Expected object elements in multi-valued attribute array")
 			}
+			result = append(result, m)
 		}
 		return result, nil
 	case []map[string]any:
@@ -1222,9 +1947,11 @@ func validateReference(val string) error {
 	if val == "" {
 		return nil
 	}
-	u, err := url.Parse(val)
-	if err != nil || !u.IsAbs() {
-		return NewScimError(400, "invalidValue", "Invalid reference value (must be absolute URI): "+val)
+	if strings.ContainsAny(val, " \t\r\n") {
+		return NewScimError(400, "invalidValue", "Invalid reference URI (contains whitespace): "+val)
+	}
+	if _, err := url.Parse(val); err != nil {
+		return NewScimError(400, "invalidValue", "Invalid reference URI: "+val)
 	}
 	return nil
 }
@@ -1241,6 +1968,55 @@ func validateBinary(val string) error {
 		}
 	}
 	return nil
+}
+
+func parseStrictBool(value any, attrName string) (bool, error) {
+	b, ok := value.(bool)
+	if !ok {
+		return false, NewScimError(400, "invalidValue", fmt.Sprintf("Attribute '%s' must be a boolean", attrName))
+	}
+	return b, nil
+}
+
+func parseStrictOptionalBool(value any, attrName string) (bool, error) {
+	if value == nil {
+		return false, nil
+	}
+	return parseStrictBool(value, attrName)
+}
+
+func parseStrictStringPtr(value any, attrName string) (*string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	s, ok := value.(string)
+	if !ok {
+		return nil, NewScimError(400, "invalidValue", fmt.Sprintf("Attribute '%s' must be a string", attrName))
+	}
+	normStr := NormalizeNFC(s)
+	return &normStr, nil
+}
+
+func parseRawStringPtr(value any, attrName string) (*string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	s, ok := value.(string)
+	if !ok {
+		return nil, NewScimError(400, "invalidValue", fmt.Sprintf("Attribute '%s' must be a string", attrName))
+	}
+	return &s, nil
+}
+
+func parseStrictString(value any, attrName string) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	s, ok := value.(string)
+	if !ok {
+		return "", NewScimError(400, "invalidValue", fmt.Sprintf("Attribute '%s' must be a string", attrName))
+	}
+	return NormalizeNFC(s), nil
 }
 
 func toStringPtr(value any) *string {

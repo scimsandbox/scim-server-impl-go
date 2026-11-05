@@ -121,8 +121,8 @@ func TestServiceProviderConfig(t *testing.T) {
 	if pagination["index"] != true {
 		t.Fatalf("pagination.index = %v, want true", pagination["index"])
 	}
-	if pagination["defaultPaginationMode"] != "index" {
-		t.Fatalf("pagination.defaultPaginationMode = %v, want index", pagination["defaultPaginationMode"])
+	if pagination["defaultPaginationMethod"] != "index" {
+		t.Fatalf("pagination.defaultPaginationMethod = %v, want index", pagination["defaultPaginationMethod"])
 	}
 	if pagination["cursorTimeout"] != 3600 {
 		t.Fatalf("pagination.cursorTimeout = %v, want 3600", pagination["cursorTimeout"])
@@ -151,7 +151,7 @@ func TestServiceProviderConfig(t *testing.T) {
 		if sa["name"] == "cursorTimeout" {
 			cursorTimeoutAttr = sa
 		}
-		if sa["name"] == "defaultPaginationMode" {
+		if sa["name"] == "defaultPaginationMethod" {
 			modeAttr = sa
 		}
 	}
@@ -162,7 +162,7 @@ func TestServiceProviderConfig(t *testing.T) {
 		t.Fatalf("cursorTimeout type = %v, want integer", cursorTimeoutAttr["type"])
 	}
 	if modeAttr == nil {
-		t.Fatalf("defaultPaginationMode subAttribute not found")
+		t.Fatalf("defaultPaginationMethod subAttribute not found")
 	}
 	canonicalValues, ok := modeAttr["canonicalValues"].([]string)
 	if !ok || len(canonicalValues) != 2 || canonicalValues[0] != "cursor" || canonicalValues[1] != "index" {

@@ -40,6 +40,26 @@ func BearerTokenAuth(tokenRepo tokenFinder, workspaceRepo workspaceFinder) func(
 			}
 
 			authHeader := r.Header.Get("Authorization")
+			trimmedPath := strings.TrimRight(r.URL.Path, "/")
+			if r.Method == http.MethodGet &&
+				strings.HasSuffix(trimmedPath, "/ServiceProviderConfig") &&
+				strings.TrimSpace(authHeader) == "" {
+				workspaceID, ok := wsID.(uuid.UUID)
+				if !ok {
+					scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Workspace not found"))
+					return
+				}
+				if workspaceRepo != nil {
+					ws, err := workspaceRepo.FindByID(r.Context(), workspaceID)
+					if err != nil || ws == nil {
+						scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Workspace not found"))
+						return
+					}
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 				MarkAuthentication(r, AuthenticationFailed)
 				w.Header().Set("WWW-Authenticate", "Bearer")

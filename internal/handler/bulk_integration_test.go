@@ -188,6 +188,10 @@ func TestBulkStopsAfterConfiguredErrorThreshold(t *testing.T) {
 	}
 }
 
+// Updated per RFC 7644 §3.7.1 (Figure 6):
+// Valid circular bulkId references between groups MUST succeed (201 Created), whereas
+// if one operation in a circular pair fails, Phase 2 rolls back the Phase-1 group so no
+// partial group leaks in the database.
 func TestBulkRollsBackGroupOnCircularBulkIdFailure_BLK23(t *testing.T) {
 	env := setupTestEnv(t)
 
@@ -195,85 +199,150 @@ func TestBulkRollsBackGroupOnCircularBulkIdFailure_BLK23(t *testing.T) {
 	token := generateToken()
 	seedWorkspaceAndToken(t, env.ctx, wsID, token)
 
-	circGroup1 := "circ_g1_" + uuid.New().String()[:8]
-	circGroup2 := "circ_g2_" + uuid.New().String()[:8]
+	t.Run("valid circular bulkId groups succeed per RFC 7644 section 3.7.1", func(t *testing.T) {
+		okGroup1 := "circ_ok_g1_" + uuid.New().String()[:8]
+		okGroup2 := "circ_ok_g2_" + uuid.New().String()[:8]
 
-	bulkBody := fmt.Sprintf(`{
-		"schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
-		"Operations": [
-			{
-				"method": "POST",
-				"path": "/Groups",
-				"bulkId": "circG1",
-				"data": {
-					"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
-					"displayName": "%s",
-					"members": [{"value": "bulkId:circG2", "type": "Group"}]
+		okBody := fmt.Sprintf(`{
+			"schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+			"Operations": [
+				{
+					"method": "POST",
+					"path": "/Groups",
+					"bulkId": "okCircG1",
+					"data": {
+						"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+						"displayName": "%s",
+						"members": [{"value": "bulkId:okCircG2", "type": "Group"}]
+					}
+				},
+				{
+					"method": "POST",
+					"path": "/Groups",
+					"bulkId": "okCircG2",
+					"data": {
+						"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+						"displayName": "%s",
+						"members": [{"value": "bulkId:okCircG1", "type": "Group"}]
+					}
 				}
-			},
-			{
-				"method": "POST",
-				"path": "/Groups",
-				"bulkId": "circG2",
-				"data": {
-					"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
-					"displayName": "%s",
-					"members": [{"value": "bulkId:circG1", "type": "Group"}]
-				}
+			]
+		}`, okGroup1, okGroup2)
+
+		resp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Bulk"), token, okBody)
+		respBody := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, respBody)
+		}
+		var result map[string]any
+		if err := json.Unmarshal([]byte(respBody), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		ops, ok := result["Operations"].([]any)
+		if !ok || len(ops) != 2 {
+			t.Fatalf("expected 2 operations, got %v", ops)
+		}
+		for i, rawOp := range ops {
+			op := rawOp.(map[string]any)
+			if op["status"] != "201" {
+				t.Fatalf("op[%d] expected status 201, got %v (%v)", i, op["status"], op["response"])
 			}
-		]
-	}`, circGroup1, circGroup2)
-
-	resp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Bulk"), token, bulkBody)
-	respBody := readBody(t, resp)
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, respBody)
-	}
-
-	var result map[string]any
-	if err := json.Unmarshal([]byte(respBody), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	ops, ok := result["Operations"].([]any)
-	if !ok || len(ops) != 2 {
-		t.Fatalf("expected 2 operations, got %v", ops)
-	}
-
-	// Both operations should report 400 error due to unresolvable circular bulkId
-	for i, rawOp := range ops {
-		op := rawOp.(map[string]any)
-		if op["status"] != "400" {
-			t.Fatalf("op[%d] expected status 400, got %v", i, op["status"])
+			if op["location"] == nil || op["location"] == "" {
+				t.Fatalf("op[%d] expected location on 201 POST", i)
+			}
 		}
-		if op["location"] != nil {
-			t.Fatalf("failed op[%d] must not return a location: %v", i, op["location"])
-		}
-	}
+	})
 
-	// Verify NO group was persisted in the database (transaction rolled back)
-	checkResp := doRequest(t, http.MethodGet, scimURL(env.server.URL, wsID, "/Groups"), token, "")
-	checkBody := readBody(t, checkResp)
-	if checkResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 from GET /Groups, got %d: %s", checkResp.StatusCode, checkBody)
-	}
+	t.Run("rolls back Phase-1 group when circular partner fails", func(t *testing.T) {
+		circGroup1 := "circ_g1_" + uuid.New().String()[:8]
+		circGroup2 := "circ_g2_" + uuid.New().String()[:8]
+		missingUserUUID := uuid.New().String()
 
-	var groupList map[string]any
-	if err := json.Unmarshal([]byte(checkBody), &groupList); err != nil {
-		t.Fatalf("unmarshal groups list: %v", err)
-	}
-	resources, _ := groupList["Resources"].([]any)
-	for _, r := range resources {
-		groupMap, ok := r.(map[string]any)
-		if !ok {
-			continue
+		bulkBody := fmt.Sprintf(`{
+			"schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+			"Operations": [
+				{
+					"method": "POST",
+					"path": "/Groups",
+					"bulkId": "circG1",
+					"data": {
+						"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+						"displayName": "%s",
+						"members": [{"value": "bulkId:circG2", "type": "Group"}]
+					}
+				},
+				{
+					"method": "POST",
+					"path": "/Groups",
+					"bulkId": "circG2",
+					"data": {
+						"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+						"displayName": "%s",
+						"members": [
+							{"value": "bulkId:circG1", "type": "Group"},
+							{"value": "%s", "type": "User"}
+						]
+					}
+				}
+			]
+		}`, circGroup1, circGroup2, missingUserUUID)
+
+		resp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Bulk"), token, bulkBody)
+		respBody := readBody(t, resp)
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, respBody)
 		}
-		dName, _ := groupMap["displayName"].(string)
-		if dName == circGroup1 || dName == circGroup2 {
-			t.Fatalf("persisted group leaked after circular bulkId failure: %s (BLK_23 violation)", dName)
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(respBody), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
 		}
-	}
+
+		ops, ok := result["Operations"].([]any)
+		if !ok || len(ops) != 2 {
+			t.Fatalf("expected 2 operations, got %v", ops)
+		}
+
+		// op[0] rolled back to 400 (unresolved bulkId:circG2), op[1] failed with 404 (missing user)
+		op0 := ops[0].(map[string]any)
+		op1 := ops[1].(map[string]any)
+		if op0["status"] != "400" {
+			t.Fatalf("op[0] expected status 400 after rollback, got %v", op0["status"])
+		}
+		if op1["status"] != "404" && op1["status"] != "400" {
+			t.Fatalf("op[1] expected error status 404/400, got %v", op1["status"])
+		}
+		for i, rawOp := range ops {
+			op := rawOp.(map[string]any)
+			if op["location"] != nil {
+				t.Fatalf("failed POST op[%d] must not return a location: %v", i, op["location"])
+			}
+		}
+
+		// Verify NO failed group was persisted in the database (rolled back cleanly)
+		checkResp := doRequest(t, http.MethodGet, scimURL(env.server.URL, wsID, "/Groups"), token, "")
+		checkBody := readBody(t, checkResp)
+		if checkResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 from GET /Groups, got %d: %s", checkResp.StatusCode, checkBody)
+		}
+
+		var groupList map[string]any
+		if err := json.Unmarshal([]byte(checkBody), &groupList); err != nil {
+			t.Fatalf("unmarshal groups list: %v", err)
+		}
+		resources, _ := groupList["Resources"].([]any)
+		for _, r := range resources {
+			groupMap, ok := r.(map[string]any)
+			if !ok {
+				continue
+			}
+			dName, _ := groupMap["displayName"].(string)
+			if dName == circGroup1 || dName == circGroup2 {
+				t.Fatalf("persisted group leaked after circular bulkId failure: %s (BLK_23 violation)", dName)
+			}
+		}
+	})
 }
 
 func TestBulkReplaceGroup_MemberTypeImmutabilityAndNotFoundBeforeValidation(t *testing.T) {

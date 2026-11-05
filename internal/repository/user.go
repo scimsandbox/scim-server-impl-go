@@ -228,21 +228,56 @@ func buildOrderClause(sortCol, sortDir string) string {
 		direction = "DESC"
 		nullsOrder = "NULLS FIRST"
 	}
-	return fmt.Sprintf("ORDER BY %s %s %s", sortCol, direction, nullsOrder)
+	if sortCol == "id" {
+		return fmt.Sprintf("ORDER BY id::text COLLATE \"C\" %s", direction)
+	}
+	switch sortCol {
+	case "external_id", "profile_url", "enterprise_manager_value", "enterprise_manager_ref":
+		return fmt.Sprintf("ORDER BY %s COLLATE \"C\" %s %s, id ASC", sortCol, direction, nullsOrder)
+	case "active", "created_at", "last_modified":
+		return fmt.Sprintf("ORDER BY %s %s %s, id ASC", sortCol, direction, nullsOrder)
+	case userSortEmailsExpression:
+		return fmt.Sprintf("ORDER BY LOWER(%s) %s %s, id ASC", sortCol, direction, nullsOrder)
+	default:
+		return fmt.Sprintf("ORDER BY LOWER(%s) %s %s, %s COLLATE \"C\" %s %s, id ASC",
+			sortCol, direction, nullsOrder, sortCol, direction, nullsOrder)
+	}
 }
 
 func resolveUserSortColumn(sortBy string) string {
 	switch strings.ToLower(sortBy) {
+	case "id":
+		return "id"
 	case "username", "user_name":
 		return "user_name"
+	case "name.formatted", "name_formatted":
+		return "name_formatted"
 	case "name.familyname", "name_family_name":
 		return "name_family_name"
 	case "name.givenname", "name_given_name":
 		return "name_given_name"
+	case "name.middlename", "name_middle_name":
+		return "name_middle_name"
+	case "name.honorificprefix", "name_honorific_prefix":
+		return "name_honorific_prefix"
+	case "name.honorificsuffix", "name_honorific_suffix":
+		return "name_honorific_suffix"
 	case "displayname", "display_name":
 		return "display_name"
+	case "nickname", "nick_name":
+		return "nick_name"
+	case "profileurl", "profile_url":
+		return "profile_url"
 	case "title":
 		return "title"
+	case "usertype", "user_type":
+		return "user_type"
+	case "preferredlanguage", "preferred_language":
+		return "preferred_language"
+	case "locale":
+		return "locale"
+	case "timezone":
+		return "timezone"
 	case "emails", "emails.value", "email":
 		return userSortEmailsExpression
 	case "meta.created", "created_at":
@@ -253,6 +288,20 @@ func resolveUserSortColumn(sortBy string) string {
 		return "external_id"
 	case "active":
 		return "active"
+	case "employeenumber", "enterprise_employee_number":
+		return "enterprise_employee_number"
+	case "costcenter", "enterprise_cost_center":
+		return "enterprise_cost_center"
+	case "organization", "enterprise_organization":
+		return "enterprise_organization"
+	case "division", "enterprise_division":
+		return "enterprise_division"
+	case "department", "enterprise_department":
+		return "enterprise_department"
+	case "manager", "manager.value", "enterprise_manager_value":
+		return "enterprise_manager_value"
+	case "manager.displayname", "enterprise_manager_display":
+		return "enterprise_manager_display"
 	default:
 		return "user_name"
 	}

@@ -619,3 +619,123 @@ func TestParseUserFilter_ExternalId_CaseExact_FLT45(t *testing.T) {
 		t.Fatalf("expected SQL %q, got %q", expectedSQL, gres.SQL)
 	}
 }
+
+func TestFilter_EmptyBracketAndCrossResourceRootSearch(t *testing.T) {
+	if _, err := ParseUserFilter(`emails[]`, 2); err == nil {
+		t.Fatal("expected error for empty valuePath bracket emails[]")
+	}
+
+	if res, err := ParseUserFilter(`schemas eq "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"`, 2); err != nil || res == nil {
+		t.Fatalf("expected schemas eq filter on User to succeed, got err=%v", err)
+	}
+
+	if res, err := ParseGroupFilter(`members.value eq "00000000-0000-0000-0000-000000000001"`, 2); err != nil || res == nil {
+		t.Fatalf("expected members.value filter on Group to succeed, got err=%v", err)
+	}
+
+	// Root cross-resource filter: userName eq "u1" and members pr
+	// User parser evaluates `members pr` as FALSE; Group parser evaluates `userName eq "u1"` as FALSE.
+	uRes, err := ParseUserFilterForRoot(`userName eq "u1" and members pr`, 2)
+	if err != nil {
+		t.Fatalf("ParseUserFilterForRoot failed on cross-resource filter: %v", err)
+	}
+	if !strings.Contains(uRes.SQL, "FALSE") {
+		t.Fatalf("expected FALSE term in User SQL for Group-only attribute 'members', got: %s", uRes.SQL)
+	}
+
+	gRes, err := ParseGroupFilterForRoot(`userName eq "u1" or displayName eq "g1"`, 2)
+	if err != nil {
+		t.Fatalf("ParseGroupFilterForRoot failed on cross-resource filter: %v", err)
+	}
+	if !strings.Contains(gRes.SQL, "FALSE") || !strings.Contains(gRes.SQL, "display_name") {
+		t.Fatalf("expected FALSE OR display_name in Group SQL, got: %s", gRes.SQL)
+	}
+
+	// Unknown attribute on both User and Group must still fail in root filter mode
+	if _, err := ParseUserFilterForRoot(`totallyUnknownAttr eq "x"`, 2); err == nil {
+		t.Fatal("expected unknown attribute to fail in ParseUserFilterForRoot")
+	}
+}
+
+func TestVersionAgnosticRefFilters_RFC7643_2_4(t *testing.T) {
+	targetID := "11111111-2222-3333-4444-555555555555"
+
+	refCases := []struct {
+		input string
+		want  string
+	}{
+		{"/Users/" + targetID, targetID},
+		{"Users/" + targetID, targetID},
+		{"https://legacy.idp.example/scim/v1/Users/" + targetID, targetID},
+		{"http://127.0.0.1:8080/ws/aaaa/scim/v2/Users/" + strings.ToUpper(targetID) + "/", targetID},
+		{"https://example.com/scim/v1/Groups/" + targetID + "?attributes=displayName", targetID},
+		{"http://example.com/Users/alice", ""},
+		{"https://" + targetID, ""},
+		{targetID, ""},
+		{"", ""},
+	}
+	for _, tc := range refCases {
+		if got := ExtractUUIDFromRef(tc.input); got != tc.want {
+			t.Fatalf("ExtractUUIDFromRef(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+
+	for _, uri := range []string{
+		"/Users/" + targetID,
+		"https://legacy.idp.example/scim/v1/Users/" + targetID,
+		"https://scim.example.com/scim/v2/Users/" + targetID,
+	} {
+		gEq, err := ParseGroupFilter(`members.$ref eq "`+uri+`"`, 2)
+		if err != nil {
+			t.Fatalf("ParseGroupFilter members.$ref eq %q failed: %v", uri, err)
+		}
+		if !strings.Contains(gEq.SQL, "m.member_value::text") || len(gEq.Args) != 1 || gEq.Args[0] != targetID {
+			t.Fatalf("members.$ref eq %q -> SQL=%q Args=%v, want m.member_value::text with arg %q", uri, gEq.SQL, gEq.Args, targetID)
+		}
+
+		gNe, err := ParseGroupFilter(`members.$ref ne "`+uri+`"`, 2)
+		if err != nil {
+			t.Fatalf("ParseGroupFilter members.$ref ne %q failed: %v", uri, err)
+		}
+		if len(gNe.Args) != 1 || gNe.Args[0] != targetID {
+			t.Fatalf("members.$ref ne %q -> Args=%v, want [%q]", uri, gNe.Args, targetID)
+		}
+	}
+
+	for _, uri := range []string{
+		"/Groups/" + targetID,
+		"https://legacy.idp.example/scim/v1/Groups/" + targetID,
+		"https://scim.example.com/scim/v2/Groups/" + targetID,
+	} {
+		uGrp, err := ParseUserFilter(`groups.$ref eq "`+uri+`"`, 2)
+		if err != nil {
+			t.Fatalf("ParseUserFilter groups.$ref eq %q failed: %v", uri, err)
+		}
+		if !strings.Contains(uGrp.SQL, "m.group_id::text") || len(uGrp.Args) != 1 || uGrp.Args[0] != targetID {
+			t.Fatalf("groups.$ref eq %q -> SQL=%q Args=%v, want m.group_id::text with arg %q", uri, uGrp.SQL, uGrp.Args, targetID)
+		}
+	}
+
+	for _, uri := range []string{
+		"/Users/" + targetID,
+		"https://legacy.idp.example/scim/v1/Users/" + targetID,
+		"https://scim.example.com/scim/v2/Users/" + targetID,
+	} {
+		uMgr, err := ParseUserFilter(`urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:manager.$ref eq "`+uri+`"`, 2)
+		if err != nil {
+			t.Fatalf("ParseUserFilter manager.$ref eq %q failed: %v", uri, err)
+		}
+		if !strings.Contains(uMgr.SQL, "enterprise_manager_value") || len(uMgr.Args) != 1 || uMgr.Args[0] != targetID {
+			t.Fatalf("manager.$ref eq %q -> SQL=%q Args=%v, want enterprise_manager_value with arg %q", uri, uMgr.SQL, uMgr.Args, targetID)
+		}
+	}
+
+	nonUUIDMgr, err := ParseUserFilter(`manager.$ref eq "http://example.com/Users/alice"`, 2)
+	if err != nil {
+		t.Fatalf("ParseUserFilter non-UUID manager.$ref failed: %v", err)
+	}
+	if !strings.Contains(nonUUIDMgr.SQL, "enterprise_manager_ref") {
+		t.Fatalf("expected enterprise_manager_ref fallback for non-UUID URI, got %q", nonUUIDMgr.SQL)
+	}
+}
+

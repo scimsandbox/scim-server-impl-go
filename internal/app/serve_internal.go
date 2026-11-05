@@ -98,6 +98,10 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	meHandler := handler.NewMeHandler()
 
 	apiRouter := chi.NewRouter()
+	apiRouter.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Requested SCIM endpoint or protocol version not found"))
+	})
+	apiRouter.MethodNotAllowed(handler.MethodNotAllowed)
 	managementRouter := chi.NewRouter()
 	managementRouter.Route("/actuator", func(r chi.Router) {
 		r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

@@ -30,6 +30,53 @@ const (
 
 var asyncWorkerSem = make(chan struct{}, maxConcurrentAsyncWorkers)
 
+func dispatchAsyncOperation(
+	w http.ResponseWriter,
+	r *http.Request,
+	repo repository.AsyncEventRepo,
+	wsID uuid.UUID,
+	baseURL string,
+	prefHeader string,
+	method string,
+	resourceType string,
+	initialResID *uuid.UUID,
+	op func(ctx context.Context, txnID uuid.UUID) (resID *uuid.UUID, setJSON string, err error),
+) {
+	select {
+	case asyncWorkerSem <- struct{}{}:
+	default:
+		scim.WriteScimError(w, scim.NewScimError(http.StatusServiceUnavailable, "tooMany", "Too many concurrent asynchronous operations"))
+		return
+	}
+
+	txnID := uuid.New()
+	eventURL := baseURL + "/Events/" + txnID.String()
+
+	event := &model.ScimAsyncEvent{
+		TxnID:        txnID,
+		WorkspaceID:  wsID,
+		Operation:    method,
+		ResourceType: resourceType,
+		ResourceID:   initialResID,
+		Status:       model.AsyncStatusPending,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := repo.Create(r.Context(), event); err != nil {
+		<-asyncWorkerSem
+		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
+		return
+	}
+
+	w.Header().Set("Set-Txn", txnID.String())
+	w.Header().Set("Preference-Applied", prefHeader)
+	w.Header().Set("Location", eventURL)
+	w.WriteHeader(http.StatusAccepted)
+
+	runAsyncWorkerWithAcquiredSlot(repo, wsID, baseURL, txnID, resourceType, initialResID, method, func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		return op(workerCtx, txnID)
+	})
+}
+
 func runAsyncWorker(
 	repo repository.AsyncEventRepo,
 	baseURL string,
@@ -39,8 +86,21 @@ func runAsyncWorker(
 	method string,
 	op func(ctx context.Context) (resID *uuid.UUID, setJSON string, err error),
 ) {
+	asyncWorkerSem <- struct{}{}
+	runAsyncWorkerWithAcquiredSlot(repo, uuid.Nil, baseURL, txnID, resourceType, initialResID, method, op)
+}
+
+func runAsyncWorkerWithAcquiredSlot(
+	repo repository.AsyncEventRepo,
+	wsID uuid.UUID,
+	baseURL string,
+	txnID uuid.UUID,
+	resourceType string,
+	initialResID *uuid.UUID,
+	method string,
+	op func(ctx context.Context) (resID *uuid.UUID, setJSON string, err error),
+) {
 	go func() {
-		asyncWorkerSem <- struct{}{}
 		defer func() { <-asyncWorkerSem }()
 
 		recordFailure := func(resID *uuid.UUID, opErr error) {
@@ -62,6 +122,12 @@ func runAsyncWorker(
 
 		workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
+
+		if wsID != uuid.Nil {
+			if ev, err := repo.FindByTxnIDAndWorkspaceID(workerCtx, txnID, wsID); err == nil && ev != nil && ev.Status != model.AsyncStatusPending {
+				return
+			}
+		}
 
 		resID, setJSON, err := op(workerCtx)
 		if err != nil {

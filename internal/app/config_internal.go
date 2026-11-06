@@ -37,15 +37,34 @@ func managementPort(cfg Config) int {
 	return cfg.Management.Port
 }
 
+func serverBaseURL(cfg Config) string {
+	if u := strings.TrimRight(strings.TrimSpace(cfg.Server.BaseURL), "/"); u != "" {
+		return u
+	}
+	port := cfg.Server.Port
+	if port <= 0 {
+		port = 8080
+	}
+	return fmt.Sprintf("http://localhost:%d", port)
+}
+
 func printableConfig(cfg Config) Config {
 	masked := cfg
 	if masked.Storage.Password != "" {
 		masked.Storage.Password = "***"
 	}
+	if masked.Server.CursorSecret != "" {
+		masked.Server.CursorSecret = "***"
+	}
 	return masked
 }
 
 func applyConfigDefaults(cfg *Config) {
+	if strings.TrimSpace(cfg.Server.BaseURL) == "" {
+		cfg.Server.BaseURL = serverBaseURL(*cfg)
+	} else {
+		cfg.Server.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.Server.BaseURL), "/")
+	}
 	if cfg.Cleanup.RequestLogs.Enabled == nil {
 		defaultEnabled := true
 		cfg.Cleanup.RequestLogs.Enabled = &defaultEnabled
@@ -72,6 +91,9 @@ func applyConfigDefaults(cfg *Config) {
 }
 
 func validateConfig(cfg Config) error {
+	if cfg.Server.BaseURL != "" && !strings.HasPrefix(cfg.Server.BaseURL, "http://") && !strings.HasPrefix(cfg.Server.BaseURL, "https://") {
+		return fmt.Errorf("server.base_url must start with http:// or https://")
+	}
 	if cfg.RateLimit.Enabled && cfg.RateLimit.RequestsPerSecond <= 0 {
 		return fmt.Errorf("rate_limit.requests_per_second must be greater than 0 when rate limiting is enabled")
 	}

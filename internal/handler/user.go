@@ -237,30 +237,8 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	baseURL := buildBaseURL(r)
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
-		eventURL := baseURL + "/Events/" + txnID.String()
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "POST",
-			ResourceType: "User",
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
 		compat := getCompatMode(r)
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", nil, "POST", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "POST", "User", nil, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			user, err := h.executeCreateUser(workerCtx, wsID, baseURL, input)
 			if err != nil {
 				return nil, "", err
@@ -455,31 +433,8 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 	ifMatch := r.Header.Get("If-Match")
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
-		eventURL := baseURL + "/Events/" + txnID.String()
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "PUT",
-			ResourceType: "User",
-			ResourceID:   &userID,
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
 		compat := getCompatMode(r)
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", &userID, "PUT", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "PUT", "User", &userID, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			u, err := h.executeReplaceUser(workerCtx, wsID, userID, baseURL, input, ifMatch)
 			if err != nil {
 				return &userID, "", err
@@ -571,31 +526,8 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 	ifMatch := r.Header.Get("If-Match")
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
-		eventURL := baseURL + "/Events/" + txnID.String()
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "PATCH",
-			ResourceType: "User",
-			ResourceID:   &userID,
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
 		compat := getCompatMode(r)
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", &userID, "PATCH", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "PATCH", "User", &userID, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			u, err := h.executePatchUser(workerCtx, wsID, userID, baseURL, operations, ifMatch)
 			if err != nil {
 				return &userID, "", err
@@ -658,31 +590,8 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	ifMatch := r.Header.Get("If-Match")
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
 		baseURL := buildBaseURL(r)
-		eventURL := baseURL + "/Events/" + txnID.String()
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "DELETE",
-			ResourceType: "User",
-			ResourceID:   &userID,
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", &userID, "DELETE", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "DELETE", "User", &userID, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			if err := h.executeDeleteUser(workerCtx, wsID, userID, ifMatch); err != nil {
 				return &userID, "", err
 			}

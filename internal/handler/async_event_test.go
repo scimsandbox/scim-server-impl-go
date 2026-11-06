@@ -1410,6 +1410,86 @@ func TestRunAsyncWorker_PanicRecovery_FreshStatusContext_And_PendingGuard(t *tes
 			t.Fatalf("expected FAILED status and reaper payload to be preserved, got status=%s payload=%v", ev.Status, ev.SetPayload)
 		}
 	})
+
+	t.Run("returns 503 tooMany without creating PENDING row when asyncWorkerSem is full", func(t *testing.T) {
+		repo := newMockAsyncEventRepo()
+		// Fill all available slots in asyncWorkerSem
+		acquired := 0
+		for {
+			select {
+			case asyncWorkerSem <- struct{}{}:
+				acquired++
+			default:
+				goto filled
+			}
+		}
+	filled:
+		defer func() {
+			for i := 0; i < acquired; i++ {
+				<-asyncWorkerSem
+			}
+		}()
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", nil)
+		opCalled := false
+		dispatchAsyncOperation(rec, req, repo, wsID, baseURL, "respond-async", "POST", "User", nil, func(ctx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
+			opCalled = true
+			return nil, "", nil
+		})
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503: %s", rec.Code, rec.Body.String())
+		}
+		var errBody map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil {
+			t.Fatalf("unmarshal 503 response: %v", err)
+		}
+		if errBody["scimType"] != "tooMany" {
+			t.Errorf("scimType = %v, want tooMany", errBody["scimType"])
+		}
+		repo.mu.Lock()
+		evCount := len(repo.events)
+		repo.mu.Unlock()
+		if evCount != 0 {
+			t.Errorf("expected 0 events in repo when 503 returned, got %d", evCount)
+		}
+		if opCalled {
+			t.Error("expected worker op not to be called when 503 returned")
+		}
+	})
+
+	t.Run("worker skips executing op when event is already FAILED before worker runs", func(t *testing.T) {
+		repo := newMockAsyncEventRepo()
+		txnID := uuid.New()
+		reaperPayload := `{"reaper":"already-failed"}`
+		_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "POST",
+			ResourceType: "User",
+			Status:       model.AsyncStatusFailed,
+			SetPayload:   &reaperPayload,
+			CreatedAt:    time.Now().UTC(),
+		})
+
+		done := make(chan struct{})
+		opExecuted := false
+		asyncWorkerSem <- struct{}{}
+		go func() {
+			runAsyncWorkerWithAcquiredSlot(repo, wsID, baseURL, txnID, "User", nil, "POST", func(ctx context.Context) (*uuid.UUID, string, error) {
+				opExecuted = true
+				return nil, "{}", nil
+			})
+			// Wait briefly for the worker goroutine to check status and exit
+			time.Sleep(50 * time.Millisecond)
+			close(done)
+		}()
+		<-done
+		if opExecuted {
+			t.Fatal("expected worker to skip op execution when event was already FAILED")
+		}
+	})
 }
 
 

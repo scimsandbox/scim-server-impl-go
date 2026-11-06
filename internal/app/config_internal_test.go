@@ -287,6 +287,59 @@ func TestPrintableConfig(t *testing.T) {
 			t.Fatalf("printableConfig() Username = %q, want %q", result.Storage.Username, cfg.Storage.Username)
 		}
 	})
+
+	t.Run("masks non-empty cursor secret", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{Server: ServerConfig{Port: 8080, CursorSecret: "top-secret-hmac-key"}}
+		result := printableConfig(cfg)
+		if result.Server.CursorSecret != "***" {
+			t.Fatalf("printableConfig() CursorSecret = %q, want %q", result.Server.CursorSecret, "***")
+		}
+		if cfg.Server.CursorSecret != "top-secret-hmac-key" {
+			t.Fatalf("original config CursorSecret mutated to %q", cfg.Server.CursorSecret)
+		}
+	})
+}
+
+func TestServerBaseURLAndEnsureCursorSecret(t *testing.T) {
+	t.Run("serverBaseURL defaults and overrides", func(t *testing.T) {
+		cfg := Config{Server: ServerConfig{Port: 8181}}
+		applyConfigDefaults(&cfg)
+		if got := serverBaseURL(cfg); got != "http://localhost:8181" {
+			t.Fatalf("serverBaseURL() = %q, want http://localhost:8181", got)
+		}
+
+		cfgCustom := Config{Server: ServerConfig{Port: 8080, BaseURL: "https://scim.example.com/"}}
+		applyConfigDefaults(&cfgCustom)
+		if got := serverBaseURL(cfgCustom); got != "https://scim.example.com" {
+			t.Fatalf("serverBaseURL() = %q, want https://scim.example.com", got)
+		}
+
+		cfgBad := Config{Server: ServerConfig{Port: 8080, BaseURL: "ftp://scim.example.com"}}
+		if err := validateConfig(cfgBad); err == nil {
+			t.Fatal("expected validateConfig error for non-http(s) base_url")
+		}
+	})
+
+	t.Run("ensureCursorSecret uses configured secret without DB", func(t *testing.T) {
+		cfg := Config{Server: ServerConfig{CursorSecret: "configured-secret-123"}}
+		if err := ensureCursorSecret(nil, cfg, nil); err != nil {
+			t.Fatalf("ensureCursorSecret() error = %v", err)
+		}
+	})
+
+	t.Run("ensureCursorSecret uses SCIM_CURSOR_SECRET from lookupEnv without DB", func(t *testing.T) {
+		cfg := Config{}
+		err := ensureCursorSecret(nil, cfg, func(k string) (string, bool) {
+			if k == "SCIM_CURSOR_SECRET" {
+				return "env-secret-456", true
+			}
+			return "", false
+		})
+		if err != nil {
+			t.Fatalf("ensureCursorSecret() error = %v", err)
+		}
+	})
 }
 
 func TestCleanupRequestLogsConfig(t *testing.T) {

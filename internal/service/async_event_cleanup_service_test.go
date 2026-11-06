@@ -515,27 +515,27 @@ func TestBuildStalePendingErrorSET_Properties(t *testing.T) {
 		t.Errorf("sub_id.uri = %v, want %v", subID["uri"], expectedURI)
 	}
 
-	// Verify stored baseURL in SetPayload is used when present
-	customBaseURL := "https://scim.tenant.example.com/ws/" + wsID.String() + "/scim/v2"
-	eventWithBaseURL := &model.ScimAsyncEvent{
+	// Verify configured baseOrigin is used when provided
+	customOrigin := "https://scim.tenant.example.com"
+	eventForCustom := &model.ScimAsyncEvent{
 		TxnID:        txnID,
 		WorkspaceID:  wsID,
 		Operation:    "PUT",
 		ResourceType: "User",
 		ResourceID:   &resID,
 		Status:       model.AsyncStatusPending,
-		SetPayload:   &customBaseURL,
 	}
-	setJSONCustom := BuildStalePendingErrorSET(eventWithBaseURL)
+	setJSONCustom := BuildStalePendingErrorSET(eventForCustom, customOrigin)
 	var mCustom map[string]any
 	if err := json.Unmarshal([]byte(setJSONCustom), &mCustom); err != nil {
 		t.Fatalf("unmarshal custom SET error: %v", err)
 	}
-	if mCustom["iss"] != customBaseURL {
-		t.Errorf("custom iss = %v, want %v", mCustom["iss"], customBaseURL)
+	wantCustomBaseURL := customOrigin + "/ws/" + wsID.String() + "/scim/v2"
+	if mCustom["iss"] != wantCustomBaseURL {
+		t.Errorf("custom iss = %v, want %v", mCustom["iss"], wantCustomBaseURL)
 	}
 	subIDCustom, _ := mCustom["sub_id"].(map[string]any)
-	wantCustomURI := customBaseURL + "/Users/" + resID.String()
+	wantCustomURI := wantCustomBaseURL + "/Users/" + resID.String()
 	if subIDCustom["uri"] != wantCustomURI {
 		t.Errorf("custom sub_id.uri = %v, want %v", subIDCustom["uri"], wantCustomURI)
 	}

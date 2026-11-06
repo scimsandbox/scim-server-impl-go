@@ -199,30 +199,8 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
 		baseURL := buildBaseURL(r)
-		eventURL := baseURL + "/Events/" + txnID.String()
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "POST",
-			ResourceType: "Group",
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", nil, "POST", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "POST", "Group", nil, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			group, err := h.executeCreateGroup(workerCtx, wsID, input)
 			if err != nil {
 				return nil, "", err
@@ -500,32 +478,9 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
 		baseURL := buildBaseURL(r)
-		eventURL := baseURL + "/Events/" + txnID.String()
 		ifMatchHdr := r.Header.Get("If-Match")
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "PUT",
-			ResourceType: "Group",
-			ResourceID:   &groupID,
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", &groupID, "PUT", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "PUT", "Group", &groupID, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			updatedGroup, err := h.executeReplaceGroup(workerCtx, wsID, groupID, input, ifMatchHdr)
 			if err != nil {
 				return &groupID, "", err
@@ -714,32 +669,9 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
 		baseURL := buildBaseURL(r)
-		eventURL := baseURL + "/Events/" + txnID.String()
 		ifMatchHdr := r.Header.Get("If-Match")
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "PATCH",
-			ResourceType: "Group",
-			ResourceID:   &groupID,
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", &groupID, "PATCH", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "PATCH", "Group", &groupID, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			opMaps := make([]map[string]any, 0, len(ops))
 			for _, op := range ops {
 				m, ok := op.(map[string]any)
@@ -880,32 +812,9 @@ func (h *GroupHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
-		txnID := uuid.New()
 		baseURL := buildBaseURL(r)
-		eventURL := baseURL + "/Events/" + txnID.String()
 		ifMatchHdr := r.Header.Get("If-Match")
-
-		event := &model.ScimAsyncEvent{
-			TxnID:        txnID,
-			WorkspaceID:  wsID,
-			Operation:    "DELETE",
-			ResourceType: "Group",
-			ResourceID:   &groupID,
-			Status:       model.AsyncStatusPending,
-			SetPayload:   &baseURL,
-			CreatedAt:    time.Now().UTC(),
-		}
-		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create async event"))
-			return
-		}
-
-		w.Header().Set("Set-Txn", txnID.String())
-		w.Header().Set("Preference-Applied", prefHeader)
-		w.Header().Set("Location", eventURL)
-		w.WriteHeader(http.StatusAccepted)
-
-		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", &groupID, "DELETE", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "DELETE", "Group", &groupID, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
 			if err := h.executeDeleteGroup(workerCtx, wsID, groupID, ifMatchHdr); err != nil {
 				return &groupID, "", err
 			}

@@ -245,7 +245,12 @@ func TestDecodeCursor_TamperAndStrictBase64Detection(t *testing.T) {
 }
 
 func TestSetCursorSecret_DeterminismAndKeyRotation(t *testing.T) {
-	defer SetCursorSecret(defaultCursorSecret)
+	origKey := append([]byte(nil), getCursorSecretKey()...)
+	defer func() {
+		cursorSecretMu.Lock()
+		cursorSecretKey = origKey
+		cursorSecretMu.Unlock()
+	}()
 
 	wsID := uuid.New()
 	SetCursorSecret("replica-shared-secret-key-A")

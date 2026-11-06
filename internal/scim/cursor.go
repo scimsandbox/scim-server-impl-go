@@ -2,6 +2,7 @@ package scim
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -21,8 +22,6 @@ const (
 
 	// DefaultCursorTimeoutSeconds defines the default cursor validity duration (1 hour per RFC 9865 §4).
 	DefaultCursorTimeoutSeconds = 3600
-
-	defaultCursorSecret = "scim-sandbox-cursor-hmac-secret-key-v1"
 )
 
 var (
@@ -32,11 +31,15 @@ var (
 		if secret == "" {
 			secret = os.Getenv("SCIM_CURSOR_SECRET")
 		}
-		if secret == "" {
-			secret = defaultCursorSecret
+		if secret != "" {
+			sum := sha256.Sum256([]byte(secret))
+			return sum[:]
 		}
-		sum := sha256.Sum256([]byte(secret))
-		return sum[:]
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			panic("failed to generate random cursor HMAC secret: " + err.Error())
+		}
+		return key
 	}()
 )
 

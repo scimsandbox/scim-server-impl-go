@@ -20,6 +20,7 @@ type Config struct {
 
 type ServerConfig struct {
 	Port              int           `yaml:"port" env:"GO_SERVER_PORT"`
+	BaseURL           string        `yaml:"base_url" env:"GO_SERVER_BASE_URL"`
 	ReadTimeout       time.Duration `yaml:"read_timeout" env:"GO_SERVER_READ_TIMEOUT"`
 	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout" env:"GO_SERVER_READ_HEADER_TIMEOUT"`
 	WriteTimeout      time.Duration `yaml:"write_timeout" env:"GO_SERVER_WRITE_TIMEOUT"`

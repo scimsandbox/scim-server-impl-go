@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	maxBodyLog    = 20000
-	redactedValue = "[REDACTED]"
+	maxBodyLog     = 20000
+	maxBodyCapture = maxBodyLog + 1024
+	redactedValue  = "[REDACTED]"
 )
 
 var (
@@ -38,6 +39,31 @@ type requestLogCreator interface {
 	Create(ctx context.Context, log *model.ScimRequestLog) error
 }
 
+type bodyCaptureReader struct {
+	rc  io.ReadCloser
+	buf bytes.Buffer
+	eof bool
+}
+
+func (b *bodyCaptureReader) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if n > 0 && b.buf.Len() < maxBodyCapture {
+		rem := maxBodyCapture - b.buf.Len()
+		if n < rem {
+			rem = n
+		}
+		b.buf.Write(p[:rem])
+	}
+	if err == io.EOF {
+		b.eof = true
+	}
+	return n, err
+}
+
+func (b *bodyCaptureReader) Close() error {
+	return b.rc.Close()
+}
+
 // ResponseCapture wraps http.ResponseWriter to capture status and body.
 type ResponseCapture struct {
 	http.ResponseWriter
@@ -51,7 +77,13 @@ func (rc *ResponseCapture) WriteHeader(code int) {
 }
 
 func (rc *ResponseCapture) Write(b []byte) (int, error) {
-	rc.body.Write(b)
+	if rc.body.Len() < maxBodyCapture {
+		rem := maxBodyCapture - rc.body.Len()
+		if len(b) < rem {
+			rem = len(b)
+		}
+		rc.body.Write(b[:rem])
+	}
 	return rc.ResponseWriter.Write(b)
 }
 
@@ -60,17 +92,25 @@ func (rc *ResponseCapture) Write(b []byte) (int, error) {
 func RequestResponseLogging(logRepo requestLogCreator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Read and buffer request body while passing the untouched original stream downstream.
-			var reqBody []byte
+			var bcr *bodyCaptureReader
 			if r.Body != nil {
-				reqBody, _ = io.ReadAll(r.Body)
-				r.Body = io.NopCloser(bytes.NewReader(reqBody))
+				bcr = &bodyCaptureReader{rc: r.Body}
+				r.Body = bcr
 			}
 
 			rc := &ResponseCapture{ResponseWriter: w, statusCode: http.StatusOK}
 			start := time.Now()
 			next.ServeHTTP(rc, r)
 			duration := time.Since(start)
+
+			var reqBody []byte
+			if bcr != nil {
+				if !bcr.eof && bcr.buf.Len() < maxBodyCapture && rc.statusCode != http.StatusRequestEntityTooLarge {
+					rem := maxBodyCapture - bcr.buf.Len()
+					_, _ = io.CopyN(&bcr.buf, bcr.rc, int64(rem))
+				}
+				reqBody = bcr.buf.Bytes()
+			}
 
 			// Extract workspace ID from path
 			var workspaceID uuid.UUID

@@ -262,3 +262,52 @@ func TestRequestResponseLogging_RedactsLogWithoutMutatingDownstreamRequestBody(t
 		t.Errorf("expected [REDACTED] in RequestBody, got: %s", *saved.RequestBody)
 	}
 }
+
+type countingInfiniteReader struct {
+	bytesRead int64
+}
+
+func (c *countingInfiniteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	c.bytesRead += int64(len(p))
+	return len(p), nil
+}
+
+func TestRequestResponseLogging_DoesNotPreReadUnboundedStreamBeforeMaxBytesReader(t *testing.T) {
+	wsID := uuid.New()
+	logStore := &stubRequestLogCreator{}
+	stream := &countingInfiniteReader{}
+
+	const maxLimit = 1048576 // 1 MiB
+	downstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxLimit)
+		_, err := io.ReadAll(r.Body)
+		if err == nil {
+			t.Fatal("expected MaxBytesReader error on unbounded stream")
+		}
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"status":"413"}`))
+	})
+
+	mw := RequestResponseLogging(logStore)(downstream)
+	req := httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Bulk", io.NopCloser(stream))
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	// Stream must have been stopped around 1 MiB (+ small read buffer), never pre-read unboundedly
+	if stream.bytesRead > maxLimit+65536 {
+		t.Fatalf("stream read %d bytes, expected <= %d", stream.bytesRead, maxLimit+65536)
+	}
+	if len(logStore.logs) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(logStore.logs))
+	}
+	if logStore.logs[0].RequestBody == nil || len(*logStore.logs[0].RequestBody) > maxBodyLog+64 {
+		t.Fatalf("logged request body exceeded maxBodyLog truncation limit")
+	}
+}

@@ -43,6 +43,7 @@ type AsyncEventCleanupService struct {
 	interval          time.Duration
 	maxCount          int
 	stalePendingAfter time.Duration
+	baseURL           string
 }
 
 // NewAsyncEventCleanupService creates a new AsyncEventCleanupService.
@@ -53,6 +54,7 @@ func NewAsyncEventCleanupService(
 	interval time.Duration,
 	maxCount int,
 	stalePendingAfter time.Duration,
+	baseURL ...string,
 ) *AsyncEventCleanupService {
 	if interval <= 0 {
 		interval = DefaultAsyncEventCleanupInterval
@@ -63,6 +65,10 @@ func NewAsyncEventCleanupService(
 	if stalePendingAfter <= 0 {
 		stalePendingAfter = DefaultAsyncEventStalePendingAfter
 	}
+	resolvedBaseURL := "http://localhost:8080"
+	if len(baseURL) > 0 && strings.TrimSpace(baseURL[0]) != "" {
+		resolvedBaseURL = strings.TrimRight(strings.TrimSpace(baseURL[0]), "/")
+	}
 	return &AsyncEventCleanupService{
 		repo:              repo,
 		logger:            logger,
@@ -70,6 +76,7 @@ func NewAsyncEventCleanupService(
 		interval:          interval,
 		maxCount:          maxCount,
 		stalePendingAfter: stalePendingAfter,
+		baseURL:           resolvedBaseURL,
 	}
 }
 
@@ -183,7 +190,7 @@ func (s *AsyncEventCleanupService) ReapStalePendingOnce(ctx context.Context) (in
 		default:
 		}
 
-		errorSet := BuildStalePendingErrorSET(event)
+		errorSet := BuildStalePendingErrorSET(event, s.baseURL)
 		completedAt := time.Now().UTC()
 
 		transitioned, err := s.repo.TransitionPendingToFailed(ctx, event.TxnID, errorSet, completedAt)
@@ -216,7 +223,7 @@ func (s *AsyncEventCleanupService) ReapStalePendingOnce(ctx context.Context) (in
 }
 
 // BuildStalePendingErrorSET constructs an RFC 9967 Security Event Token payload for a reaped pending event.
-func BuildStalePendingErrorSET(event *model.ScimAsyncEvent) string {
+func BuildStalePendingErrorSET(event *model.ScimAsyncEvent, baseOrigin ...string) string {
 	statusStr := "500"
 	upperMethod := strings.ToUpper(event.Operation)
 	if upperMethod == "" {
@@ -235,13 +242,18 @@ func BuildStalePendingErrorSET(event *model.ScimAsyncEvent) string {
 		"response": errResp,
 	}
 
-	baseURL := ""
-	if event.SetPayload != nil && (strings.HasPrefix(*event.SetPayload, "http://") || strings.HasPrefix(*event.SetPayload, "https://")) {
-		baseURL = strings.TrimRight(*event.SetPayload, "/")
+	origin := "http://localhost:8080"
+	if len(baseOrigin) > 0 && strings.TrimSpace(baseOrigin[0]) != "" {
+		origin = strings.TrimRight(strings.TrimSpace(baseOrigin[0]), "/")
+	}
+
+	var baseURL string
+	if strings.Contains(origin, "/ws/") || strings.HasSuffix(origin, "/scim/v2") {
+		baseURL = origin
 	} else if event.WorkspaceID != uuid.Nil {
-		baseURL = fmt.Sprintf("http://localhost:8080/ws/%s/scim/v2", event.WorkspaceID.String())
+		baseURL = fmt.Sprintf("%s/ws/%s/scim/v2", origin, event.WorkspaceID.String())
 	} else {
-		baseURL = "http://localhost:8080/scim/v2"
+		baseURL = origin + "/scim/v2"
 	}
 
 	payload := map[string]any{

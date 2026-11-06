@@ -4,15 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 )
-
-var pendingBaseURLs sync.Map
 
 // DefaultEventPruneBatchSize is the number of terminal events deleted per batch.
 const DefaultEventPruneBatchSize = 5000
@@ -56,13 +53,6 @@ func scanAsyncEvent(row rowScanner) (*model.ScimAsyncEvent, error) {
 	if err != nil {
 		return nil, err
 	}
-	if e.Status == model.AsyncStatusPending && e.SetPayload == nil {
-		if v, ok := pendingBaseURLs.Load(e.TxnID); ok {
-			if s, ok := v.(string); ok {
-				e.SetPayload = &s
-			}
-		}
-	}
 	return &e, nil
 }
 
@@ -78,12 +68,6 @@ func (r *AsyncEventRepository) Create(ctx context.Context, e *model.ScimAsyncEve
 		e.Status = model.AsyncStatusPending
 	}
 
-	dbPayload := e.SetPayload
-	if e.Status == model.AsyncStatusPending && e.SetPayload != nil {
-		pendingBaseURLs.Store(e.TxnID, *e.SetPayload)
-		dbPayload = nil
-	}
-
 	query := `INSERT INTO scim_async_events (` + asyncEventColumns + `)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
@@ -94,7 +78,7 @@ func (r *AsyncEventRepository) Create(ctx context.Context, e *model.ScimAsyncEve
 		e.ResourceType,
 		e.ResourceID,
 		e.Status,
-		dbPayload,
+		e.SetPayload,
 		e.CreatedAt,
 		e.CompletedAt,
 	)
@@ -121,7 +105,6 @@ func (r *AsyncEventRepository) UpdateStatusAndPayload(
 	payload *string,
 	completedAt time.Time,
 ) error {
-	pendingBaseURLs.Delete(txnID)
 	query := `UPDATE scim_async_events
 		SET status = $2, resource_id = COALESCE($3, resource_id), set_payload = $4, completed_at = $5
 		WHERE txn_id = $1 AND status = 'PENDING'`
@@ -238,7 +221,6 @@ func (r *AsyncEventRepository) FindStalePendingEvents(ctx context.Context, older
 // TransitionPendingToFailed atomically transitions an event from PENDING to FAILED with the given payload and completedAt.
 // It returns true if a row was updated, or false if the event was no longer PENDING or did not exist.
 func (r *AsyncEventRepository) TransitionPendingToFailed(ctx context.Context, txnID uuid.UUID, payload string, completedAt time.Time) (bool, error) {
-	pendingBaseURLs.Delete(txnID)
 	query := `UPDATE scim_async_events
 		SET status = 'FAILED', set_payload = $2, completed_at = $3
 		WHERE txn_id = $1 AND status = 'PENDING'`

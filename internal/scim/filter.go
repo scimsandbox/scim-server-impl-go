@@ -5,7 +5,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode"
 )
 
 // FilterResult holds a SQL WHERE clause fragment and its parameter values.
@@ -116,8 +115,6 @@ const (
 	sqlLowerLikeSeparator      = ") LIKE LOWER("
 	sqlLike                    = " LIKE "
 	sqlTextCast                = "::text"
-	sqlTextLike                = sqlTextCast + sqlLike
-	sqlTextLowerLikeSeparator  = sqlTextCast + sqlLowerLikeSeparator
 	sqlIsNotNull               = " IS NOT NULL"
 	sqlIsNotNullAnd            = sqlIsNotNull + " AND "
 	sqlTextNotEqualsEmptyArray = sqlTextCast + " != '[]'"
@@ -1468,52 +1465,35 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 		}
 	}
 
-	// For JSON columns, we use casting to text and LIKE patterns
-	// This matches the Java implementation's approach
-	param := p.nextParam()
-	isCaseInsensitive := caseInsensitiveAttrs[strings.ToLower(collectionName+"."+subAttr)]
+	if operator == filterOpPr {
+		sql := fmt.Sprintf(
+			"(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE (elem->>'%s') IS NOT NULL AND (elem->>'%s') != ''))",
+			col, col, col, col, jsonKey, jsonKey,
+		)
+		return &FilterResult{SQL: sql, Args: nil}, nil
+	}
+
+	if isBool {
+		param := p.nextParam()
+		boolStr := strings.ToLower(value)
+		sql := fmt.Sprintf(
+			"(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE (elem->>'%s') = %s))",
+			col, col, col, col, jsonKey, param,
+		)
+		return &FilterResult{SQL: sql, Args: []any{boolStr}}, nil
+	}
 
 	switch operator {
-	case filterOpEq:
-		var pattern string
-		if isBool {
-			pattern = fmt.Sprintf(`%%"primaryFlag":%s%%`, strings.ToLower(value))
-		} else {
-			// Match JSON key-value pair
-			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, jsonKey, escapeLikeValue(value))
+	case filterOpEq, filterOpCo, filterOpSw, filterOpEw:
+		cond, args, err := p.buildElemCondition(collectionName, subAttr, operator, value)
+		if err != nil {
+			return nil, err
 		}
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpCo:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%%%s%%"%%`, jsonKey, escaped)
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpSw:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%s%%"%%`, jsonKey, escaped)
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpEw:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%%%s"%%`, jsonKey, escaped)
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpPr:
-		return &FilterResult{SQL: col + sqlIsNotNullAnd + col + sqlTextNotEqualsEmptyArray, Args: nil}, nil
-
+		sql := fmt.Sprintf(
+			"(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE %s))",
+			col, col, col, col, cond,
+		)
+		return &FilterResult{SQL: sql, Args: args}, nil
 	default:
 		return nil, fmt.Errorf("unsupported operator for JSON attribute: %s", operator)
 	}
@@ -1630,9 +1610,6 @@ func escapeLikeValue(value string) string {
 			b.WriteRune('\\')
 			b.WriteRune(c)
 		default:
-			if !unicode.IsPrint(c) {
-				continue
-			}
 			b.WriteRune(c)
 		}
 	}

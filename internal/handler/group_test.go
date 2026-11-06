@@ -249,7 +249,7 @@ func TestGroupPatchImmutableSubAttributes_Group2(t *testing.T) {
 			if op == "replace" {
 				opMap["value"] = "Group"
 			}
-			err := gh.applyGroupPatchOp(context.Background(), group, wsID, opMap)
+			err := gh.applyGroupPatchOpTx(context.Background(), nil, group, wsID, opMap)
 			scimErr, ok := err.(*scim.ScimError)
 			if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "mutability" {
 				t.Fatalf("PATCH %s %s: got %v, want 400 mutability", op, sub, err)
@@ -259,7 +259,7 @@ func TestGroupPatchImmutableSubAttributes_Group2(t *testing.T) {
 
 	// 2. add targeting .value or .$ref on existing member -> 400 mutability
 	for _, sub := range []string{".value", ".$ref"} {
-		err := gh.applyGroupPatchOp(context.Background(), group, wsID, map[string]any{
+		err := gh.applyGroupPatchOpTx(context.Background(), nil, group, wsID, map[string]any{
 			"op":    "add",
 			"path":  `members[value eq "` + memberTyped.String() + `"]` + sub,
 			"value": "anything",
@@ -271,7 +271,7 @@ func TestGroupPatchImmutableSubAttributes_Group2(t *testing.T) {
 	}
 
 	// 3. RFC7644-3.5.2-0cc87d: add targeting .type when member had NO previous type -> succeeds and sets type
-	if err := gh.applyGroupPatchOp(context.Background(), group, wsID, map[string]any{
+	if err := gh.applyGroupPatchOpTx(context.Background(), nil, group, wsID, map[string]any{
 		"op":    "add",
 		"path":  `members[value eq "` + memberUnset.String() + `"].type`,
 		"value": "User",
@@ -283,7 +283,7 @@ func TestGroupPatchImmutableSubAttributes_Group2(t *testing.T) {
 	}
 
 	// 4. Subsequent add targeting .type with a DIFFERENT value -> 400 mutability
-	err := gh.applyGroupPatchOp(context.Background(), group, wsID, map[string]any{
+	err := gh.applyGroupPatchOpTx(context.Background(), nil, group, wsID, map[string]any{
 		"op":    "add",
 		"path":  `members[value eq "` + memberUnset.String() + `"].type`,
 		"value": "Group",
@@ -300,7 +300,7 @@ func TestGroupPatchImmutableSubAttributes_Group2(t *testing.T) {
 		MemberValue: memberEmptyType,
 		MemberType:  &emptyType,
 	})
-	if err := gh.applyGroupPatchOp(context.Background(), group, wsID, map[string]any{
+	if err := gh.applyGroupPatchOpTx(context.Background(), nil, group, wsID, map[string]any{
 		"op":    "add",
 		"path":  `members[$ref eq "/Users/` + memberEmptyType.String() + `"].type`,
 		"value": "User",
@@ -362,7 +362,7 @@ func TestGroupMemberVersionAgnosticRefHelpers_RFC7643_2_4(t *testing.T) {
 			{MemberValue: u2, MemberType: &userType},
 		},
 	}
-	if err := gh.applyGroupPatchOp(context.Background(), group, wsID, map[string]any{
+	if err := gh.applyGroupPatchOpTx(context.Background(), nil, group, wsID, map[string]any{
 		"op":   "remove",
 		"path": `members[$ref eq "/Users/` + u1.String() + `"]`,
 	}); err != nil {
@@ -371,7 +371,7 @@ func TestGroupMemberVersionAgnosticRefHelpers_RFC7643_2_4(t *testing.T) {
 	if len(group.Members) != 1 || group.Members[0].MemberValue != u2 {
 		t.Fatalf("expected only u2 remaining, got %+v", group.Members)
 	}
-	if err := gh.applyGroupPatchOp(context.Background(), group, wsID, map[string]any{
+	if err := gh.applyGroupPatchOpTx(context.Background(), nil, group, wsID, map[string]any{
 		"op":    "remove",
 		"path":  "members",
 		"value": []any{map[string]any{"$ref": "https://legacy.idp.example/scim/v1/Users/" + u2.String()}},

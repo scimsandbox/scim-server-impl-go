@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -22,7 +24,56 @@ const (
 	ProvPutFullURN     = "urn:ietf:params:scim:event:prov:put:full"
 	ProvPatchNoticeURN = "urn:ietf:params:scim:event:prov:patch:notice"
 	ProvDeleteURN      = "urn:ietf:params:scim:event:prov:delete"
+
+	maxConcurrentAsyncWorkers = 64
 )
+
+var asyncWorkerSem = make(chan struct{}, maxConcurrentAsyncWorkers)
+
+func runAsyncWorker(
+	repo repository.AsyncEventRepo,
+	baseURL string,
+	txnID uuid.UUID,
+	resourceType string,
+	initialResID *uuid.UUID,
+	method string,
+	op func(ctx context.Context) (resID *uuid.UUID, setJSON string, err error),
+) {
+	go func() {
+		asyncWorkerSem <- struct{}{}
+		defer func() { <-asyncWorkerSem }()
+
+		recordFailure := func(resID *uuid.UUID, opErr error) {
+			if resID == nil {
+				resID = initialResID
+			}
+			statusCtx, statusCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer statusCancel()
+			errSet, _ := buildErrorSETJson(baseURL, txnID, resourceType, resID, method, opErr)
+			_ = repo.UpdateStatusAndPayload(statusCtx, txnID, model.AsyncStatusFailed, resID, &errSet, time.Now().UTC())
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("panic in async SCIM worker", "txnId", txnID, "resourceType", resourceType, "method", method, "panic", r)
+				recordFailure(initialResID, scim.NewScimError(http.StatusInternalServerError, "", "Internal server error"))
+			}
+		}()
+
+		workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		resID, setJSON, err := op(workerCtx)
+		if err != nil {
+			recordFailure(resID, err)
+			return
+		}
+
+		statusCtx, statusCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer statusCancel()
+		_ = repo.UpdateStatusAndPayload(statusCtx, txnID, model.AsyncStatusCompleted, resID, &setJSON, time.Now().UTC())
+	}()
+}
 
 // isAsyncPreferred checks if the request contains 'Prefer: respond-async' per RFC 7240.
 func isAsyncPreferred(r *http.Request) bool {
@@ -132,16 +183,6 @@ func extractModifiedPatchPaths(operations []map[string]any) []string {
 		paths = []string{"displayName"}
 	}
 	return paths
-}
-
-func extractModifiedPatchPathsFromAny(ops []any) []string {
-	maps := make([]map[string]any, 0, len(ops))
-	for _, o := range ops {
-		if m, ok := o.(map[string]any); ok {
-			maps = append(maps, m)
-		}
-	}
-	return extractModifiedPatchPaths(maps)
 }
 
 // buildSETJson constructs an RFC 8417 / RFC 9967 Security Event Token (SET) JSON payload

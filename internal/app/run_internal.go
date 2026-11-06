@@ -12,6 +12,7 @@ import (
 	"github.com/scimsandbox/scim-server-impl-go/internal/configloader"
 	"github.com/scimsandbox/scim-server-impl-go/internal/logging"
 	"github.com/scimsandbox/scim-server-impl-go/internal/messages"
+	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
 func loadConfig(lookupEnv LookupEnvFunc) (Config, error) {
@@ -41,6 +42,9 @@ func loadConfig(lookupEnv LookupEnvFunc) (Config, error) {
 	applyConfigDefaults(&cfg)
 	if err := validateConfig(cfg); err != nil {
 		return Config{}, err
+	}
+	if cfg.Server.CursorSecret != "" {
+		scim.SetCursorSecret(cfg.Server.CursorSecret)
 	}
 
 	return cfg, nil

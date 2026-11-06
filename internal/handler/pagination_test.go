@@ -384,3 +384,62 @@ func TestParsePagination_MaxResultsAndCursorTooMany_Group5(t *testing.T) {
 	}
 }
 
+func TestBuildListResponse_CursorCountZeroOmitsNextCursor(t *testing.T) {
+	wsID := uuid.New()
+	pag := &PaginationRequest{
+		IsCursor: true,
+		Offset:   0,
+		Count:    0,
+	}
+	resp := buildListResponse(pag, wsID, 10, []map[string]any{})
+	if _, exists := resp["nextCursor"]; exists {
+		t.Fatalf("expected nextCursor to be omitted when count=0 (0 resources returned), got %v", resp["nextCursor"])
+	}
+}
+
+func TestBuildListResponse_PreviousCursorUsesPrevPageSize(t *testing.T) {
+	wsID := uuid.New()
+
+	// Page 1: offset=0, count=5 -> 5 resources returned out of 10
+	pag1 := &PaginationRequest{
+		IsCursor: true,
+		Offset:   0,
+		Count:    5,
+	}
+	page1Resources := []map[string]any{
+		{"id": "1"}, {"id": "2"}, {"id": "3"}, {"id": "4"}, {"id": "5"},
+	}
+	resp1 := buildListResponse(pag1, wsID, 10, page1Resources)
+	nextCur1, ok := resp1["nextCursor"].(string)
+	if !ok || nextCur1 == "" {
+		t.Fatalf("expected nextCursor on page 1")
+	}
+
+	// Page 2: client uses nextCur1 but changes count=2
+	pag2, scimErr := parsePagination(url.Values{
+		"cursor": []string{nextCur1},
+		"count":  []string{"2"},
+	}, nil, wsID, 10)
+	if scimErr != nil {
+		t.Fatalf("parsePagination failed: %v", scimErr)
+	}
+	if pag2.Offset != 5 || pag2.PrevPageSize != 5 || pag2.Count != 2 {
+		t.Fatalf("got Offset=%d PrevPageSize=%d Count=%d, want Offset=5 PrevPageSize=5 Count=2",
+			pag2.Offset, pag2.PrevPageSize, pag2.Count)
+	}
+
+	resp2 := buildListResponse(pag2, wsID, 10, []map[string]any{{"id": "6"}, {"id": "7"}})
+	prevCur2, ok := resp2["previousCursor"].(string)
+	if !ok || prevCur2 == "" {
+		t.Fatalf("expected previousCursor on page 2")
+	}
+	prevOffset, err := scim.DecodeCursor(prevCur2, wsID)
+	if err != nil {
+		t.Fatalf("DecodeCursor(previousCursor) failed: %v", err)
+	}
+	if prevOffset != 0 {
+		t.Fatalf("previousCursor offset = %d, want 0 (stepped back by PrevPageSize=5, not current Count=2)", prevOffset)
+	}
+}
+
+

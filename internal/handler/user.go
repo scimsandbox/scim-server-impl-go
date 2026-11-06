@@ -45,6 +45,175 @@ func NewUserHandler(
 	}
 }
 
+func (h *UserHandler) executeCreateUser(ctx context.Context, wsID uuid.UUID, baseURL string, body map[string]any) (*model.ScimUser, error) {
+	if h.userRepo == nil {
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	userName, _ := body["userName"].(string)
+	userName = scim.NormalizeNFC(userName)
+	if userName == "" {
+		return nil, scim.NewScimError(http.StatusBadRequest, "invalidValue", "userName is required")
+	}
+
+	exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(ctx, userName, wsID)
+	if err != nil {
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+	if exists {
+		return nil, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+userName+"' already exists")
+	}
+
+	user := &model.ScimUser{
+		ID:           uuid.New(),
+		WorkspaceID:  wsID,
+		Active:       true,
+		CreatedAt:    time.Now().UTC(),
+		LastModified: time.Now().UTC(),
+		Version:      0,
+	}
+	if err := scim.ApplyFromScimInput(user, body); err != nil {
+		return nil, err
+	}
+	h.resolveManagerMetadata(ctx, user, wsID, baseURL)
+
+	if err := h.userRepo.Create(ctx, user); err != nil {
+		if isUserNameConflict(err) {
+			return nil, scim.NewScimError(http.StatusConflict, "uniqueness",
+				"User with userName '"+user.UserName+"' already exists")
+		}
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create user")
+	}
+
+	h.touchWorkspace(ctx, wsID)
+	return user, nil
+}
+
+func (h *UserHandler) executeReplaceUser(ctx context.Context, wsID, userID uuid.UUID, baseURL string, body map[string]any, ifMatch string) (*model.ScimUser, error) {
+	if h.userRepo == nil {
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	user, err := h.userRepo.FindByIDAndWorkspaceID(ctx, userID, wsID)
+	if err != nil || user == nil {
+		return nil, scim.NewScimError(http.StatusNotFound, "", "User not found")
+	}
+
+	if !checkETagMatch(ifMatch, user.Version) {
+		return nil, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch")
+	}
+
+	newUserName, _ := body["userName"].(string)
+	newUserName = scim.NormalizeNFC(newUserName)
+	if newUserName != "" && !strings.EqualFold(newUserName, user.UserName) {
+		exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(ctx, newUserName, wsID)
+		if err != nil {
+			return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+		}
+		if exists {
+			return nil, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+newUserName+"' already exists")
+		}
+	}
+
+	scim.ClearMutableAttributes(user)
+	if err := scim.ApplyFromScimInput(user, body); err != nil {
+		return nil, err
+	}
+	h.resolveManagerMetadata(ctx, user, wsID, baseURL)
+	user.LastModified = time.Now().UTC()
+
+	if err := h.userRepo.Update(ctx, user); err != nil {
+		if errors.Is(err, repository.ErrOptimisticLock) {
+			return nil, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed")
+		}
+		if isUserNameConflict(err) {
+			return nil, scim.NewScimError(http.StatusConflict, "uniqueness",
+				"User with userName '"+user.UserName+"' already exists")
+		}
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update user")
+	}
+
+	h.touchWorkspace(ctx, wsID)
+	return user, nil
+}
+
+func (h *UserHandler) executePatchUser(ctx context.Context, wsID, userID uuid.UUID, baseURL string, ops []map[string]any, ifMatch string) (*model.ScimUser, error) {
+	if h.userRepo == nil {
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	user, err := h.userRepo.FindByIDAndWorkspaceID(ctx, userID, wsID)
+	if err != nil || user == nil {
+		return nil, scim.NewScimError(http.StatusNotFound, "", "User not found")
+	}
+
+	if !checkETagMatch(ifMatch, user.Version) {
+		return nil, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch")
+	}
+
+	before := scim.CloneScimUser(user)
+	if err := scim.ApplyPatchOperations(user, ops); err != nil {
+		return nil, err
+	}
+	h.resolveManagerMetadata(ctx, user, wsID, baseURL)
+
+	if !scim.ScimUserMutableEqual(before, user) {
+		if !strings.EqualFold(user.UserName, before.UserName) {
+			exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(ctx, user.UserName, wsID)
+			if err != nil {
+				return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+			}
+			if exists {
+				return nil, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+user.UserName+"' already exists")
+			}
+		}
+
+		user.LastModified = time.Now().UTC()
+		if err := h.userRepo.Update(ctx, user); err != nil {
+			if errors.Is(err, repository.ErrOptimisticLock) {
+				return nil, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed")
+			}
+			if isUserNameConflict(err) {
+				return nil, scim.NewScimError(http.StatusConflict, "uniqueness",
+					"User with userName '"+user.UserName+"' already exists")
+			}
+			return nil, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update user")
+		}
+
+		h.touchWorkspace(ctx, wsID)
+	}
+
+	return user, nil
+}
+
+func (h *UserHandler) executeDeleteUser(ctx context.Context, wsID, userID uuid.UUID, ifMatch string) error {
+	if h.userRepo == nil {
+		return scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	user, err := h.userRepo.FindByIDAndWorkspaceID(ctx, userID, wsID)
+	if err != nil || user == nil {
+		return scim.NewScimError(http.StatusNotFound, "", "User not found")
+	}
+
+	if !checkETagMatch(ifMatch, user.Version) {
+		return scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch")
+	}
+
+	if h.membershipRepo != nil {
+		if err := h.membershipRepo.DeleteByMemberValue(ctx, userID); err != nil {
+			slog.Error("failed to delete memberships", "error", err)
+		}
+	}
+
+	if err := h.userRepo.Delete(ctx, userID, wsID); err != nil {
+		return scim.NewScimError(http.StatusInternalServerError, "", "Failed to delete user")
+	}
+
+	h.touchWorkspace(ctx, wsID)
+	return nil
+}
+
 func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	wsID, err := resolveWorkspaceID(r)
 	if err != nil {
@@ -65,9 +234,10 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	baseURL := buildBaseURL(r)
+
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
 		txnID := uuid.New()
-		baseURL := buildBaseURL(r)
 		eventURL := baseURL + "/Events/" + txnID.String()
 
 		event := &model.ScimAsyncEvent{
@@ -76,6 +246,7 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 			Operation:    "POST",
 			ResourceType: "User",
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -88,103 +259,30 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(detachedInput map[string]any, normUN string, ws uuid.UUID, txn uuid.UUID, base string, compat scim.CompatMode) {
-			if h.userRepo == nil {
-				return
-			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(resID *uuid.UUID, opErr error) {
-				errSet, _ := buildErrorSETJson(base, txn, "User", resID, "POST", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, resID, &errSet, time.Now().UTC())
-			}
-
-			exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(workerCtx, normUN, ws)
+		compat := getCompatMode(r)
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", nil, "POST", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			user, err := h.executeCreateUser(workerCtx, wsID, baseURL, input)
 			if err != nil {
-				failAsync(nil, err)
-				return
+				return nil, "", err
 			}
-			if exists {
-				failAsync(nil, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+normUN+"' already exists"))
-				return
-			}
-
-			user := &model.ScimUser{
-				ID:           uuid.New(),
-				WorkspaceID:  ws,
-				Active:       true,
-				CreatedAt:    time.Now().UTC(),
-				LastModified: time.Now().UTC(),
-				Version:      0,
-			}
-			if err := scim.ApplyFromScimInput(user, detachedInput); err != nil {
-				failAsync(nil, err)
-				return
-			}
-			h.resolveManagerMetadata(workerCtx, user, ws, base)
-
-			if err := h.userRepo.Create(workerCtx, user); err != nil {
-				if isUserNameConflict(err) {
-					failAsync(nil, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+user.UserName+"' already exists"))
-					return
-				}
-				failAsync(nil, err)
-				return
-			}
-			h.touchWorkspace(workerCtx, ws)
-
-			resp := scim.UserToScimResponse(user, base, nil)
+			resp := scim.UserToScimResponse(user, baseURL, nil)
 			if compat == scim.CompatMS {
 				resp = scim.ApplyMsCompat(resp)
 			}
-			setStr, err := buildSETJson(base, txn, "User", user.ID, "POST", resp)
+			setStr, err := buildSETJson(baseURL, txnID, "User", user.ID, "POST", resp)
 			if err != nil {
-				failAsync(&user.ID, err)
-				return
+				return &user.ID, "", err
 			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &user.ID, &setStr, time.Now().UTC())
-		}(input, userName, wsID, txnID, baseURL, getCompatMode(r))
+			return &user.ID, setStr, nil
+		})
 		return
 	}
 
-	exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), userName, wsID)
+	user, err := h.executeCreateUser(r.Context(), wsID, baseURL, input)
 	if err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
-		return
-	}
-	if exists {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+userName+"' already exists"))
-		return
-	}
-
-	user := &model.ScimUser{
-		ID:           uuid.New(),
-		WorkspaceID:  wsID,
-		Active:       true,
-		CreatedAt:    time.Now(),
-		LastModified: time.Now(),
-		Version:      0,
-	}
-	if err := scim.ApplyFromScimInput(user, input); err != nil {
 		scim.WriteErrorFromAny(w, err)
 		return
 	}
-
-	baseURL := buildBaseURL(r)
-	h.resolveManagerMetadata(r.Context(), user, wsID, baseURL)
-
-	if err := h.userRepo.Create(r.Context(), user); err != nil {
-		if isUserNameConflict(err) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
-				"User with userName '"+user.UserName+"' already exists"))
-			return
-		}
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create user"))
-		return
-	}
-
-	h.touchWorkspace(r.Context(), wsID)
 
 	response := scim.UserToScimResponse(user, baseURL, nil)
 
@@ -223,13 +321,9 @@ func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// If-None-Match → 304
-	ifNoneMatch := r.Header.Get("If-None-Match")
-	if ifNoneMatch != "" {
-		etag := fmt.Sprintf("W/\"%d\"", user.Version)
-		if ifNoneMatch == etag || ifNoneMatch == "*" {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
+	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" && checkETagMatch(ifNoneMatch, user.Version) {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 
 	baseURL := buildBaseURL(r)
@@ -357,11 +451,12 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	baseURL := buildBaseURL(r)
+	ifMatch := r.Header.Get("If-Match")
+
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
 		txnID := uuid.New()
-		baseURL := buildBaseURL(r)
 		eventURL := baseURL + "/Events/" + txnID.String()
-		ifMatchHdr := r.Header.Get("If-Match")
 
 		event := &model.ScimAsyncEvent{
 			TxnID:        txnID,
@@ -370,6 +465,7 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 			ResourceType: "User",
 			ResourceID:   &userID,
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -382,134 +478,31 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(detachedInput map[string]any, ws uuid.UUID, uid uuid.UUID, txn uuid.UUID, base string, ifMatch string, compat scim.CompatMode) {
-			if h.userRepo == nil {
-				return
-			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(opErr error) {
-				errSet, _ := buildErrorSETJson(base, txn, "User", &uid, "PUT", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, &errSet, time.Now().UTC())
-			}
-
-			u, err := h.userRepo.FindByIDAndWorkspaceID(workerCtx, uid, ws)
+		compat := getCompatMode(r)
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", &userID, "PUT", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			u, err := h.executeReplaceUser(workerCtx, wsID, userID, baseURL, input, ifMatch)
 			if err != nil {
-				failAsync(err)
-				return
+				return &userID, "", err
 			}
-			if u == nil {
-				failAsync(scim.NewScimError(http.StatusNotFound, "", "User not found"))
-				return
-			}
-			if !checkETagMatch(ifMatch, u.Version) {
-				failAsync(scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-				return
-			}
-
-			newUserName, _ := detachedInput["userName"].(string)
-			newUserName = scim.NormalizeNFC(newUserName)
-			if newUserName != "" && !strings.EqualFold(newUserName, u.UserName) {
-				exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(workerCtx, newUserName, ws)
-				if err != nil {
-					failAsync(err)
-					return
-				}
-				if exists {
-					failAsync(scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+newUserName+"' already exists"))
-					return
-				}
-			}
-
-			scim.ClearMutableAttributes(u)
-			if err := scim.ApplyFromScimInput(u, detachedInput); err != nil {
-				failAsync(err)
-				return
-			}
-			h.resolveManagerMetadata(workerCtx, u, ws, base)
-			u.LastModified = time.Now().UTC()
-
-			if err := h.userRepo.Update(workerCtx, u); err != nil {
-				if errors.Is(err, repository.ErrOptimisticLock) {
-					failAsync(scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
-					return
-				}
-				if isUserNameConflict(err) {
-					failAsync(scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+u.UserName+"' already exists"))
-					return
-				}
-				failAsync(err)
-				return
-			}
-			h.touchWorkspace(workerCtx, ws)
-
-			groups := h.getUserGroups(workerCtx, u.ID, base)
-			resp := scim.UserToScimResponse(u, base, groups)
+			groups := h.getUserGroups(workerCtx, u.ID, baseURL)
+			resp := scim.UserToScimResponse(u, baseURL, groups)
 			if compat == scim.CompatMS {
 				resp = scim.ApplyMsCompat(resp)
 			}
-			setStr, err := buildSETJson(base, txn, "User", u.ID, "PUT", resp)
+			setStr, err := buildSETJson(baseURL, txnID, "User", u.ID, "PUT", resp)
 			if err != nil {
-				failAsync(err)
-				return
+				return &userID, "", err
 			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &uid, &setStr, time.Now().UTC())
-		}(input, wsID, userID, txnID, baseURL, ifMatchHdr, getCompatMode(r))
+			return &userID, setStr, nil
+		})
 		return
 	}
 
-	user, err := h.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
-	if err != nil || user == nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
-		return
-	}
-
-	// If-Match check (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
-	ifMatch := r.Header.Get("If-Match")
-	if !checkETagMatch(ifMatch, user.Version) {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-		return
-	}
-
-	newUserName, _ := input["userName"].(string)
-	newUserName = scim.NormalizeNFC(newUserName)
-	if newUserName != "" && !strings.EqualFold(newUserName, user.UserName) {
-		exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), newUserName, wsID)
-		if err != nil {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
-			return
-		}
-		if exists {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+newUserName+"' already exists"))
-			return
-		}
-	}
-
-	scim.ClearMutableAttributes(user)
-	if err := scim.ApplyFromScimInput(user, input); err != nil {
+	user, err := h.executeReplaceUser(r.Context(), wsID, userID, baseURL, input, ifMatch)
+	if err != nil {
 		scim.WriteErrorFromAny(w, err)
 		return
 	}
-	baseURL := buildBaseURL(r)
-	h.resolveManagerMetadata(r.Context(), user, wsID, baseURL)
-	user.LastModified = time.Now()
-
-	if err := h.userRepo.Update(r.Context(), user); err != nil {
-		if errors.Is(err, repository.ErrOptimisticLock) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
-			return
-		}
-		if isUserNameConflict(err) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
-				"User with userName '"+user.UserName+"' already exists"))
-			return
-		}
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update user"))
-		return
-	}
-
-	h.touchWorkspace(r.Context(), wsID)
 
 	groups := h.getUserGroups(r.Context(), user.ID, baseURL)
 	response := scim.UserToScimResponse(user, baseURL, groups)
@@ -574,11 +567,12 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	baseURL := buildBaseURL(r)
+	ifMatch := r.Header.Get("If-Match")
+
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
 		txnID := uuid.New()
-		baseURL := buildBaseURL(r)
 		eventURL := baseURL + "/Events/" + txnID.String()
-		ifMatchHdr := r.Header.Get("If-Match")
 
 		event := &model.ScimAsyncEvent{
 			TxnID:        txnID,
@@ -587,6 +581,7 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 			ResourceType: "User",
 			ResourceID:   &userID,
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -599,100 +594,29 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(detachedOps []map[string]any, ws uuid.UUID, uid uuid.UUID, txn uuid.UUID, base string, ifMatch string, compat scim.CompatMode) {
-			if h.userRepo == nil {
-				return
-			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(opErr error) {
-				errSet, _ := buildErrorSETJson(base, txn, "User", &uid, "PATCH", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, &errSet, time.Now().UTC())
-			}
-
-			u, err := h.userRepo.FindByIDAndWorkspaceID(workerCtx, uid, ws)
+		compat := getCompatMode(r)
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", &userID, "PATCH", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			u, err := h.executePatchUser(workerCtx, wsID, userID, baseURL, operations, ifMatch)
 			if err != nil {
-				failAsync(err)
-				return
+				return &userID, "", err
 			}
-			if u == nil {
-				failAsync(scim.NewScimError(http.StatusNotFound, "", "User not found"))
-				return
-			}
-			if !checkETagMatch(ifMatch, u.Version) {
-				failAsync(scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-				return
-			}
-
-			before := scim.CloneScimUser(u)
-			if err := scim.ApplyPatchOperations(u, detachedOps); err != nil {
-				failAsync(err)
-				return
-			}
-			h.resolveManagerMetadata(workerCtx, u, ws, base)
-
-			if !scim.ScimUserMutableEqual(before, u) {
-				if !strings.EqualFold(u.UserName, before.UserName) {
-					exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(workerCtx, u.UserName, ws)
-					if err != nil {
-						failAsync(err)
-						return
-					}
-					if exists {
-						failAsync(scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+u.UserName+"' already exists"))
-						return
-					}
-				}
-				u.LastModified = time.Now().UTC()
-				if err := h.userRepo.Update(workerCtx, u); err != nil {
-					if errors.Is(err, repository.ErrOptimisticLock) {
-						failAsync(scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
-						return
-					}
-					if isUserNameConflict(err) {
-						failAsync(scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+u.UserName+"' already exists"))
-						return
-					}
-					failAsync(err)
-					return
-				}
-				h.touchWorkspace(workerCtx, ws)
-			}
-
-			groups := h.getUserGroups(workerCtx, u.ID, base)
-			resp := scim.UserToScimResponse(u, base, groups)
+			groups := h.getUserGroups(workerCtx, u.ID, baseURL)
+			resp := scim.UserToScimResponse(u, baseURL, groups)
 			if compat == scim.CompatMS {
 				resp = scim.ApplyMsCompat(resp)
 			}
-			patchPaths := extractModifiedPatchPaths(detachedOps)
-			setStr, err := buildSETJson(base, txn, "User", u.ID, "PATCH", resp, patchPaths...)
+			patchPaths := extractModifiedPatchPaths(operations)
+			setStr, err := buildSETJson(baseURL, txnID, "User", u.ID, "PATCH", resp, patchPaths...)
 			if err != nil {
-				failAsync(err)
-				return
+				return &userID, "", err
 			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &uid, &setStr, time.Now().UTC())
-		}(operations, wsID, userID, txnID, baseURL, ifMatchHdr, getCompatMode(r))
+			return &userID, setStr, nil
+		})
 		return
 	}
 
-	user, err := h.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
-	if err != nil || user == nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
-		return
-	}
-
-	// If-Match check (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
-	ifMatch := r.Header.Get("If-Match")
-	if !checkETagMatch(ifMatch, user.Version) {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-		return
-	}
-
-	baseURL := buildBaseURL(r)
-	before := scim.CloneScimUser(user)
-
-	if err := scim.ApplyPatchOperations(user, operations); err != nil {
+	user, err := h.executePatchUser(r.Context(), wsID, userID, baseURL, operations, ifMatch)
+	if err != nil {
 		var scimErr *scim.ScimError
 		if errors.As(err, &scimErr) {
 			scim.WriteScimError(w, scimErr)
@@ -700,39 +624,6 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		}
 		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", err.Error()))
 		return
-	}
-	h.resolveManagerMetadata(r.Context(), user, wsID, baseURL)
-
-	if !scim.ScimUserMutableEqual(before, user) {
-		if !strings.EqualFold(user.UserName, before.UserName) {
-			exists, err := h.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), user.UserName, wsID)
-			if err != nil {
-				scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
-				return
-			}
-			if exists {
-				scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness", "User with userName '"+user.UserName+"' already exists"))
-				return
-			}
-		}
-
-		user.LastModified = time.Now()
-
-		if err := h.userRepo.Update(r.Context(), user); err != nil {
-			if errors.Is(err, repository.ErrOptimisticLock) {
-				scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
-				return
-			}
-			if isUserNameConflict(err) {
-				scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
-					"User with userName '"+user.UserName+"' already exists"))
-				return
-			}
-			scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update user"))
-			return
-		}
-
-		h.touchWorkspace(r.Context(), wsID)
 	}
 
 	groups := h.getUserGroups(r.Context(), user.ID, baseURL)
@@ -764,11 +655,12 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ifMatch := r.Header.Get("If-Match")
+
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
 		txnID := uuid.New()
 		baseURL := buildBaseURL(r)
 		eventURL := baseURL + "/Events/" + txnID.String()
-		ifMatchHdr := r.Header.Get("If-Match")
 
 		event := &model.ScimAsyncEvent{
 			TxnID:        txnID,
@@ -777,6 +669,7 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 			ResourceType: "User",
 			ResourceID:   &userID,
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -789,76 +682,24 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(ws uuid.UUID, uid uuid.UUID, txn uuid.UUID, base string, ifMatch string) {
-			if h.userRepo == nil {
-				return
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "User", &userID, "DELETE", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			if err := h.executeDeleteUser(workerCtx, wsID, userID, ifMatch); err != nil {
+				return &userID, "", err
 			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(opErr error) {
-				errSet, _ := buildErrorSETJson(base, txn, "User", &uid, "DELETE", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &uid, &errSet, time.Now().UTC())
-			}
-
-			u, err := h.userRepo.FindByIDAndWorkspaceID(workerCtx, uid, ws)
+			setStr, err := buildSETJson(baseURL, txnID, "User", userID, "DELETE", nil)
 			if err != nil {
-				failAsync(err)
-				return
+				return &userID, "", err
 			}
-			if u == nil {
-				failAsync(scim.NewScimError(http.StatusNotFound, "", "User not found"))
-				return
-			}
-			if !checkETagMatch(ifMatch, u.Version) {
-				failAsync(scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-				return
-			}
-
-			if h.membershipRepo != nil {
-				_ = h.membershipRepo.DeleteByMemberValue(workerCtx, uid)
-			}
-			if err := h.userRepo.Delete(workerCtx, uid, ws); err != nil {
-				failAsync(err)
-				return
-			}
-			h.touchWorkspace(workerCtx, ws)
-
-			setStr, err := buildSETJson(base, txn, "User", uid, "DELETE", nil)
-			if err != nil {
-				failAsync(err)
-				return
-			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &uid, &setStr, time.Now().UTC())
-		}(wsID, userID, txnID, baseURL, ifMatchHdr)
+			return &userID, setStr, nil
+		})
 		return
 	}
 
-	user, err := h.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
-	if err != nil || user == nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "User not found"))
+	if err := h.executeDeleteUser(r.Context(), wsID, userID, ifMatch); err != nil {
+		scim.WriteErrorFromAny(w, err)
 		return
 	}
 
-	ifMatch := r.Header.Get("If-Match")
-	if !checkETagMatch(ifMatch, user.Version) {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-		return
-	}
-
-	// Delete memberships first
-	if h.membershipRepo != nil {
-		if err := h.membershipRepo.DeleteByMemberValue(r.Context(), userID); err != nil {
-			slog.Error("failed to delete memberships", "error", err)
-		}
-	}
-
-	if err := h.userRepo.Delete(r.Context(), userID, wsID); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to delete user"))
-		return
-	}
-
-	h.touchWorkspace(r.Context(), wsID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1007,35 +848,6 @@ func (h *UserHandler) touchWorkspace(ctx context.Context, wsID uuid.UUID) {
 	if err := h.workspaceRepo.TouchUpdatedAt(ctx, wsID); err != nil {
 		slog.Error("failed to touch workspace", "error", err)
 	}
-}
-
-func clampInt(s string, defaultVal, minVal int) int {
-	if s == "" {
-		return defaultVal
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return defaultVal
-	}
-	if v < minVal {
-		return minVal
-	}
-	return v
-}
-
-func clampIntMax(s string, defaultVal, minVal, maxVal int) int {
-	v := clampInt(s, defaultVal, minVal)
-	if v > maxVal {
-		return maxVal
-	}
-	return v
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // userNameConstraints are the unique constraints on scim_users that a client can violate

@@ -25,6 +25,7 @@ type ServerConfig struct {
 	WriteTimeout      time.Duration `yaml:"write_timeout" env:"GO_SERVER_WRITE_TIMEOUT"`
 	IdleTimeout       time.Duration `yaml:"idle_timeout" env:"GO_SERVER_IDLE_TIMEOUT"`
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout" env:"GO_SERVER_SHUTDOWN_TIMEOUT"`
+	CursorSecret      string        `yaml:"cursor_secret" env:"GO_CURSOR_SECRET"`
 }
 
 type ManagementConfig struct {

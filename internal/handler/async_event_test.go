@@ -42,7 +42,8 @@ func (m *mockAsyncEventRepo) Create(ctx context.Context, e *model.ScimAsyncEvent
 	if e.TxnID == uuid.Nil {
 		e.TxnID = uuid.New()
 	}
-	m.events[e.TxnID] = e
+	cp := *e
+	m.events[cp.TxnID] = &cp
 	return nil
 }
 
@@ -56,7 +57,8 @@ func (m *mockAsyncEventRepo) FindByTxnIDAndWorkspaceID(ctx context.Context, txnI
 	if !ok || e.WorkspaceID != workspaceID {
 		return nil, nil
 	}
-	return e, nil
+	cp := *e
+	return &cp, nil
 }
 
 func (m *mockAsyncEventRepo) UpdateStatusAndPayload(
@@ -72,7 +74,7 @@ func (m *mockAsyncEventRepo) UpdateStatusAndPayload(
 	if m.updateErr != nil {
 		return m.updateErr
 	}
-	if e, ok := m.events[txnID]; ok {
+	if e, ok := m.events[txnID]; ok && e.Status == model.AsyncStatusPending {
 		e.Status = status
 		if resourceID != nil {
 			e.ResourceID = resourceID
@@ -1296,6 +1298,120 @@ func TestBuildErrorSETJson_FallbackFormatting(t *testing.T) {
 		})
 	}
 }
+
+type ctxCapturingAsyncEventRepo struct {
+	*mockAsyncEventRepo
+	updateCtxErr chan error
+}
+
+func (c *ctxCapturingAsyncEventRepo) UpdateStatusAndPayload(
+	ctx context.Context,
+	txnID uuid.UUID,
+	status string,
+	resourceID *uuid.UUID,
+	payload *string,
+	completedAt time.Time,
+) error {
+	select {
+	case c.updateCtxErr <- ctx.Err():
+	default:
+	}
+	return c.mockAsyncEventRepo.UpdateStatusAndPayload(ctx, txnID, status, resourceID, payload, completedAt)
+}
+
+func TestRunAsyncWorker_PanicRecovery_FreshStatusContext_And_PendingGuard(t *testing.T) {
+	wsID := uuid.New()
+	baseURL := "https://example.com/ws/" + wsID.String() + "/scim/v2"
+
+	t.Run("recovers from panic and transitions event to FAILED", func(t *testing.T) {
+		repo := &ctxCapturingAsyncEventRepo{
+			mockAsyncEventRepo: newMockAsyncEventRepo(),
+			updateCtxErr:       make(chan error, 1),
+		}
+		txnID := uuid.New()
+		resID := uuid.New()
+		_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "POST",
+			ResourceType: "User",
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		})
+
+		runAsyncWorker(repo, baseURL, txnID, "User", &resID, "POST", func(ctx context.Context) (*uuid.UUID, string, error) {
+			panic("simulated worker crash")
+		})
+
+		select {
+		case ctxErr := <-repo.updateCtxErr:
+			if ctxErr != nil {
+				t.Fatalf("expected non-canceled statusCtx in UpdateStatusAndPayload, got %v", ctxErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for panic recovery status update")
+		}
+
+		ev, _ := repo.FindByTxnIDAndWorkspaceID(context.Background(), txnID, wsID)
+		if ev == nil || ev.Status != model.AsyncStatusFailed {
+			t.Fatalf("event status = %v, want FAILED", ev)
+		}
+	})
+
+	t.Run("uses fresh statusCtx even when worker operation context is canceled/expired", func(t *testing.T) {
+		repo := &ctxCapturingAsyncEventRepo{
+			mockAsyncEventRepo: newMockAsyncEventRepo(),
+			updateCtxErr:       make(chan error, 1),
+		}
+		txnID := uuid.New()
+		_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "POST",
+			ResourceType: "User",
+			Status:       model.AsyncStatusPending,
+			CreatedAt:    time.Now().UTC(),
+		})
+
+		runAsyncWorker(repo, baseURL, txnID, "User", nil, "POST", func(ctx context.Context) (*uuid.UUID, string, error) {
+			return nil, "", context.DeadlineExceeded
+		})
+
+		select {
+		case ctxErr := <-repo.updateCtxErr:
+			if ctxErr != nil {
+				t.Fatalf("expected fresh statusCtx with nil Err(), got %v", ctxErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for failure status update")
+		}
+	})
+
+	t.Run("does not overwrite FAILED event when reaper already transitioned it from PENDING", func(t *testing.T) {
+		repo := newMockAsyncEventRepo()
+		txnID := uuid.New()
+		reaperPayload := `{"reaper":"failed"}`
+		_ = repo.Create(context.Background(), &model.ScimAsyncEvent{
+			TxnID:        txnID,
+			WorkspaceID:  wsID,
+			Operation:    "POST",
+			ResourceType: "User",
+			Status:       model.AsyncStatusFailed,
+			SetPayload:   &reaperPayload,
+			CreatedAt:    time.Now().UTC(),
+		})
+
+		resID := uuid.New()
+		latePayload := `{"worker":"completed"}`
+		_ = repo.UpdateStatusAndPayload(context.Background(), txnID, model.AsyncStatusCompleted, &resID, &latePayload, time.Now().UTC())
+
+		ev, _ := repo.FindByTxnIDAndWorkspaceID(context.Background(), txnID, wsID)
+		if ev.Status != model.AsyncStatusFailed || ev.SetPayload == nil || *ev.SetPayload != reaperPayload {
+			t.Fatalf("expected FAILED status and reaper payload to be preserved, got status=%s payload=%v", ev.Status, ev.SetPayload)
+		}
+	})
+}
+
 
 
 

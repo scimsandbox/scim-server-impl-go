@@ -31,6 +31,9 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	if err != nil {
 		return err
 	}
+	if cfg.Server.CursorSecret != "" {
+		scim.SetCursorSecret(cfg.Server.CursorSecret)
+	}
 
 	logger := setupLogger(cfg, stderr)
 	localizer := setupLocalizer(cfg)

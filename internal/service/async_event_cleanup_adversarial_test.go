@@ -746,8 +746,9 @@ func TestBuildStalePendingErrorSET_RFC9967_Conformance(t *testing.T) {
 			}
 
 			// 2. Base SET claims (RFC 8417 / RFC 9967)
-			if m["iss"] != fmt.Sprintf("/ws/%s/scim/v2", wsID.String()) {
-				t.Errorf("iss = %v, want /ws/%s/scim/v2", m["iss"], wsID)
+			wantIss := fmt.Sprintf("http://localhost:8080/ws/%s/scim/v2", wsID.String())
+			if m["iss"] != wantIss {
+				t.Errorf("iss = %v, want %s", m["iss"], wantIss)
 			}
 			if _, ok := m["iat"].(float64); !ok {
 				t.Errorf("iat = %v, want numeric unix timestamp", m["iat"])
@@ -798,7 +799,7 @@ func TestBuildStalePendingErrorSET_RFC9967_Conformance(t *testing.T) {
 
 			// 5. Sub ID and location verification
 			if tc.wantLocation {
-				expectedURI := fmt.Sprintf("/ws/%s/scim/v2/%s/%s", wsID.String(), tc.wantPlural, resID.String())
+				expectedURI := fmt.Sprintf("http://localhost:8080/ws/%s/scim/v2/%s/%s", wsID.String(), tc.wantPlural, resID.String())
 				if asyncResp["location"] != expectedURI {
 					t.Errorf("asyncResp.location = %v, want %q", asyncResp["location"], expectedURI)
 				}

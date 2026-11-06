@@ -236,8 +236,12 @@ func BuildStalePendingErrorSET(event *model.ScimAsyncEvent) string {
 	}
 
 	baseURL := ""
-	if event.WorkspaceID != uuid.Nil {
-		baseURL = fmt.Sprintf("/ws/%s/scim/v2", event.WorkspaceID.String())
+	if event.SetPayload != nil && (strings.HasPrefix(*event.SetPayload, "http://") || strings.HasPrefix(*event.SetPayload, "https://")) {
+		baseURL = strings.TrimRight(*event.SetPayload, "/")
+	} else if event.WorkspaceID != uuid.Nil {
+		baseURL = fmt.Sprintf("http://localhost:8080/ws/%s/scim/v2", event.WorkspaceID.String())
+	} else {
+		baseURL = "http://localhost:8080/scim/v2"
 	}
 
 	payload := map[string]any{

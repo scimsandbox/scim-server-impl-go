@@ -739,3 +739,39 @@ func TestVersionAgnosticRefFilters_RFC7643_2_4(t *testing.T) {
 	}
 }
 
+func TestBuildJSONAttributeFilter_JsonbArrayElementsAndSpecialChars(t *testing.T) {
+	// 1. Direct JSON attribute filter with quotes and backslashes uses jsonb_array_elements
+	resQuote, err := ParseUserFilter(`emails.value eq "a\"b\\c@example.com"`, 1)
+	if err != nil {
+		t.Fatalf("ParseUserFilter with quotes/backslashes failed: %v", err)
+	}
+	if !strings.Contains(resQuote.SQL, "jsonb_array_elements(emails::jsonb) AS elem") {
+		t.Fatalf("expected jsonb_array_elements in SQL, got: %s", resQuote.SQL)
+	}
+	if !strings.Contains(resQuote.SQL, "LOWER(elem->>'value') = LOWER($1)") {
+		t.Fatalf("expected LOWER(elem->>'value') = LOWER($1) in SQL, got: %s", resQuote.SQL)
+	}
+	if len(resQuote.Args) != 1 || resQuote.Args[0] != `a\"b\\c@example.com` {
+		t.Fatalf("unexpected Args: %v", resQuote.Args)
+	}
+
+	// 2. Presence filter on JSON sub-attribute checks elem->>'type' IS NOT NULL
+	resPr, err := ParseUserFilter(`emails.type pr`, 1)
+	if err != nil {
+		t.Fatalf("ParseUserFilter emails.type pr failed: %v", err)
+	}
+	if !strings.Contains(resPr.SQL, "jsonb_array_elements(emails::jsonb) AS elem") || !strings.Contains(resPr.SQL, "(elem->>'type') IS NOT NULL") {
+		t.Fatalf("expected jsonb_array_elements with elem->>'type' IS NOT NULL, got: %s", resPr.SQL)
+	}
+
+	// 3. Control characters (e.g., tab) in LIKE value are preserved by escapeLikeValue
+	resCtrl, err := ParseUserFilter("displayName co \"a\tb\"", 1)
+	if err != nil {
+		t.Fatalf("ParseUserFilter with tab character failed: %v", err)
+	}
+	if len(resCtrl.Args) != 1 || resCtrl.Args[0] != "%a\tb%" {
+		t.Fatalf("expected control char preserved in LIKE arg '%%a\\tb%%', got %q", resCtrl.Args)
+	}
+}
+
+

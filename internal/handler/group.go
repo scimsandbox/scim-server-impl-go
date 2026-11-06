@@ -193,8 +193,7 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawExt, hasExt := input["externalId"]
-	extIDPtr, err := parseGroupExternalID(rawExt, hasExt)
-	if err != nil {
+	if _, err := parseGroupExternalID(rawExt, hasExt); err != nil {
 		scim.WriteErrorFromAny(w, err)
 		return
 	}
@@ -210,6 +209,7 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 			Operation:    "POST",
 			ResourceType: "Group",
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -222,162 +222,28 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(detachedInput map[string]any, normDN string, normExt *string, ws uuid.UUID, txn uuid.UUID, base string) {
-			if h.groupRepo == nil {
-				return
-			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(resID *uuid.UUID, opErr error) {
-				errSet, _ := buildErrorSETJson(base, txn, "Group", resID, "POST", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, resID, &errSet, time.Now().UTC())
-			}
-
-			existing, err := h.groupRepo.FindByDisplayNameAndWorkspaceID(workerCtx, normDN, ws)
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", nil, "POST", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			group, err := h.executeCreateGroup(workerCtx, wsID, input)
 			if err != nil {
-				failAsync(nil, err)
-				return
+				return nil, "", err
 			}
-			if existing != nil {
-				failAsync(nil, scim.NewScimError(http.StatusConflict, "uniqueness", "Group with displayName '"+normDN+"' already exists"))
-				return
-			}
-
-			group := &model.ScimGroup{
-				ID:           uuid.New(),
-				WorkspaceID:  ws,
-				DisplayName:  normDN,
-				ExternalID:   normExt,
-				CreatedAt:    time.Now().UTC(),
-				LastModified: time.Now().UTC(),
-				Version:      0,
-			}
-
-			if err := h.groupRepo.Create(workerCtx, group); err != nil {
-				if isGroupDisplayNameConflict(err) {
-					failAsync(nil, scim.NewScimError(http.StatusConflict, "uniqueness", "Group with displayName '"+normDN+"' already exists"))
-					return
-				}
-				failAsync(nil, err)
-				return
-			}
-
-			if members, ok := detachedInput["members"].([]any); ok {
-				seenMembers := make(map[string]bool, len(members))
-				for _, m := range members {
-					if memberMap, ok := m.(map[string]any); ok {
-						if err := checkMemberValueRefConflict(memberMap); err != nil {
-							_ = h.membershipRepo.DeleteByGroupID(workerCtx, group.ID)
-							_ = h.groupRepo.Delete(workerCtx, group.ID, ws)
-							failAsync(nil, err)
-							return
-						}
-						if mv := resolveMemberID(memberMap); mv != "" {
-							if seenMembers[mv] {
-								continue
-							}
-							seenMembers[mv] = true
-						}
-						if err := h.addMember(workerCtx, group.ID, ws, memberMap); err != nil {
-							_ = h.membershipRepo.DeleteByGroupID(workerCtx, group.ID)
-							_ = h.groupRepo.Delete(workerCtx, group.ID, ws)
-							failAsync(nil, err)
-							return
-						}
-					}
-				}
-			}
-
-			h.touchWorkspace(workerCtx, ws)
-
-			memberships, _ := h.membershipRepo.FindByGroupID(workerCtx, group.ID)
-			group.Members = memberships
-			resp := scim.GroupToScimResponse(group, base)
-
-			setStr, err := buildSETJson(base, txn, "Group", group.ID, "POST", resp)
+			resp := scim.GroupToScimResponse(group, baseURL)
+			setStr, err := buildSETJson(baseURL, txnID, "Group", group.ID, "POST", resp)
 			if err != nil {
-				failAsync(&group.ID, err)
-				return
+				return &group.ID, "", err
 			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &group.ID, &setStr, time.Now().UTC())
-		}(input, displayName, extIDPtr, wsID, txnID, baseURL)
+			return &group.ID, setStr, nil
+		})
 		return
 	}
 
-	existing, err := h.groupRepo.FindByDisplayNameAndWorkspaceID(r.Context(), displayName, wsID)
+	group, err := h.executeCreateGroup(r.Context(), wsID, input)
 	if err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Internal error"))
+		scim.WriteErrorFromAny(w, err)
 		return
 	}
-	if existing != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
-			"Group with displayName '"+displayName+"' already exists"))
-		return
-	}
-
-	group := &model.ScimGroup{
-		ID:           uuid.New(),
-		WorkspaceID:  wsID,
-		DisplayName:  displayName,
-		ExternalID:   extIDPtr,
-		CreatedAt:    time.Now(),
-		LastModified: time.Now(),
-		Version:      0,
-	}
-
-	if err := h.groupRepo.Create(r.Context(), group); err != nil {
-		if isGroupDisplayNameConflict(err) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
-				"Group with displayName '"+displayName+"' already exists"))
-			return
-		}
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to create group"))
-		return
-	}
-
-	// Add members (deduplicating repeated member entries)
-	if members, ok := input["members"].([]any); ok {
-		seenMembers := make(map[string]bool, len(members))
-		for _, m := range members {
-			if memberMap, ok := m.(map[string]any); ok {
-				if err := checkMemberValueRefConflict(memberMap); err != nil {
-					_ = h.membershipRepo.DeleteByGroupID(r.Context(), group.ID)
-					_ = h.groupRepo.Delete(r.Context(), group.ID, wsID)
-					var se *scim.ScimError
-					if errors.As(err, &se) {
-						scim.WriteScimError(w, se)
-						return
-					}
-					scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", err.Error()))
-					return
-				}
-				if mv := resolveMemberID(memberMap); mv != "" {
-					if seenMembers[mv] {
-						continue
-					}
-					seenMembers[mv] = true
-				}
-				if err := h.addMember(r.Context(), group.ID, wsID, memberMap); err != nil {
-					_ = h.membershipRepo.DeleteByGroupID(r.Context(), group.ID)
-					_ = h.groupRepo.Delete(r.Context(), group.ID, wsID)
-					var se *scim.ScimError
-					if errors.As(err, &se) {
-						scim.WriteScimError(w, se)
-						return
-					}
-					scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", err.Error()))
-					return
-				}
-			}
-		}
-	}
-
-	h.touchWorkspace(r.Context(), wsID)
 
 	baseURL := buildBaseURL(r)
-	memberships, _ := h.membershipRepo.FindByGroupID(r.Context(), group.ID)
-	group.Members = memberships
 	response := scim.GroupToScimResponse(group, baseURL)
 
 	attrs := r.URL.Query().Get("attributes")
@@ -389,6 +255,88 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Location", resourceURL)
 	w.Header().Set("ETag", fmt.Sprintf("W/\"%d\"", group.Version))
 	writeJSON(w, http.StatusCreated, response)
+}
+
+func (h *GroupHandler) executeCreateGroup(ctx context.Context, wsID uuid.UUID, input map[string]any) (*model.ScimGroup, error) {
+	if h.groupRepo == nil {
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	rawDN, hasDN := input["displayName"]
+	displayName, okDN := rawDN.(string)
+	displayName = scim.NormalizeNFC(displayName)
+	if !hasDN || !okDN || displayName == "" {
+		return nil, scim.NewScimError(http.StatusBadRequest, "invalidValue", "displayName is required")
+	}
+
+	rawExt, hasExt := input["externalId"]
+	extIDPtr, err := parseGroupExternalID(rawExt, hasExt)
+	if err != nil {
+		return nil, err
+	}
+
+	var createdGroup *model.ScimGroup
+	err = jdbc.InTransaction(ctx, func(tx jdbc.Tx) error {
+		existing, err := h.groupRepo.FindByDisplayNameAndWorkspaceIDTx(ctx, tx, displayName, wsID)
+		if err != nil {
+			return scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+		}
+		if existing != nil {
+			return scim.NewScimError(http.StatusConflict, "uniqueness",
+				"Group with displayName '"+displayName+"' already exists")
+		}
+
+		group := &model.ScimGroup{
+			ID:           uuid.New(),
+			WorkspaceID:  wsID,
+			DisplayName:  displayName,
+			ExternalID:   extIDPtr,
+			CreatedAt:    time.Now().UTC(),
+			LastModified: time.Now().UTC(),
+			Version:      0,
+		}
+
+		if err := h.groupRepo.CreateTx(ctx, tx, group); err != nil {
+			if isGroupDisplayNameConflict(err) {
+				return scim.NewScimError(http.StatusConflict, "uniqueness",
+					"Group with displayName '"+displayName+"' already exists")
+			}
+			return scim.NewScimError(http.StatusInternalServerError, "", "Failed to create group")
+		}
+
+		if members, ok := input["members"].([]any); ok {
+			seenMembers := make(map[string]bool, len(members))
+			for _, m := range members {
+				if memberMap, ok := m.(map[string]any); ok {
+					if err := checkMemberValueRefConflict(memberMap); err != nil {
+						return err
+					}
+					if mv := resolveMemberID(memberMap); mv != "" {
+						if seenMembers[mv] {
+							continue
+						}
+						seenMembers[mv] = true
+					}
+					if err := h.addMemberTx(ctx, tx, group.ID, wsID, memberMap); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		if h.membershipRepo != nil {
+			memberships, _ := h.membershipRepo.FindByGroupIDTx(ctx, tx, group.ID)
+			group.Members = memberships
+		}
+		createdGroup = group
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	h.touchWorkspace(ctx, wsID)
+	return createdGroup, nil
 }
 
 func (h *GroupHandler) GetGroup(w http.ResponseWriter, r *http.Request) {
@@ -414,14 +362,10 @@ func (h *GroupHandler) GetGroup(w http.ResponseWriter, r *http.Request) {
 	memberships, _ := h.membershipRepo.FindByGroupID(r.Context(), group.ID)
 	group.Members = memberships
 
-	// If-None-Match
-	ifNoneMatch := r.Header.Get("If-None-Match")
-	if ifNoneMatch != "" {
-		etag := fmt.Sprintf("W/\"%d\"", group.Version)
-		if ifNoneMatch == etag || ifNoneMatch == "*" {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
+	// If-None-Match (RFC 7232 §3.2)
+	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" && checkETagMatch(ifNoneMatch, group.Version) {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 
 	baseURL := buildBaseURL(r)
@@ -550,8 +494,7 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawExt, hasExt := input["externalId"]
-	extIDPtr, err := parseGroupExternalID(rawExt, hasExt)
-	if err != nil {
+	if _, err := parseGroupExternalID(rawExt, hasExt); err != nil {
 		scim.WriteErrorFromAny(w, err)
 		return
 	}
@@ -569,6 +512,7 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 			ResourceType: "Group",
 			ResourceID:   &groupID,
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -581,118 +525,74 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(detachedInput map[string]any, normDN string, normExt *string, ws uuid.UUID, gid uuid.UUID, txn uuid.UUID, base string, ifMatch string) {
-			if h.groupRepo == nil {
-				return
-			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(opErr error) {
-				if errors.Is(opErr, repository.ErrOptimisticLock) {
-					opErr = scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed")
-				} else if isGroupDisplayNameConflict(opErr) {
-					opErr = scim.NewScimError(http.StatusConflict, "uniqueness", "Group with displayName '"+normDN+"' already exists")
-				}
-				errSet, _ := buildErrorSETJson(base, txn, "Group", &gid, "PUT", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, &errSet, time.Now().UTC())
-			}
-
-			var updatedGroup *model.ScimGroup
-			err := jdbc.InTransaction(workerCtx, func(tx jdbc.Tx) error {
-				group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(workerCtx, tx, gid, ws)
-				if err != nil {
-					return err
-				}
-				if group == nil {
-					return &scim.ScimError{Status: http.StatusNotFound, Detail: "Group not found"}
-				}
-				if !checkETagMatch(ifMatch, group.Version) {
-					return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
-				}
-				if normDN != group.DisplayName {
-					existing, err := h.groupRepo.FindByDisplayNameAndWorkspaceIDTx(workerCtx, tx, normDN, ws)
-					if err != nil {
-						return err
-					}
-					if existing != nil && existing.ID != group.ID {
-						return &scim.ScimError{Status: http.StatusConflict, ScimType: "uniqueness",
-							Detail: "Group with displayName '" + normDN + "' already exists"}
-					}
-				}
-				group.DisplayName = normDN
-				group.ExternalID = normExt
-
-				if err := h.checkMemberTypeImmutabilityTx(workerCtx, tx, gid, detachedInput["members"]); err != nil {
-					return err
-				}
-				if err := h.membershipRepo.DeleteByGroupIDTx(workerCtx, tx, gid); err != nil {
-					return err
-				}
-				if members, ok := detachedInput["members"].([]any); ok {
-					seenMembers := make(map[string]bool, len(members))
-					for _, m := range members {
-						if memberMap, ok := m.(map[string]any); ok {
-							if err := checkMemberValueRefConflict(memberMap); err != nil {
-								return err
-							}
-							if mv := resolveMemberID(memberMap); mv != "" {
-								if seenMembers[mv] {
-									continue
-								}
-								seenMembers[mv] = true
-							}
-							if err := h.addMemberTx(workerCtx, tx, gid, ws, memberMap); err != nil {
-								return err
-							}
-						}
-					}
-				}
-				group.LastModified = time.Now().UTC()
-				if err := h.groupRepo.UpdateTx(workerCtx, tx, group); err != nil {
-					return err
-				}
-				memberships, err := h.membershipRepo.FindByGroupIDTx(workerCtx, tx, gid)
-				if err != nil {
-					return err
-				}
-				group.Members = memberships
-				updatedGroup = group
-				return nil
-			})
-			if err != nil || updatedGroup == nil {
-				failAsync(err)
-				return
-			}
-			h.touchWorkspace(workerCtx, ws)
-
-			resp := scim.GroupToScimResponse(updatedGroup, base)
-			setStr, err := buildSETJson(base, txn, "Group", gid, "PUT", resp)
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", &groupID, "PUT", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			updatedGroup, err := h.executeReplaceGroup(workerCtx, wsID, groupID, input, ifMatchHdr)
 			if err != nil {
-				failAsync(err)
-				return
+				return &groupID, "", err
 			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &gid, &setStr, time.Now().UTC())
-		}(input, displayName, extIDPtr, wsID, groupID, txnID, baseURL, ifMatchHdr)
+			resp := scim.GroupToScimResponse(updatedGroup, baseURL)
+			setStr, err := buildSETJson(baseURL, txnID, "Group", groupID, "PUT", resp)
+			if err != nil {
+				return &groupID, "", err
+			}
+			return &groupID, setStr, nil
+		})
 		return
 	}
 
+	updatedGroup, err := h.executeReplaceGroup(r.Context(), wsID, groupID, input, r.Header.Get("If-Match"))
+	if err != nil {
+		scim.WriteErrorFromAny(w, err)
+		return
+	}
+
+	baseURL := buildBaseURL(r)
+	response := scim.GroupToScimResponse(updatedGroup, baseURL)
+
+	attrs := r.URL.Query().Get("attributes")
+	excludedAttrs := r.URL.Query().Get("excludedAttributes")
+	response = applyAttributeProjection(response, attrs, excludedAttrs)
+
+	w.Header().Set("Content-Location", baseURL+"/Groups/"+updatedGroup.ID.String())
+	w.Header().Set("ETag", fmt.Sprintf("W/\"%d\"", updatedGroup.Version))
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *GroupHandler) executeReplaceGroup(ctx context.Context, wsID, groupID uuid.UUID, input map[string]any, ifMatch string) (*model.ScimGroup, error) {
+	if h.groupRepo == nil {
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	var displayName string
 	var updatedGroup *model.ScimGroup
-	err = jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
-		group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(r.Context(), tx, groupID, wsID)
+	err := jdbc.InTransaction(ctx, func(tx jdbc.Tx) error {
+		group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(ctx, tx, groupID, wsID)
 		if err != nil || group == nil {
 			return &scim.ScimError{Status: http.StatusNotFound, Detail: "Group not found"}
 		}
 
 		// If-Match (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
-		ifMatch := r.Header.Get("If-Match")
 		if !checkETagMatch(ifMatch, group.Version) {
 			return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
 		}
 
+		rawDN, hasDN := input["displayName"]
+		var okDN bool
+		displayName, okDN = rawDN.(string)
+		displayName = scim.NormalizeNFC(displayName)
+		if !hasDN || !okDN || displayName == "" {
+			return scim.NewScimError(http.StatusBadRequest, "invalidValue", "displayName is required")
+		}
+
+		rawExt, hasExt := input["externalId"]
+		extIDPtr, err := parseGroupExternalID(rawExt, hasExt)
+		if err != nil {
+			return err
+		}
+
 		// Uniqueness check
 		if displayName != group.DisplayName {
-			existing, err := h.groupRepo.FindByDisplayNameAndWorkspaceIDTx(r.Context(), tx, displayName, wsID)
+			existing, err := h.groupRepo.FindByDisplayNameAndWorkspaceIDTx(ctx, tx, displayName, wsID)
 			if err != nil {
 				return err
 			}
@@ -702,16 +602,16 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		group.DisplayName = displayName
-		group.ExternalID = extIDPtr
-
 		// GRP_21: RFC 7643 §4.2 - Group member sub-attributes 'value' and 'type' are immutable
-		if err := h.checkMemberTypeImmutabilityTx(r.Context(), tx, group.ID, input["members"]); err != nil {
+		if err := h.checkMemberTypeImmutabilityTx(ctx, tx, group.ID, input["members"]); err != nil {
 			return err
 		}
 
+		group.DisplayName = displayName
+		group.ExternalID = extIDPtr
+
 		// Clear existing members
-		if err := h.membershipRepo.DeleteByGroupIDTx(r.Context(), tx, group.ID); err != nil {
+		if err := h.membershipRepo.DeleteByGroupIDTx(ctx, tx, group.ID); err != nil {
 			slog.Error("failed to clear memberships", "error", err)
 			return err
 		}
@@ -730,20 +630,21 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 						}
 						seenMembers[mv] = true
 					}
-					if err := h.addMemberTx(r.Context(), tx, group.ID, wsID, memberMap); err != nil {
+					if err := h.addMemberTx(ctx, tx, group.ID, wsID, memberMap); err != nil {
 						return err
 					}
 				}
 			}
 		}
 
+		group.LastModified = time.Now().UTC()
 		// Update group (also handles version bump / optimistic lock check)
-		if err := h.groupRepo.UpdateTx(r.Context(), tx, group); err != nil {
+		if err := h.groupRepo.UpdateTx(ctx, tx, group); err != nil {
 			return err
 		}
 
 		// Reload memberships into group
-		memberships, err := h.membershipRepo.FindByGroupIDTx(r.Context(), tx, group.ID)
+		memberships, err := h.membershipRepo.FindByGroupIDTx(ctx, tx, group.ID)
 		if err != nil {
 			return err
 		}
@@ -752,39 +653,24 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 		updatedGroup = group
 		return nil
 	})
-
 	if err != nil {
 		var se *scim.ScimError
 		if errors.As(err, &se) {
-			scim.WriteScimError(w, se)
-			return
+			return nil, se
 		}
 		if errors.Is(err, repository.ErrOptimisticLock) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
-			return
+			return nil, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed")
 		}
 		if isGroupDisplayNameConflict(err) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness",
-				"Group with displayName '"+displayName+"' already exists"))
-			return
+			return nil, scim.NewScimError(http.StatusConflict, "uniqueness",
+				"Group with displayName '"+displayName+"' already exists")
 		}
 		slog.Error("replace group failed", "error", err)
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update group"))
-		return
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update group")
 	}
 
-	h.touchWorkspace(r.Context(), wsID)
-
-	baseURL := buildBaseURL(r)
-	response := scim.GroupToScimResponse(updatedGroup, baseURL)
-
-	attrs := r.URL.Query().Get("attributes")
-	excludedAttrs := r.URL.Query().Get("excludedAttributes")
-	response = applyAttributeProjection(response, attrs, excludedAttrs)
-
-	w.Header().Set("Content-Location", baseURL+"/Groups/"+updatedGroup.ID.String())
-	w.Header().Set("ETag", fmt.Sprintf("W/\"%d\"", updatedGroup.Version))
-	writeJSON(w, http.StatusOK, response)
+	h.touchWorkspace(ctx, wsID)
+	return updatedGroup, nil
 }
 
 func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
@@ -840,6 +726,7 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 			ResourceType: "Group",
 			ResourceID:   &groupID,
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -852,169 +739,44 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(detachedOps []any, ws uuid.UUID, gid uuid.UUID, txn uuid.UUID, base string, ifMatch string) {
-			if h.groupRepo == nil {
-				return
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", &groupID, "PATCH", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			opMaps := make([]map[string]any, 0, len(ops))
+			for _, op := range ops {
+				m, ok := op.(map[string]any)
+				if !ok {
+					return &groupID, "", &scim.ScimError{Status: http.StatusBadRequest, ScimType: "invalidSyntax", Detail: "Invalid PATCH operation"}
+				}
+				opMaps = append(opMaps, m)
 			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(opErr error) {
-				if errors.Is(opErr, repository.ErrOptimisticLock) {
-					opErr = scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed")
-				} else if isGroupDisplayNameConflict(opErr) {
-					opErr = scim.NewScimError(http.StatusConflict, "uniqueness", "Group displayName already exists")
-				}
-				errSet, _ := buildErrorSETJson(base, txn, "Group", &gid, "PATCH", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, &errSet, time.Now().UTC())
-			}
-
-			var updatedGroup *model.ScimGroup
-			changed := false
-			err := jdbc.InTransaction(workerCtx, func(tx jdbc.Tx) error {
-				group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(workerCtx, tx, gid, ws)
-				if err != nil {
-					return err
-				}
-				if group == nil {
-					return &scim.ScimError{Status: http.StatusNotFound, Detail: "Group not found"}
-				}
-				if !checkETagMatch(ifMatch, group.Version) {
-					return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
-				}
-
-				memberships, err := h.membershipRepo.FindByGroupIDTx(workerCtx, tx, gid)
-				if err != nil {
-					return err
-				}
-				group.Members = memberships
-
-				beforeDN := group.DisplayName
-				beforeExt := cloneGroupStrPtr(group.ExternalID)
-				beforeMembers := append([]model.ScimGroupMembership(nil), memberships...)
-
-				for _, op := range detachedOps {
-					m, ok := op.(map[string]any)
-					if !ok {
-						return &scim.ScimError{Status: http.StatusBadRequest, ScimType: "invalidSyntax", Detail: "Invalid PATCH operation"}
-					}
-					if err := h.applyGroupPatchOpTx(workerCtx, tx, group, ws, m); err != nil {
-						return err
-					}
-				}
-
-				afterMembers, err := h.membershipRepo.FindByGroupIDTx(workerCtx, tx, gid)
-				if err != nil {
-					return err
-				}
-
-				if group.DisplayName != beforeDN || !strPtrEq(group.ExternalID, beforeExt) || !groupMembersEqual(beforeMembers, afterMembers) {
-					changed = true
-					group.LastModified = time.Now().UTC()
-					if err := h.groupRepo.UpdateTx(workerCtx, tx, group); err != nil {
-						return err
-					}
-				}
-
-				group.Members = afterMembers
-				updatedGroup = group
-				return nil
-			})
-			if err != nil || updatedGroup == nil {
-				failAsync(err)
-				return
-			}
-			if changed {
-				h.touchWorkspace(workerCtx, ws)
-			}
-
-			resp := scim.GroupToScimResponse(updatedGroup, base)
-			patchPaths := extractModifiedPatchPathsFromAny(detachedOps)
-			setStr, err := buildSETJson(base, txn, "Group", gid, "PATCH", resp, patchPaths...)
+			updatedGroup, err := h.executePatchGroup(workerCtx, wsID, groupID, opMaps, ifMatchHdr)
 			if err != nil {
-				failAsync(err)
-				return
+				return &groupID, "", err
 			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &gid, &setStr, time.Now().UTC())
-		}(ops, wsID, groupID, txnID, baseURL, ifMatchHdr)
+			resp := scim.GroupToScimResponse(updatedGroup, baseURL)
+			patchPaths := extractModifiedPatchPaths(opMaps)
+			setStr, err := buildSETJson(baseURL, txnID, "Group", groupID, "PATCH", resp, patchPaths...)
+			if err != nil {
+				return &groupID, "", err
+			}
+			return &groupID, setStr, nil
+		})
 		return
 	}
 
-	var updatedGroup *model.ScimGroup
-	changed := false
-	err = jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
-		group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(r.Context(), tx, groupID, wsID)
-		if err != nil || group == nil {
-			return &scim.ScimError{Status: http.StatusNotFound, Detail: "Group not found"}
+	opMaps := make([]map[string]any, 0, len(ops))
+	for _, op := range ops {
+		m, ok := op.(map[string]any)
+		if !ok {
+			scim.WriteScimError(w, &scim.ScimError{Status: http.StatusBadRequest, ScimType: "invalidSyntax", Detail: "Invalid PATCH operation"})
+			return
 		}
+		opMaps = append(opMaps, m)
+	}
 
-		// If-Match (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
-		ifMatch := r.Header.Get("If-Match")
-		if !checkETagMatch(ifMatch, group.Version) {
-			return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
-		}
-
-		// Load current members using tx-aware repo
-		memberships, err := h.membershipRepo.FindByGroupIDTx(r.Context(), tx, group.ID)
-		if err != nil {
-			return err
-		}
-		group.Members = memberships
-
-		beforeDN := group.DisplayName
-		beforeExt := cloneGroupStrPtr(group.ExternalID)
-		beforeMembers := append([]model.ScimGroupMembership(nil), memberships...)
-
-		for _, op := range ops {
-			opMap, ok := op.(map[string]any)
-			if !ok {
-				return &scim.ScimError{Status: http.StatusBadRequest, ScimType: "invalidSyntax", Detail: "Invalid PATCH operation"}
-			}
-			if err := h.applyGroupPatchOpTx(r.Context(), tx, group, wsID, opMap); err != nil {
-				return err
-			}
-		}
-
-		// Reload memberships
-		afterMembers, err := h.membershipRepo.FindByGroupIDTx(r.Context(), tx, group.ID)
-		if err != nil {
-			return err
-		}
-
-		if group.DisplayName != beforeDN || !strPtrEq(group.ExternalID, beforeExt) || !groupMembersEqual(beforeMembers, afterMembers) {
-			changed = true
-			// Update group (handles version bump / optimistic lock)
-			if err := h.groupRepo.UpdateTx(r.Context(), tx, group); err != nil {
-				return err
-			}
-		}
-
-		group.Members = afterMembers
-		updatedGroup = group
-		return nil
-	})
-
+	updatedGroup, err := h.executePatchGroup(r.Context(), wsID, groupID, opMaps, r.Header.Get("If-Match"))
 	if err != nil {
-		var se *scim.ScimError
-		if errors.As(err, &se) {
-			scim.WriteScimError(w, se)
-			return
-		}
-		if errors.Is(err, repository.ErrOptimisticLock) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed"))
-			return
-		}
-		if isGroupDisplayNameConflict(err) {
-			scim.WriteScimError(w, scim.NewScimError(http.StatusConflict, "uniqueness", "Group displayName already exists"))
-			return
-		}
-		slog.Error("patch group failed", "error", err)
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update group"))
+		scim.WriteErrorFromAny(w, err)
 		return
-	}
-
-	if changed {
-		h.touchWorkspace(r.Context(), wsID)
 	}
 
 	baseURL := buildBaseURL(r)
@@ -1027,6 +789,81 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Location", baseURL+"/Groups/"+updatedGroup.ID.String())
 	w.Header().Set("ETag", fmt.Sprintf("W/\"%d\"", updatedGroup.Version))
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *GroupHandler) executePatchGroup(ctx context.Context, wsID, groupID uuid.UUID, ops []map[string]any, ifMatch string) (*model.ScimGroup, error) {
+	if h.groupRepo == nil {
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	var updatedGroup *model.ScimGroup
+	changed := false
+	err := jdbc.InTransaction(ctx, func(tx jdbc.Tx) error {
+		group, err := h.groupRepo.FindByIDAndWorkspaceIDTx(ctx, tx, groupID, wsID)
+		if err != nil || group == nil {
+			return &scim.ScimError{Status: http.StatusNotFound, Detail: "Group not found"}
+		}
+
+		// If-Match (RFC 7232 §3.1 / RFC 7644 §3.14 wildcard support)
+		if !checkETagMatch(ifMatch, group.Version) {
+			return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag mismatch"}
+		}
+
+		// Load current members using tx-aware repo
+		memberships, err := h.membershipRepo.FindByGroupIDTx(ctx, tx, group.ID)
+		if err != nil {
+			return err
+		}
+		group.Members = memberships
+
+		beforeDN := group.DisplayName
+		beforeExt := cloneGroupStrPtr(group.ExternalID)
+		beforeMembers := append([]model.ScimGroupMembership(nil), memberships...)
+
+		for _, opMap := range ops {
+			if err := h.applyGroupPatchOpTx(ctx, tx, group, wsID, opMap); err != nil {
+				return err
+			}
+		}
+
+		// Reload memberships
+		afterMembers, err := h.membershipRepo.FindByGroupIDTx(ctx, tx, group.ID)
+		if err != nil {
+			return err
+		}
+
+		if group.DisplayName != beforeDN || !strPtrEq(group.ExternalID, beforeExt) || !groupMembersEqual(beforeMembers, afterMembers) {
+			changed = true
+			group.LastModified = time.Now().UTC()
+			// Update group (handles version bump / optimistic lock)
+			if err := h.groupRepo.UpdateTx(ctx, tx, group); err != nil {
+				return err
+			}
+		}
+
+		group.Members = afterMembers
+		updatedGroup = group
+		return nil
+	})
+	if err != nil {
+		var se *scim.ScimError
+		if errors.As(err, &se) {
+			return nil, se
+		}
+		if errors.Is(err, repository.ErrOptimisticLock) {
+			return nil, scim.NewScimError(http.StatusPreconditionFailed, "", "Resource changed")
+		}
+		if isGroupDisplayNameConflict(err) {
+			return nil, scim.NewScimError(http.StatusConflict, "uniqueness", "Group displayName already exists")
+		}
+		slog.Error("patch group failed", "error", err)
+		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Failed to update group")
+	}
+
+	if changed {
+		h.touchWorkspace(ctx, wsID)
+	}
+	return updatedGroup, nil
 }
 
 func (h *GroupHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
@@ -1055,6 +892,7 @@ func (h *GroupHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 			ResourceType: "Group",
 			ResourceID:   &groupID,
 			Status:       model.AsyncStatusPending,
+			SetPayload:   &baseURL,
 			CreatedAt:    time.Now().UTC(),
 		}
 		if err := h.asyncEventRepo.Create(r.Context(), event); err != nil {
@@ -1067,83 +905,59 @@ func (h *GroupHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", eventURL)
 		w.WriteHeader(http.StatusAccepted)
 
-		go func(ws uuid.UUID, gid uuid.UUID, txn uuid.UUID, base string, ifMatch string) {
-			if h.groupRepo == nil {
-				return
+		runAsyncWorker(h.asyncEventRepo, baseURL, txnID, "Group", &groupID, "DELETE", func(workerCtx context.Context) (*uuid.UUID, string, error) {
+			if err := h.executeDeleteGroup(workerCtx, wsID, groupID, ifMatchHdr); err != nil {
+				return &groupID, "", err
 			}
-			workerCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-
-			failAsync := func(opErr error) {
-				errSet, _ := buildErrorSETJson(base, txn, "Group", &gid, "DELETE", opErr)
-				_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusFailed, &gid, &errSet, time.Now().UTC())
-			}
-
-			g, err := h.groupRepo.FindByIDAndWorkspaceID(workerCtx, gid, ws)
+			setStr, err := buildSETJson(baseURL, txnID, "Group", groupID, "DELETE", nil)
 			if err != nil {
-				failAsync(err)
-				return
+				return &groupID, "", err
 			}
-			if g == nil {
-				failAsync(scim.NewScimError(http.StatusNotFound, "", "Group not found"))
-				return
-			}
-			if !checkETagMatch(ifMatch, g.Version) {
-				failAsync(scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-				return
-			}
-
-			if h.membershipRepo != nil {
-				_ = h.membershipRepo.DeleteByMemberValue(workerCtx, gid)
-				_ = h.membershipRepo.DeleteByGroupID(workerCtx, gid)
-			}
-			if err := h.groupRepo.Delete(workerCtx, gid, ws); err != nil {
-				failAsync(err)
-				return
-			}
-			h.touchWorkspace(workerCtx, ws)
-
-			setStr, err := buildSETJson(base, txn, "Group", gid, "DELETE", nil)
-			if err != nil {
-				failAsync(err)
-				return
-			}
-			_ = h.asyncEventRepo.UpdateStatusAndPayload(workerCtx, txn, model.AsyncStatusCompleted, &gid, &setStr, time.Now().UTC())
-		}(wsID, groupID, txnID, baseURL, ifMatchHdr)
+			return &groupID, setStr, nil
+		})
 		return
 	}
 
-	group, err := h.groupRepo.FindByIDAndWorkspaceID(r.Context(), groupID, wsID)
+	if err := h.executeDeleteGroup(r.Context(), wsID, groupID, r.Header.Get("If-Match")); err != nil {
+		scim.WriteErrorFromAny(w, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *GroupHandler) executeDeleteGroup(ctx context.Context, wsID, groupID uuid.UUID, ifMatch string) error {
+	if h.groupRepo == nil {
+		return scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
+	}
+
+	group, err := h.groupRepo.FindByIDAndWorkspaceID(ctx, groupID, wsID)
 	if err != nil || group == nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Group not found"))
-		return
+		return scim.NewScimError(http.StatusNotFound, "", "Group not found")
 	}
 
-	ifMatch := r.Header.Get("If-Match")
 	if !checkETagMatch(ifMatch, group.Version) {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch"))
-		return
+		return scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch")
 	}
 
 	// Delete memberships where this group is a member of another group
 	if h.membershipRepo != nil {
-		if err := h.membershipRepo.DeleteByMemberValue(r.Context(), groupID); err != nil {
+		if err := h.membershipRepo.DeleteByMemberValue(ctx, groupID); err != nil {
 			slog.Error("failed to delete memberships by member value", "error", err)
 		}
 
 		// Delete group's own memberships
-		if err := h.membershipRepo.DeleteByGroupID(r.Context(), groupID); err != nil {
+		if err := h.membershipRepo.DeleteByGroupID(ctx, groupID); err != nil {
 			slog.Error("failed to delete group memberships", "error", err)
 		}
 	}
 
-	if err := h.groupRepo.Delete(r.Context(), groupID, wsID); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusInternalServerError, "", "Failed to delete group"))
-		return
+	if err := h.groupRepo.Delete(ctx, groupID, wsID); err != nil {
+		return scim.NewScimError(http.StatusInternalServerError, "", "Failed to delete group")
 	}
 
-	h.touchWorkspace(r.Context(), wsID)
-	w.WriteHeader(http.StatusNoContent)
+	h.touchWorkspace(ctx, wsID)
+	return nil
 }
 
 func (h *GroupHandler) SearchGroups(w http.ResponseWriter, r *http.Request) {
@@ -1225,381 +1039,6 @@ func cleanGroupPatchPath(rawPath string) string {
 func isGroupReadOnlyAttr(cleanPath string) bool {
 	lp := strings.ToLower(strings.TrimSpace(cleanPath))
 	return lp == "id" || lp == "meta" || strings.HasPrefix(lp, "meta.")
-}
-
-func (h *GroupHandler) applyGroupPatchOp(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, op map[string]any) error {
-	opType := strings.ToLower(fmt.Sprintf("%v", op["op"]))
-	rawPath, _ := op["path"].(string)
-	path := cleanGroupPatchPath(rawPath)
-	value := op["value"]
-
-	if isGroupReadOnlyAttr(path) {
-		return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Attribute '" + path + "' is readOnly and cannot be modified"}
-	}
-
-	switch opType {
-	case "add":
-		if value == nil {
-			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "PATCH add operation must contain a 'value' member"}
-		}
-		return h.applyGroupAdd(ctx, group, wsID, path, value)
-	case "replace":
-		return h.applyGroupReplace(ctx, group, wsID, path, value)
-	case "remove":
-		return h.applyGroupRemove(ctx, group, path, value)
-	default:
-		return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Unsupported PATCH op: " + opType}
-	}
-}
-
-func (h *GroupHandler) applyGroupAdd(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, path string, value any) error {
-	lp := strings.ToLower(path)
-	if lp == "members" {
-		members := extractMembersPayload(value, true)
-		return h.addMissingMembers(ctx, group, wsID, members)
-	}
-	if lp == "displayname" {
-		s, ok := value.(string)
-		s = scim.NormalizeNFC(s)
-		if !ok || s == "" {
-			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'displayName' must be a non-empty string"}
-		}
-		return h.updateDisplayName(ctx, group, wsID, s)
-	}
-	if lp == "externalid" {
-		s, ok := value.(string)
-		if !ok {
-			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'externalId' must be a string"}
-		}
-		norm := scim.NormalizeNFC(s)
-		group.ExternalID = &norm
-		return nil
-	}
-	if path == "" {
-		if valueMap, ok := value.(map[string]any); ok {
-			_, hasMemberValue := valueMap["value"]
-			_, hasMemberRef := valueMap["$ref"]
-			if (hasMemberValue || hasMemberRef) && len(valueMap) <= 4 {
-				if _, hasDN := valueMap["displayName"]; !hasDN {
-					if _, hasMembers := valueMap["members"]; !hasMembers {
-						return h.addMissingMembers(ctx, group, wsID, []map[string]any{valueMap})
-					}
-				}
-			}
-			return h.applyAddValueMap(ctx, group, wsID, valueMap)
-		}
-		if rawList, ok := value.([]any); ok {
-			members := extractMembersPayload(rawList, false)
-			return h.addMissingMembers(ctx, group, wsID, members)
-		}
-		return &scim.ScimError{Status: 400, ScimType: "invalidSyntax", Detail: "Pathless PATCH add requires an object value"}
-	}
-	if strings.HasPrefix(lp, "members[") {
-		return h.applyMemberSubAttrAdd(ctx, nil, group, wsID, path, value)
-	}
-	return &scim.ScimError{Status: 400, ScimType: "invalidPath", Detail: "Unsupported PATCH path: " + path}
-}
-
-func (h *GroupHandler) applyGroupReplace(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, path string, value any) error {
-	lp := strings.ToLower(path)
-	if lp == "members" {
-		members := extractMembersPayload(value, false)
-		return h.replaceMembers(ctx, group, wsID, members)
-	}
-	if lp == "displayname" {
-		s, ok := value.(string)
-		s = scim.NormalizeNFC(s)
-		if !ok || s == "" {
-			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'displayName' must be a non-empty string"}
-		}
-		return h.updateDisplayName(ctx, group, wsID, s)
-	}
-	if lp == "externalid" {
-		if value == nil {
-			group.ExternalID = nil
-			return nil
-		}
-		s, ok := value.(string)
-		if !ok {
-			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'externalId' must be a string"}
-		}
-		norm := scim.NormalizeNFC(s)
-		group.ExternalID = &norm
-		return nil
-	}
-	if path == "" {
-		valueMap, ok := value.(map[string]any)
-		if !ok {
-			return &scim.ScimError{Status: 400, ScimType: "invalidSyntax", Detail: "Pathless PATCH replace requires an object value"}
-		}
-		return h.applyReplaceValueMap(ctx, group, wsID, valueMap)
-	}
-	if strings.HasPrefix(lp, "members[") {
-		if strings.HasSuffix(lp, ".type") || strings.HasSuffix(lp, ".value") || strings.HasSuffix(lp, ".$ref") {
-			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Group member attribute is immutable"}
-		}
-		if strings.HasSuffix(lp, ".display") {
-			return nil
-		}
-	}
-	return &scim.ScimError{Status: 400, ScimType: "invalidPath", Detail: "Unsupported PATCH path: " + path}
-}
-
-func (h *GroupHandler) applyGroupRemove(ctx context.Context, group *model.ScimGroup, path string, value any) error {
-	lp := strings.ToLower(path)
-	if lp == "displayname" {
-		return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Required attribute 'displayName' cannot be removed"}
-	}
-	if lp == "externalid" {
-		group.ExternalID = nil
-		return nil
-	}
-	if lp == "members" {
-		if rawList, ok := value.([]any); ok && len(rawList) > 0 {
-			return h.removeMembersByValueList(ctx, group, rawList)
-		}
-		// Remove all members
-		if err := h.membershipRepo.DeleteByGroupID(ctx, group.ID); err != nil {
-			return err
-		}
-		group.Members = nil
-		return nil
-	}
-	if strings.HasPrefix(lp, "members[") {
-		closeIdx := strings.IndexByte(path, ']')
-		if closeIdx < 8 {
-			return &scim.ScimError{Status: 400, ScimType: "invalidFilter", Detail: "Invalid member filter in path: " + path}
-		}
-		filterExpr := strings.TrimSpace(path[8:closeIdx])
-		if filterExpr == "" {
-			return &scim.ScimError{Status: 400, ScimType: "invalidFilter", Detail: "Empty valuePath filter in path: " + path}
-		}
-		rest := strings.ToLower(strings.TrimSpace(path[closeIdx+1:]))
-		if rest == ".value" || rest == ".type" || rest == ".$ref" {
-			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Group member attribute is immutable and cannot be removed"}
-		}
-		targetValue := extractFilterValue(filterExpr)
-		if targetValue != "" {
-			targetUUID, err := uuid.Parse(targetValue)
-			if err == nil {
-				if h.membershipRepo != nil {
-					if err := h.membershipRepo.DeleteByGroupIDAndMemberValues(ctx, group.ID, []uuid.UUID{targetUUID}); err != nil {
-						return err
-					}
-				}
-				filtered := make([]model.ScimGroupMembership, 0, len(group.Members))
-				for _, m := range group.Members {
-					if m.MemberValue != targetUUID {
-						filtered = append(filtered, m)
-					}
-				}
-				group.Members = filtered
-			}
-		}
-		return nil
-	}
-	if path == "" {
-		if rawList, ok := value.([]any); ok {
-			return h.removeMembersByValueList(ctx, group, rawList)
-		}
-		return &scim.ScimError{Status: 400, ScimType: "noTarget", Detail: "PATCH remove operation requires a 'path'"}
-	}
-	return &scim.ScimError{Status: 400, ScimType: "invalidPath", Detail: "Unsupported PATCH remove path: " + path}
-}
-
-func (h *GroupHandler) removeMembersByValueList(ctx context.Context, group *model.ScimGroup, rawList []any) error {
-	for _, item := range rawList {
-		if memberMap, ok := item.(map[string]any); ok {
-			if err := checkMemberValueRefConflict(memberMap); err != nil {
-				return err
-			}
-			memberValue := resolveMemberID(memberMap)
-			if memberValue != "" {
-				memberUUID, err := uuid.Parse(memberValue)
-				if err == nil {
-					if h.membershipRepo != nil {
-						if err := h.membershipRepo.DeleteByGroupIDAndMemberValues(ctx, group.ID, []uuid.UUID{memberUUID}); err != nil {
-							slog.Error("failed to remove member", "error", err)
-						}
-					}
-					filtered := make([]model.ScimGroupMembership, 0, len(group.Members))
-					for _, m := range group.Members {
-						if m.MemberValue != memberUUID {
-							filtered = append(filtered, m)
-						}
-					}
-					group.Members = filtered
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func (h *GroupHandler) applyAddValueMap(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, valueMap map[string]any) error {
-	for rawKey, v := range valueMap {
-		if strings.EqualFold(rawKey, "schemas") {
-			continue
-		}
-		cleanKey := cleanGroupPatchPath(rawKey)
-		if isGroupReadOnlyAttr(cleanKey) {
-			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Attribute '" + cleanKey + "' is readOnly and cannot be modified"}
-		}
-		switch strings.ToLower(cleanKey) {
-		case "displayname":
-			s, ok := v.(string)
-			s = scim.NormalizeNFC(s)
-			if !ok || s == "" {
-				return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'displayName' must be a non-empty string"}
-			}
-			if err := h.updateDisplayName(ctx, group, wsID, s); err != nil {
-				return err
-			}
-		case "externalid":
-			if v == nil {
-				continue
-			}
-			s, ok := v.(string)
-			if !ok {
-				return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'externalId' must be a string"}
-			}
-			norm := scim.NormalizeNFC(s)
-			group.ExternalID = &norm
-		case "members":
-			members := extractMembersPayload(v, false)
-			if err := h.addMissingMembers(ctx, group, wsID, members); err != nil {
-				return err
-			}
-		default:
-			return &scim.ScimError{Status: 400, ScimType: "invalidPath", Detail: "Unknown Group attribute: " + cleanKey}
-		}
-	}
-	return nil
-}
-
-func (h *GroupHandler) applyReplaceValueMap(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, valueMap map[string]any) error {
-	for rawKey, v := range valueMap {
-		if strings.EqualFold(rawKey, "schemas") {
-			continue
-		}
-		cleanKey := cleanGroupPatchPath(rawKey)
-		if isGroupReadOnlyAttr(cleanKey) {
-			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Attribute '" + cleanKey + "' is readOnly and cannot be modified"}
-		}
-		switch strings.ToLower(cleanKey) {
-		case "displayname":
-			s, ok := v.(string)
-			s = scim.NormalizeNFC(s)
-			if !ok || s == "" {
-				return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'displayName' must be a non-empty string"}
-			}
-			if err := h.updateDisplayName(ctx, group, wsID, s); err != nil {
-				return err
-			}
-		case "externalid":
-			if v == nil {
-				group.ExternalID = nil
-			} else {
-				s, ok := v.(string)
-				if !ok {
-					return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Attribute 'externalId' must be a string"}
-				}
-				norm := scim.NormalizeNFC(s)
-				group.ExternalID = &norm
-			}
-		case "members":
-			members := extractMembersPayload(v, false)
-			if err := h.replaceMembers(ctx, group, wsID, members); err != nil {
-				return err
-			}
-		default:
-			return &scim.ScimError{Status: 400, ScimType: "invalidPath", Detail: "Unknown Group attribute: " + cleanKey}
-		}
-	}
-	return nil
-}
-
-func (h *GroupHandler) updateDisplayName(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, newName string) error {
-	newName = scim.NormalizeNFC(newName)
-	if group.DisplayName != newName {
-		existing, err := h.groupRepo.FindByDisplayNameAndWorkspaceID(ctx, newName, wsID)
-		if err != nil {
-			return err
-		}
-		if existing != nil && existing.ID != group.ID {
-			return &scim.ScimError{Status: 409, ScimType: "uniqueness",
-				Detail: "Group with displayName '" + newName + "' already exists"}
-		}
-	}
-	group.DisplayName = newName
-	return nil
-}
-
-func (h *GroupHandler) addMissingMembers(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, members []map[string]any) error {
-	addedAny := false
-	newlyAdded := make(map[string]bool)
-	existingMembers := make(map[string]bool, len(group.Members))
-	for _, existing := range group.Members {
-		existingMembers[existing.MemberValue.String()] = true
-	}
-
-	for _, member := range members {
-		if err := checkMemberValueRefConflict(member); err != nil {
-			return err
-		}
-		memberValue := resolveMemberID(member)
-		if memberValue == "" {
-			if refStr, ok := member["$ref"].(string); ok && strings.TrimSpace(refStr) != "" {
-				return h.addMember(ctx, group.ID, wsID, member)
-			}
-			continue
-		}
-		memberKey := memberValue
-		if memberUUID, err := uuid.Parse(memberValue); err == nil {
-			memberKey = memberUUID.String()
-		}
-		if existingMembers[memberKey] || newlyAdded[memberKey] {
-			continue
-		}
-		if err := h.addMember(ctx, group.ID, wsID, member); err != nil {
-			return err
-		}
-		newlyAdded[memberKey] = true
-		addedAny = true
-	}
-	if addedAny {
-		memberships, _ := h.membershipRepo.FindByGroupID(ctx, group.ID)
-		group.Members = memberships
-	}
-	return nil
-}
-
-func (h *GroupHandler) replaceMembers(ctx context.Context, group *model.ScimGroup, wsID uuid.UUID, members []map[string]any) error {
-	if err := validateMemberTypeImmutability(group.Members, members); err != nil {
-		return err
-	}
-	if err := h.membershipRepo.DeleteByGroupID(ctx, group.ID); err != nil {
-		return err
-	}
-	group.Members = nil
-	seen := make(map[string]bool, len(members))
-	for _, member := range members {
-		if err := checkMemberValueRefConflict(member); err != nil {
-			return err
-		}
-		if mv := resolveMemberID(member); mv != "" {
-			if seen[mv] {
-				continue
-			}
-			seen[mv] = true
-		}
-		if err := h.addMember(ctx, group.ID, wsID, member); err != nil {
-			return err
-		}
-	}
-	memberships, _ := h.membershipRepo.FindByGroupID(ctx, group.ID)
-	group.Members = memberships
-	return nil
 }
 
 // validateMemberTypeImmutability enforces RFC 7643 §4.2 member 'type' immutability (GRP_21).
@@ -1933,8 +1372,10 @@ func (h *GroupHandler) applyGroupRemoveTx(ctx context.Context, tx jdbc.Executor,
 		if rawList, ok := value.([]any); ok && len(rawList) > 0 {
 			return h.removeMembersByValueListTx(ctx, tx, group, rawList)
 		}
-		if err := h.membershipRepo.DeleteByGroupIDTx(ctx, tx, group.ID); err != nil {
-			return err
+		if h.membershipRepo != nil {
+			if err := h.membershipRepo.DeleteByGroupIDTx(ctx, tx, group.ID); err != nil {
+				return err
+			}
 		}
 		group.Members = nil
 		return nil
@@ -1956,8 +1397,10 @@ func (h *GroupHandler) applyGroupRemoveTx(ctx context.Context, tx jdbc.Executor,
 		if targetValue != "" {
 			targetUUID, err := uuid.Parse(targetValue)
 			if err == nil {
-				if err := h.membershipRepo.DeleteByGroupIDAndMemberValuesTx(ctx, tx, group.ID, []uuid.UUID{targetUUID}); err != nil {
-					return err
+				if h.membershipRepo != nil {
+					if err := h.membershipRepo.DeleteByGroupIDAndMemberValuesTx(ctx, tx, group.ID, []uuid.UUID{targetUUID}); err != nil {
+						return err
+					}
 				}
 				filtered := make([]model.ScimGroupMembership, 0, len(group.Members))
 				for _, m := range group.Members {
@@ -1989,8 +1432,10 @@ func (h *GroupHandler) removeMembersByValueListTx(ctx context.Context, tx jdbc.E
 			if memberValue != "" {
 				memberUUID, err := uuid.Parse(memberValue)
 				if err == nil {
-					if err := h.membershipRepo.DeleteByGroupIDAndMemberValuesTx(ctx, tx, group.ID, []uuid.UUID{memberUUID}); err != nil {
-						slog.Error("failed to remove member", "error", err)
+					if h.membershipRepo != nil {
+						if err := h.membershipRepo.DeleteByGroupIDAndMemberValuesTx(ctx, tx, group.ID, []uuid.UUID{memberUUID}); err != nil {
+							slog.Error("failed to remove member", "error", err)
+						}
 					}
 					filtered := make([]model.ScimGroupMembership, 0, len(group.Members))
 					for _, m := range group.Members {
@@ -2148,105 +1593,6 @@ func (h *GroupHandler) addMissingMembersTx(ctx context.Context, tx jdbc.Executor
 		group.Members = memberships
 	}
 	return nil
-}
-
-func (h *GroupHandler) addMember(ctx context.Context, groupID, wsID uuid.UUID, memberMap map[string]any) error {
-	if err := checkMemberValueRefConflict(memberMap); err != nil {
-		return err
-	}
-	memberValue := resolveMemberID(memberMap)
-	if memberValue == "" {
-		return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Member value is required"}
-	}
-
-	memberUUID, err := uuid.Parse(memberValue)
-	if err != nil {
-		return &scim.ScimError{Status: 400, ScimType: "invalidValue",
-			Detail: "Invalid member value (must be UUID): " + memberValue}
-	}
-
-	explicitType := ""
-	if rawT, exists := memberMap["type"]; exists && rawT != nil {
-		t, ok := rawT.(string)
-		if !ok {
-			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Member type must be a string"}
-		}
-		if t != "" {
-			if !strings.EqualFold(t, "User") && !strings.EqualFold(t, "Group") {
-				return &scim.ScimError{Status: 400, ScimType: "invalidValue",
-					Detail: "Invalid member type: " + t}
-			}
-			if strings.EqualFold(t, "Group") {
-				explicitType = "Group"
-			} else {
-				explicitType = "User"
-			}
-		}
-	}
-
-	display, _ := memberMap["display"].(string)
-	display = scim.NormalizeNFC(display)
-	memberType := explicitType
-
-	switch explicitType {
-	case "User":
-		user, err := h.userRepo.FindByIDAndWorkspaceID(ctx, memberUUID, wsID)
-		if err != nil || user == nil {
-			return &scim.ScimError{Status: 404, ScimType: "invalidValue",
-				Detail: "User not found: " + memberValue}
-		}
-		if display == "" {
-			if user.DisplayName != nil && *user.DisplayName != "" {
-				display = *user.DisplayName
-			} else {
-				display = user.UserName
-			}
-		}
-	case "Group":
-		childGroup, err := h.groupRepo.FindByIDAndWorkspaceID(ctx, memberUUID, wsID)
-		if err != nil || childGroup == nil {
-			return &scim.ScimError{Status: 404, ScimType: "invalidValue",
-				Detail: "Group not found: " + memberValue}
-		}
-		if display == "" {
-			display = childGroup.DisplayName
-		}
-	default:
-		// Type omitted: check User first, then Group within the same workspace
-		user, uErr := h.userRepo.FindByIDAndWorkspaceID(ctx, memberUUID, wsID)
-		if uErr == nil && user != nil {
-			memberType = "User"
-			if display == "" {
-				if user.DisplayName != nil && *user.DisplayName != "" {
-					display = *user.DisplayName
-				} else {
-					display = user.UserName
-				}
-			}
-		} else {
-			childGroup, gErr := h.groupRepo.FindByIDAndWorkspaceID(ctx, memberUUID, wsID)
-			if gErr == nil && childGroup != nil {
-				memberType = "Group"
-				if display == "" {
-					display = childGroup.DisplayName
-				}
-			} else {
-				return &scim.ScimError{Status: 404, ScimType: "invalidValue",
-					Detail: "Member resource not found: " + memberValue}
-			}
-		}
-	}
-
-	membership := model.ScimGroupMembership{
-		ID:          uuid.New(),
-		GroupID:     groupID,
-		WorkspaceID: wsID,
-		MemberValue: memberUUID,
-		MemberType:  &memberType,
-		Display:     &display,
-	}
-
-	return h.membershipRepo.CreateBatch(ctx, []model.ScimGroupMembership{membership})
 }
 
 func (h *GroupHandler) touchWorkspace(ctx context.Context, wsID uuid.UUID) {

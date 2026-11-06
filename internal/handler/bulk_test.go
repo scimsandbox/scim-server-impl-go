@@ -1,12 +1,17 @@
 package handler
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
+	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
@@ -520,5 +525,92 @@ func TestBulk_MissingDataLocationAndTopologicalOrder(t *testing.T) {
 			t.Fatalf("embedded filter bulkId failed to resolve: got %q", got)
 		}
 	})
+
+	t.Run("entire POST cycle is scheduled before dependent PUT PATCH DELETE", func(t *testing.T) {
+		ops := []map[string]any{
+			{"method": "POST", "path": "/Groups", "bulkId": "g1", "data": map[string]any{"members": []any{map[string]any{"value": "bulkId:g2"}}}},
+			{"method": "PATCH", "path": "/Groups/bulkId:g1", "data": map[string]any{"Operations": []any{}}},
+			{"method": "POST", "path": "/Groups", "bulkId": "g2", "data": map[string]any{"members": []any{map[string]any{"value": "bulkId:g1"}}}},
+			{"method": "DELETE", "path": "/Groups/bulkId:g1"},
+		}
+		producers := map[string]int{"g1": 0, "g2": 2}
+		order := computeBulkExecutionOrder(ops, producers)
+		// Both POST g1 (0) and POST g2 (2) must execute before PATCH (1) and DELETE (3)
+		if len(order) != 4 || order[0] != 0 || order[1] != 2 || order[2] != 1 || order[3] != 3 {
+			t.Fatalf("computeBulkExecutionOrder = %v, want [0 2 1 3]", order)
+		}
+	})
 }
+
+func TestBulk_MaxBytesReader_ChunkedBodyExceedingLimitReturns413(t *testing.T) {
+	bh := &BulkHandler{}
+	wsID := uuid.New()
+
+	oversized := `{"schemas":["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],"Operations":[{"data":"` +
+		strings.Repeat("x", maxBulkPayloadBytes+1024) + `"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/Bulk", bytes.NewBufferString(oversized))
+	req.ContentLength = -1 // Simulate chunked transfer encoding with unknown Content-Length
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	rec := httptest.NewRecorder()
+	bh.ProcessBulk(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 Request Entity Too Large", rec.Code)
+	}
+}
+
+func TestBulk_DeferredFixupRollback_RemovesBulkIdAndCountsErrors(t *testing.T) {
+	bh := &BulkHandler{
+		userHandler:  &UserHandler{},
+		groupHandler: &GroupHandler{},
+	}
+	wsID := uuid.New()
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/ws/"+wsID.String()+"/scim/v2/Bulk", nil)
+
+	g1ID := uuid.New()
+	g2ID := uuid.New()
+	bulkIdMap := map[string]string{
+		"g1": g1ID.String(),
+		"g2": g2ID.String(),
+	}
+	indexedResults := []map[string]any{
+		{"method": "POST", "bulkId": "g1", "status": "201", "location": "https://example.com/Groups/" + g1ID.String(), "version": `W/"0"`},
+		{"method": "POST", "bulkId": "g2", "status": "201", "location": "https://example.com/Groups/" + g2ID.String(), "version": `W/"0"`},
+	}
+	createdPosts := map[int]*createdPostRecord{
+		0: {origIdx: 0, resourceType: bulkResourceGroups, resourceID: g1ID, bulkID: "g1", depBulkIDs: []string{"bad"}},
+		1: {origIdx: 1, resourceType: bulkResourceGroups, resourceID: g2ID, bulkID: "g2", depBulkIDs: []string{"g1"}},
+	}
+	fixups := []deferredBulkFixup{
+		{
+			kind:            bulkFixupGroupMembers,
+			origIdx:         0,
+			resourceID:      g1ID,
+			bulkID:          "g1",
+			deferredMembers: []map[string]any{{"value": "bulkId:bad"}},
+		},
+	}
+
+	rolledBack := make(map[string]bool)
+	rollbackErrors := bh.applyDeferredBulkFixups(req, wsID, "https://example.com", bulkIdMap, indexedResults, fixups, createdPosts, rolledBack)
+
+	// Both g1 (direct fixup failure) and g2 (cascade dependency on g1) must be rolled back
+	if rollbackErrors != 2 {
+		t.Fatalf("rollbackErrors = %d, want 2", rollbackErrors)
+	}
+	if _, exists := bulkIdMap["g1"]; exists {
+		t.Fatal("expected g1 to be removed from bulkIdMap after rollback")
+	}
+	if _, exists := bulkIdMap["g2"]; exists {
+		t.Fatal("expected g2 to be removed from bulkIdMap after cascade rollback")
+	}
+	if indexedResults[0]["status"] != "400" || indexedResults[1]["status"] != "400" {
+		t.Fatalf("expected both POST operations to have status 400 after rollback, got %v and %v",
+			indexedResults[0]["status"], indexedResults[1]["status"])
+	}
+	var _ *model.ScimGroup
+}
+
 

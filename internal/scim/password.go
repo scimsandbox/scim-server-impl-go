@@ -1,13 +1,13 @@
 package scim
 
 import (
-	"strings"
-
 	"golang.org/x/crypto/bcrypt"
 )
 
-// HashPassword hashes a raw plaintext password using bcrypt if non-empty and
-// not already a bcrypt hash (i.e. does not start with $2a$, $2b$, or $2y$).
+// MaxBcryptPasswordBytes is the maximum plaintext password length supported by bcrypt.
+const MaxBcryptPasswordBytes = 72
+
+// HashPassword hashes a raw plaintext password using bcrypt if non-empty.
 // If the password exceeds 72 bytes, or if bcrypt hashing fails, an error is returned
 // with HTTP 400 invalidValue so plaintext credentials are never stored.
 func HashPassword(raw *string) (*string, error) {
@@ -15,10 +15,7 @@ func HashPassword(raw *string) (*string, error) {
 		return raw, nil
 	}
 	val := *raw
-	if strings.HasPrefix(val, "$2a$") || strings.HasPrefix(val, "$2b$") || strings.HasPrefix(val, "$2y$") {
-		return raw, nil
-	}
-	if len([]byte(val)) > 72 {
+	if len([]byte(val)) > MaxBcryptPasswordBytes {
 		return nil, NewScimError(400, "invalidValue", "password cannot be more than 72 bytes")
 	}
 	hashed, err := bcrypt.GenerateFromPassword([]byte(val), bcrypt.DefaultCost)

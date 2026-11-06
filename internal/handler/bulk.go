@@ -7,13 +7,10 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
-	"github.com/scimsandbox/scim-server-impl-go/internal/repository"
 	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
@@ -24,7 +21,8 @@ const (
 	userNotFoundDetail  = "User not found"
 	groupNotFoundDetail = "Group not found"
 	maxOperations       = 1000
-	maxPayloadSize      = 1048576 // 1 MB
+	maxBulkPayloadBytes = 1048576 // 1 MB
+	maxPayloadSize      = maxBulkPayloadBytes
 )
 
 var bulkIdTokenRe = regexp.MustCompile(`bulkId:([^\s"'/\]\[,]+)`)
@@ -73,16 +71,24 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body map[string]any
-	if err := readJSON(r, &body); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	// Validate content length before reading body
+	if r.ContentLength > maxBulkPayloadBytes {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusRequestEntityTooLarge, "",
+			fmt.Sprintf("Bulk request exceeds maxPayloadSize (%d bytes)", maxBulkPayloadBytes)))
 		return
 	}
 
-	// Validate content length
-	if r.ContentLength > maxPayloadSize {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusRequestEntityTooLarge, "",
-			fmt.Sprintf("Bulk request exceeds maxPayloadSize (%d bytes)", maxPayloadSize)))
+	r.Body = http.MaxBytesReader(w, r.Body, maxBulkPayloadBytes)
+
+	var body map[string]any
+	if err := readJSON(r, &body); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusRequestEntityTooLarge, "",
+				fmt.Sprintf("Bulk request exceeds maxPayloadSize (%d bytes)", maxBulkPayloadBytes)))
+			return
+		}
+		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
 		return
 	}
 
@@ -138,12 +144,16 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	producerClosure := computePostProducerClosure(ops, producerByBulkID)
 	execOrder := computeBulkExecutionOrder(ops, producerByBulkID)
 
 	bulkIdMap := make(map[string]string)
 	indexedResults := make([]map[string]any, len(rawOps))
 	var fixups []deferredBulkFixup
 	createdPosts := make(map[int]*createdPostRecord)
+	completedOps := make(map[int]bool, len(rawOps))
+	rolledBackBulkIDs := make(map[string]bool)
+	baseURL := buildBaseURL(r)
 	errorCount := 0
 
 	for _, origIdx := range execOrder {
@@ -152,6 +162,7 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 		}
 		op := ops[origIdx]
 		if op == nil {
+			completedOps[origIdx] = true
 			continue
 		}
 
@@ -161,19 +172,45 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 		if createdRec != nil {
 			createdPosts[origIdx] = createdRec
 		}
+		completedOps[origIdx] = true
 
 		if isErrorResult(res) {
 			errorCount++
-			if failOnErrors > 0 && errorCount >= failOnErrors {
-				break
+		}
+
+		// Eagerly resolve any deferred fixups whose entire POST dependency closure has completed
+		if len(fixups) > 0 {
+			var readyFixups []deferredBulkFixup
+			var remainingFixups []deferredBulkFixup
+			for _, fx := range fixups {
+				ready := true
+				for p := range producerClosure[fx.origIdx] {
+					if !completedOps[p] {
+						ready = false
+						break
+					}
+				}
+				if ready {
+					readyFixups = append(readyFixups, fx)
+				} else {
+					remainingFixups = append(remainingFixups, fx)
+				}
 			}
+			if len(readyFixups) > 0 {
+				fixups = remainingFixups
+				rollbackErrs := h.applyDeferredBulkFixups(r, wsID, baseURL, bulkIdMap, indexedResults, readyFixups, createdPosts, rolledBackBulkIDs)
+				errorCount += rollbackErrs
+			}
+		}
+
+		if failOnErrors > 0 && errorCount >= failOnErrors {
+			break
 		}
 	}
 
-	// Phase 2: Resolve deferred cyclic bulkId references (Group members & User manager)
+	// Resolve any remaining deferred cyclic bulkId references (e.g. if loop broke early on failOnErrors)
 	if len(fixups) > 0 {
-		baseURL := buildBaseURL(r)
-		h.applyDeferredBulkFixups(r, wsID, baseURL, bulkIdMap, indexedResults, fixups, createdPosts)
+		h.applyDeferredBulkFixups(r, wsID, baseURL, bulkIdMap, indexedResults, fixups, createdPosts, rolledBackBulkIDs)
 	}
 
 	results := make([]map[string]any, 0, len(rawOps))
@@ -191,6 +228,48 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+func computePostProducerClosure(ops []map[string]any, producerByBulkID map[string]int) map[int]map[int]bool {
+	directDeps := make(map[int][]int)
+	for _, prodIdx := range producerByBulkID {
+		op := ops[prodIdx]
+		if op == nil {
+			continue
+		}
+		seen := make(map[int]bool)
+		for _, ref := range extractBulkIDRefs(op["path"]) {
+			if depIdx, ok := producerByBulkID[ref]; ok && !seen[depIdx] {
+				seen[depIdx] = true
+				directDeps[prodIdx] = append(directDeps[prodIdx], depIdx)
+			}
+		}
+		for _, ref := range extractBulkIDRefs(op["data"]) {
+			if depIdx, ok := producerByBulkID[ref]; ok && !seen[depIdx] {
+				seen[depIdx] = true
+				directDeps[prodIdx] = append(directDeps[prodIdx], depIdx)
+			}
+		}
+	}
+
+	closure := make(map[int]map[int]bool, len(producerByBulkID))
+	for _, prodIdx := range producerByBulkID {
+		visited := make(map[int]bool)
+		queue := []int{prodIdx}
+		visited[prodIdx] = true
+		for len(queue) > 0 {
+			curr := queue[0]
+			queue = queue[1:]
+			for _, nxt := range directDeps[curr] {
+				if !visited[nxt] {
+					visited[nxt] = true
+					queue = append(queue, nxt)
+				}
+			}
+		}
+		closure[prodIdx] = visited
+	}
+	return closure
+}
+
 func computeBulkExecutionOrder(ops []map[string]any, producerByBulkID map[string]int) []int {
 	n := len(ops)
 	if n <= 1 || len(producerByBulkID) == 0 {
@@ -201,6 +280,7 @@ func computeBulkExecutionOrder(ops []map[string]any, producerByBulkID map[string
 		return order
 	}
 
+	producerClosure := computePostProducerClosure(ops, producerByBulkID)
 	dependents := make([][]int, n)
 	inDegree := make([]int, n)
 	lastOpForResource := make(map[string]int)
@@ -228,16 +308,35 @@ func computeBulkExecutionOrder(ops []map[string]any, producerByBulkID map[string
 			}
 		}
 
-		for _, ref := range extractBulkIDRefs(op["path"]) {
-			if prodIdx, ok := producerByBulkID[ref]; ok {
-				addEdge(prodIdx, i)
+		addRefEdges := func(ref string) {
+			prodIdx, ok := producerByBulkID[ref]
+			if !ok {
+				return
 			}
+			addEdge(prodIdx, i)
+			// If operation i is not part of prodIdx's cycle/closure, require the entire
+			// POST dependency closure of prodIdx to complete before operation i executes.
+			if !producerClosure[prodIdx][i] {
+				for p := range producerClosure[prodIdx] {
+					addEdge(p, i)
+				}
+			}
+		}
+
+		for _, ref := range extractBulkIDRefs(op["path"]) {
+			addRefEdges(ref)
 		}
 		for _, ref := range extractBulkIDRefs(op["data"]) {
-			if prodIdx, ok := producerByBulkID[ref]; ok {
-				addEdge(prodIdx, i)
-			}
+			addRefEdges(ref)
 		}
+	}
+
+	isPostOp := func(idx int) bool {
+		if ops[idx] == nil {
+			return false
+		}
+		m, _ := ops[idx]["method"].(string)
+		return strings.EqualFold(strings.TrimSpace(m), "POST")
 	}
 
 	scheduled := make([]bool, n)
@@ -255,12 +354,9 @@ func computeBulkExecutionOrder(ops []map[string]any, producerByBulkID map[string
 			// Cycle detected: pick the earliest unscheduled POST operation so Phase 1 can create
 			// its resource ID and defer its cyclic reference to Phase 2.
 			for i := 0; i < n; i++ {
-				if !scheduled[i] && ops[i] != nil {
-					m, _ := ops[i]["method"].(string)
-					if strings.EqualFold(m, "POST") {
-						chosen = i
-						break
-					}
+				if !scheduled[i] && isPostOp(i) {
+					chosen = i
+					break
 				}
 			}
 			if chosen == -1 {
@@ -629,8 +725,12 @@ func (h *BulkHandler) applyDeferredBulkFixups(
 	indexedResults []map[string]any,
 	fixups []deferredBulkFixup,
 	createdPosts map[int]*createdPostRecord,
-) {
-	rolledBackBulkIDs := make(map[string]bool)
+	rolledBackBulkIDs map[string]bool,
+) int {
+	if rolledBackBulkIDs == nil {
+		rolledBackBulkIDs = make(map[string]bool)
+	}
+	rollbackErrors := 0
 
 	rollbackRecord := func(rec *createdPostRecord, err error) {
 		if rec == nil || rec.rolledBack {
@@ -663,9 +763,13 @@ func (h *BulkHandler) applyDeferredBulkFixups(
 		}
 		if rec.origIdx >= 0 && rec.origIdx < len(indexedResults) && indexedResults[rec.origIdx] != nil {
 			res := indexedResults[rec.origIdx]
+			wasError := isErrorResult(res)
 			delete(res, "location")
 			delete(res, "version")
 			setBulkError(res, err)
+			if !wasError && isErrorResult(res) {
+				rollbackErrors++
+			}
 		}
 	}
 
@@ -690,7 +794,7 @@ func (h *BulkHandler) applyDeferredBulkFixups(
 					}
 					seen[mv] = true
 				}
-				if err := h.groupHandler.addMember(r.Context(), fx.resourceID, wsID, resolvedMember); err != nil {
+				if err := h.groupHandler.addMemberTx(r.Context(), nil, fx.resourceID, wsID, resolvedMember); err != nil {
 					fixErr = err
 					break
 				}
@@ -755,6 +859,8 @@ func (h *BulkHandler) applyDeferredBulkFixups(
 			}
 		}
 	}
+
+	return rollbackErrors
 }
 
 func (h *BulkHandler) handleBulkPut(r *http.Request, result map[string]any, rawPath string, data map[string]any, opVersion string, wsID uuid.UUID, baseURL string) {
@@ -855,406 +961,54 @@ func (h *BulkHandler) handleBulkDelete(r *http.Request, result map[string]any, r
 	}
 }
 
-// Internal helpers that wrap handler operations and return errors instead of writing to response
+// Internal helpers that delegate to UserHandler and GroupHandler execute* methods
 
 func (h *BulkHandler) createUserInternal(r *http.Request, wsID uuid.UUID, baseURL string, data map[string]any) (*model.ScimUser, error) {
-	userName, _ := data["userName"].(string)
-	userName = scim.NormalizeNFC(userName)
-	if userName == "" {
-		return nil, &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "userName is required"}
-	}
-
-	exists, err := h.userHandler.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), userName, wsID)
-	if err != nil {
-		return nil, &scim.ScimError{Status: 500, Detail: "Internal error"}
-	}
-	if exists {
-		return nil, &scim.ScimError{Status: 409, ScimType: "uniqueness",
-			Detail: "User with userName '" + userName + "' already exists"}
-	}
-
-	user := &model.ScimUser{
-		ID:           uuid.New(),
-		WorkspaceID:  wsID,
-		Active:       true,
-		CreatedAt:    time.Now(),
-		LastModified: time.Now(),
-		Version:      0,
-	}
-	if err := scim.ApplyFromScimInput(user, data); err != nil {
-		return nil, err
-	}
-	h.userHandler.resolveManagerMetadata(r.Context(), user, wsID, baseURL)
-
-	if err := h.userHandler.userRepo.Create(r.Context(), user); err != nil {
-		if isUserNameConflict(err) {
-			return nil, &scim.ScimError{Status: 409, ScimType: "uniqueness",
-				Detail: "User with userName '" + user.UserName + "' already exists"}
-		}
-		return nil, &scim.ScimError{Status: 500, Detail: "Failed to create user"}
-	}
-
-	h.userHandler.touchWorkspace(r.Context(), wsID)
-	return user, nil
+	return h.userHandler.executeCreateUser(r.Context(), wsID, baseURL, data)
 }
 
 func (h *BulkHandler) createGroupInternal(r *http.Request, wsID uuid.UUID, data map[string]any) (*model.ScimGroup, error) {
-	rawDN, hasDN := data["displayName"]
-	displayName, okDN := rawDN.(string)
-	displayName = scim.NormalizeNFC(displayName)
-	if !hasDN || !okDN || displayName == "" {
-		return nil, &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "displayName is required"}
-	}
-
-	rawExt, hasExt := data["externalId"]
-	extIDPtr, err := parseGroupExternalID(rawExt, hasExt)
-	if err != nil {
-		return nil, err
-	}
-
-	var createdGroup *model.ScimGroup
-	err = jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
-		existing, err := h.groupHandler.groupRepo.FindByDisplayNameAndWorkspaceIDTx(r.Context(), tx, displayName, wsID)
-		if err != nil {
-			return &scim.ScimError{Status: 500, Detail: "Internal error"}
-		}
-		if existing != nil {
-			return &scim.ScimError{Status: 409, ScimType: "uniqueness",
-				Detail: "Group with displayName '" + displayName + "' already exists"}
-		}
-
-		group := &model.ScimGroup{
-			ID:           uuid.New(),
-			WorkspaceID:  wsID,
-			DisplayName:  displayName,
-			ExternalID:   extIDPtr,
-			CreatedAt:    time.Now().UTC(),
-			LastModified: time.Now().UTC(),
-			Version:      0,
-		}
-
-		if err := h.groupHandler.groupRepo.CreateTx(r.Context(), tx, group); err != nil {
-			if isGroupDisplayNameConflict(err) {
-				return &scim.ScimError{Status: 409, ScimType: "uniqueness",
-					Detail: "Group with displayName '" + displayName + "' already exists"}
-			}
-			return &scim.ScimError{Status: 500, Detail: "Failed to create group"}
-		}
-
-		// Add members within transaction; any failure triggers rollback
-		if members, ok := data["members"].([]any); ok {
-			seen := make(map[string]bool, len(members))
-			for _, m := range members {
-				if memberMap, ok := m.(map[string]any); ok {
-					if err := checkMemberValueRefConflict(memberMap); err != nil {
-						return err
-					}
-					if mv := resolveMemberID(memberMap); mv != "" {
-						if seen[mv] {
-							continue
-						}
-						seen[mv] = true
-					}
-					if err := h.groupHandler.addMemberTx(r.Context(), tx, group.ID, wsID, memberMap); err != nil {
-						return err
-					}
-				}
-			}
-		}
-
-		createdGroup = group
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	h.groupHandler.touchWorkspace(r.Context(), wsID)
-	return createdGroup, nil
+	return h.groupHandler.executeCreateGroup(r.Context(), wsID, data)
 }
 
 func (h *BulkHandler) replaceUserInternal(r *http.Request, wsID, userID uuid.UUID, baseURL string, data map[string]any, opVersion string) (int64, error) {
-	user, err := h.userHandler.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
-	if err != nil || user == nil {
-		return 0, &scim.ScimError{Status: 404, Detail: userNotFoundDetail}
-	}
-
-	if strings.TrimSpace(opVersion) != "" && !checkETagMatch(opVersion, user.Version) {
-		return 0, &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag version precondition failed"}
-	}
-
-	newUserName, _ := data["userName"].(string)
-	newUserName = scim.NormalizeNFC(newUserName)
-	if newUserName != "" && !strings.EqualFold(newUserName, user.UserName) {
-		exists, err := h.userHandler.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), newUserName, wsID)
-		if err != nil {
-			return 0, &scim.ScimError{Status: 500, Detail: "Internal error"}
-		}
-		if exists {
-			return 0, &scim.ScimError{Status: 409, ScimType: "uniqueness", Detail: "User with userName '" + newUserName + "' already exists"}
-		}
-	}
-
-	scim.ClearMutableAttributes(user)
-	if err := scim.ApplyFromScimInput(user, data); err != nil {
+	user, err := h.userHandler.executeReplaceUser(r.Context(), wsID, userID, baseURL, data, opVersion)
+	if err != nil {
 		return 0, err
 	}
-	h.userHandler.resolveManagerMetadata(r.Context(), user, wsID, baseURL)
-	user.LastModified = time.Now()
-
-	if err := h.userHandler.userRepo.Update(r.Context(), user); err != nil {
-		if errors.Is(err, repository.ErrOptimisticLock) {
-			return 0, &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "Resource changed"}
-		}
-		if isUserNameConflict(err) {
-			return 0, &scim.ScimError{Status: 409, ScimType: "uniqueness",
-				Detail: "User with userName '" + user.UserName + "' already exists"}
-		}
-		return 0, &scim.ScimError{Status: 500, Detail: "Failed to update user"}
-	}
-
-	h.userHandler.touchWorkspace(r.Context(), wsID)
 	return user.Version, nil
 }
 
 func (h *BulkHandler) replaceGroupInternal(r *http.Request, wsID, groupID uuid.UUID, data map[string]any, opVersion string) (int64, error) {
-	var newVersion int64
-	err := jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
-		group, err := h.groupHandler.groupRepo.FindByIDAndWorkspaceIDTx(r.Context(), tx, groupID, wsID)
-		if err != nil || group == nil {
-			return &scim.ScimError{Status: 404, Detail: groupNotFoundDetail}
-		}
-
-		if strings.TrimSpace(opVersion) != "" && !checkETagMatch(opVersion, group.Version) {
-			return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag version precondition failed"}
-		}
-
-		rawDN, hasDN := data["displayName"]
-		displayName, okDN := rawDN.(string)
-		displayName = scim.NormalizeNFC(displayName)
-		if !hasDN || !okDN || displayName == "" {
-			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "displayName is required"}
-		}
-
-		rawExt, hasExt := data["externalId"]
-		extIDPtr, err := parseGroupExternalID(rawExt, hasExt)
-		if err != nil {
-			return err
-		}
-
-		if displayName != group.DisplayName {
-			existing, err := h.groupHandler.groupRepo.FindByDisplayNameAndWorkspaceIDTx(r.Context(), tx, displayName, wsID)
-			if err != nil {
-				return err
-			}
-			if existing != nil && existing.ID != group.ID {
-				return &scim.ScimError{Status: http.StatusConflict, ScimType: "uniqueness",
-					Detail: "Group with displayName '" + displayName + "' already exists"}
-			}
-		}
-
-		// GRP_21: RFC 7643 §4.2 - Group member sub-attributes 'value' and 'type' are immutable
-		if err := h.groupHandler.checkMemberTypeImmutabilityTx(r.Context(), tx, group.ID, data["members"]); err != nil {
-			return err
-		}
-
-		group.DisplayName = displayName
-		group.ExternalID = extIDPtr
-
-		// Clear and re-add members within transaction
-		if err := h.groupHandler.membershipRepo.DeleteByGroupIDTx(r.Context(), tx, group.ID); err != nil {
-			return err
-		}
-		if members, ok := data["members"].([]any); ok {
-			seen := make(map[string]bool, len(members))
-			for _, m := range members {
-				if memberMap, ok := m.(map[string]any); ok {
-					if err := checkMemberValueRefConflict(memberMap); err != nil {
-						return err
-					}
-					if mv := resolveMemberID(memberMap); mv != "" {
-						if seen[mv] {
-							continue
-						}
-						seen[mv] = true
-					}
-					if err := h.groupHandler.addMemberTx(r.Context(), tx, group.ID, wsID, memberMap); err != nil {
-						return err
-					}
-				}
-			}
-		}
-
-		group.LastModified = time.Now().UTC()
-		if err := h.groupHandler.groupRepo.UpdateTx(r.Context(), tx, group); err != nil {
-			if errors.Is(err, repository.ErrOptimisticLock) {
-				return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "Resource changed"}
-			}
-			if isGroupDisplayNameConflict(err) {
-				return &scim.ScimError{Status: http.StatusConflict, ScimType: "uniqueness",
-					Detail: "Group with displayName '" + displayName + "' already exists"}
-			}
-			return &scim.ScimError{Status: 500, Detail: "Failed to update group"}
-		}
-		newVersion = group.Version
-		return nil
-	})
+	group, err := h.groupHandler.executeReplaceGroup(r.Context(), wsID, groupID, data, opVersion)
 	if err != nil {
 		return 0, err
 	}
-
-	h.groupHandler.touchWorkspace(r.Context(), wsID)
-	return newVersion, nil
+	return group.Version, nil
 }
 
 func (h *BulkHandler) patchUserInternal(r *http.Request, wsID, userID uuid.UUID, baseURL string, operations []map[string]any, opVersion string) (int64, error) {
-	user, err := h.userHandler.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
-	if err != nil || user == nil {
-		return 0, &scim.ScimError{Status: 404, Detail: userNotFoundDetail}
-	}
-
-	if strings.TrimSpace(opVersion) != "" && !checkETagMatch(opVersion, user.Version) {
-		return 0, &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag version precondition failed"}
-	}
-
-	before := scim.CloneScimUser(user)
-
-	if err := scim.ApplyPatchOperations(user, operations); err != nil {
+	user, err := h.userHandler.executePatchUser(r.Context(), wsID, userID, baseURL, operations, opVersion)
+	if err != nil {
 		return 0, err
 	}
-	h.userHandler.resolveManagerMetadata(r.Context(), user, wsID, baseURL)
-
-	if !scim.ScimUserMutableEqual(before, user) {
-		if !strings.EqualFold(user.UserName, before.UserName) {
-			exists, err := h.userHandler.userRepo.ExistsByUserNameAndWorkspaceID(r.Context(), user.UserName, wsID)
-			if err != nil {
-				return 0, &scim.ScimError{Status: 500, Detail: "Internal error"}
-			}
-			if exists {
-				return 0, &scim.ScimError{Status: 409, ScimType: "uniqueness", Detail: "User with userName '" + user.UserName + "' already exists"}
-			}
-		}
-
-		user.LastModified = time.Now()
-		if err := h.userHandler.userRepo.Update(r.Context(), user); err != nil {
-			if errors.Is(err, repository.ErrOptimisticLock) {
-				return 0, &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "Resource changed"}
-			}
-			if isUserNameConflict(err) {
-				return 0, &scim.ScimError{Status: 409, ScimType: "uniqueness",
-					Detail: "User with userName '" + user.UserName + "' already exists"}
-			}
-			return 0, &scim.ScimError{Status: 500, Detail: "Failed to update user"}
-		}
-
-		h.userHandler.touchWorkspace(r.Context(), wsID)
-	}
-
 	return user.Version, nil
 }
 
 func (h *BulkHandler) patchGroupInternal(r *http.Request, wsID, groupID uuid.UUID, operations []map[string]any, opVersion string) (int64, error) {
-	var finalVersion int64
-	changed := false
-	err := jdbc.InTransaction(r.Context(), func(tx jdbc.Tx) error {
-		group, err := h.groupHandler.groupRepo.FindByIDAndWorkspaceIDTx(r.Context(), tx, groupID, wsID)
-		if err != nil || group == nil {
-			return &scim.ScimError{Status: 404, Detail: groupNotFoundDetail}
-		}
-
-		if strings.TrimSpace(opVersion) != "" && !checkETagMatch(opVersion, group.Version) {
-			return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag version precondition failed"}
-		}
-
-		memberships, err := h.groupHandler.membershipRepo.FindByGroupIDTx(r.Context(), tx, group.ID)
-		if err != nil {
-			return err
-		}
-		group.Members = memberships
-
-		beforeDN := group.DisplayName
-		beforeExt := cloneGroupStrPtr(group.ExternalID)
-		beforeMembers := append([]model.ScimGroupMembership(nil), memberships...)
-
-		for _, op := range operations {
-			if err := h.groupHandler.applyGroupPatchOpTx(r.Context(), tx, group, wsID, op); err != nil {
-				return err
-			}
-		}
-
-		afterMembers, err := h.groupHandler.membershipRepo.FindByGroupIDTx(r.Context(), tx, group.ID)
-		if err != nil {
-			return err
-		}
-
-		if group.DisplayName != beforeDN || !strPtrEq(group.ExternalID, beforeExt) || !groupMembersEqual(beforeMembers, afterMembers) {
-			changed = true
-			group.LastModified = time.Now().UTC()
-			if err := h.groupHandler.groupRepo.UpdateTx(r.Context(), tx, group); err != nil {
-				if errors.Is(err, repository.ErrOptimisticLock) {
-					return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "Resource changed"}
-				}
-				if isGroupDisplayNameConflict(err) {
-					return &scim.ScimError{Status: http.StatusConflict, ScimType: "uniqueness", Detail: "Group displayName already exists"}
-				}
-				return &scim.ScimError{Status: 500, Detail: "Failed to update group"}
-			}
-		}
-
-		finalVersion = group.Version
-		return nil
-	})
+	group, err := h.groupHandler.executePatchGroup(r.Context(), wsID, groupID, operations, opVersion)
 	if err != nil {
 		return 0, err
 	}
-
-	if changed {
-		h.groupHandler.touchWorkspace(r.Context(), wsID)
-	}
-	return finalVersion, nil
+	return group.Version, nil
 }
 
 func (h *BulkHandler) deleteUserInternal(r *http.Request, wsID, userID uuid.UUID, opVersion string) error {
-	user, err := h.userHandler.userRepo.FindByIDAndWorkspaceID(r.Context(), userID, wsID)
-	if err != nil || user == nil {
-		return &scim.ScimError{Status: 404, Detail: userNotFoundDetail}
-	}
-
-	if strings.TrimSpace(opVersion) != "" && !checkETagMatch(opVersion, user.Version) {
-		return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag version precondition failed"}
-	}
-
-	if h.userHandler.membershipRepo != nil {
-		_ = h.userHandler.membershipRepo.DeleteByMemberValue(r.Context(), userID)
-	}
-	if err := h.userHandler.userRepo.Delete(r.Context(), userID, wsID); err != nil {
-		return &scim.ScimError{Status: 500, Detail: "Failed to delete user"}
-	}
-
-	h.userHandler.touchWorkspace(r.Context(), wsID)
-	return nil
+	return h.userHandler.executeDeleteUser(r.Context(), wsID, userID, opVersion)
 }
 
 func (h *BulkHandler) deleteGroupInternal(r *http.Request, wsID, groupID uuid.UUID, opVersion string) error {
-	group, err := h.groupHandler.groupRepo.FindByIDAndWorkspaceID(r.Context(), groupID, wsID)
-	if err != nil || group == nil {
-		return &scim.ScimError{Status: 404, Detail: groupNotFoundDetail}
-	}
-
-	if strings.TrimSpace(opVersion) != "" && !checkETagMatch(opVersion, group.Version) {
-		return &scim.ScimError{Status: http.StatusPreconditionFailed, Detail: "ETag version precondition failed"}
-	}
-
-	if h.groupHandler.membershipRepo != nil {
-		_ = h.groupHandler.membershipRepo.DeleteByMemberValue(r.Context(), groupID)
-		_ = h.groupHandler.membershipRepo.DeleteByGroupID(r.Context(), groupID)
-	}
-	if err := h.groupHandler.groupRepo.Delete(r.Context(), groupID, wsID); err != nil {
-		return &scim.ScimError{Status: 500, Detail: "Failed to delete group"}
-	}
-
-	h.groupHandler.touchWorkspace(r.Context(), wsID)
-	return nil
+	return h.groupHandler.executeDeleteGroup(r.Context(), wsID, groupID, opVersion)
 }
 
 // Helpers

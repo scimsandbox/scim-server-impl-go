@@ -163,6 +163,9 @@ func resolveGroupSortColumn(sortBy string) string {
 // --- Transactional variants (accept a Querier) ---
 
 func (r *GroupRepository) FindByIDAndWorkspaceIDTx(ctx context.Context, tx jdbc.Executor, id, workspaceID uuid.UUID) (*model.ScimGroup, error) {
+	if tx == nil {
+		return r.FindByIDAndWorkspaceID(ctx, id, workspaceID)
+	}
 	query := `SELECT ` + groupColumns + ` FROM scim_groups WHERE id = $1 AND workspace_id = $2`
 	row := tx.QueryRowContext(ctx, query, id, workspaceID)
 	g, err := scanGroup(row)
@@ -173,6 +176,9 @@ func (r *GroupRepository) FindByIDAndWorkspaceIDTx(ctx context.Context, tx jdbc.
 }
 
 func (r *GroupRepository) FindByDisplayNameAndWorkspaceIDTx(ctx context.Context, tx jdbc.Executor, displayName string, workspaceID uuid.UUID) (*model.ScimGroup, error) {
+	if tx == nil {
+		return r.FindByDisplayNameAndWorkspaceID(ctx, displayName, workspaceID)
+	}
 	query := `SELECT ` + groupColumns + ` FROM scim_groups WHERE display_name = $1 AND workspace_id = $2`
 	row := tx.QueryRowContext(ctx, query, displayName, workspaceID)
 	g, err := scanGroup(row)
@@ -183,6 +189,9 @@ func (r *GroupRepository) FindByDisplayNameAndWorkspaceIDTx(ctx context.Context,
 }
 
 func (r *GroupRepository) UpdateTx(ctx context.Context, tx jdbc.Executor, g *model.ScimGroup) error {
+	if tx == nil {
+		return r.Update(ctx, g)
+	}
 	g.LastModified = time.Now().UTC()
 	oldVersion := g.Version
 	g.Version++
@@ -207,6 +216,9 @@ func (r *GroupRepository) UpdateTx(ctx context.Context, tx jdbc.Executor, g *mod
 }
 
 func (r *GroupRepository) CreateTx(ctx context.Context, tx jdbc.Executor, g *model.ScimGroup) error {
+	if tx == nil {
+		return r.Create(ctx, g)
+	}
 	if g.ID == uuid.Nil {
 		g.ID = uuid.New()
 	}
@@ -377,6 +389,9 @@ func (r *MembershipRepository) UpdateMemberType(ctx context.Context, membershipI
 // Transactional variants for memberships
 
 func (r *MembershipRepository) FindByGroupIDTx(ctx context.Context, tx jdbc.Executor, groupID uuid.UUID) ([]model.ScimGroupMembership, error) {
+	if tx == nil {
+		return r.FindByGroupID(ctx, groupID)
+	}
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, group_id, workspace_id, member_value, member_type, display
 		 FROM scim_group_memberships WHERE group_id = $1`, groupID)
@@ -388,6 +403,9 @@ func (r *MembershipRepository) FindByGroupIDTx(ctx context.Context, tx jdbc.Exec
 }
 
 func (r *MembershipRepository) CreateBatchTx(ctx context.Context, tx jdbc.Executor, memberships []model.ScimGroupMembership) error {
+	if tx == nil {
+		return r.CreateBatch(ctx, memberships)
+	}
 	if len(memberships) == 0 {
 		return nil
 	}
@@ -404,16 +422,25 @@ func (r *MembershipRepository) CreateBatchTx(ctx context.Context, tx jdbc.Execut
 }
 
 func (r *MembershipRepository) DeleteByGroupIDTx(ctx context.Context, tx jdbc.Executor, groupID uuid.UUID) error {
+	if tx == nil {
+		return r.DeleteByGroupID(ctx, groupID)
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM scim_group_memberships WHERE group_id = $1`, groupID)
 	return err
 }
 
 func (r *MembershipRepository) DeleteByMemberValueTx(ctx context.Context, tx jdbc.Executor, memberValue uuid.UUID) error {
+	if tx == nil {
+		return r.DeleteByMemberValue(ctx, memberValue)
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM scim_group_memberships WHERE member_value = $1`, memberValue)
 	return err
 }
 
 func (r *MembershipRepository) DeleteByGroupIDAndMemberValuesTx(ctx context.Context, tx jdbc.Executor, groupID uuid.UUID, memberValues []uuid.UUID) error {
+	if tx == nil {
+		return r.DeleteByGroupIDAndMemberValues(ctx, groupID, memberValues)
+	}
 	if len(memberValues) == 0 {
 		return nil
 	}
@@ -430,6 +457,9 @@ func (r *MembershipRepository) DeleteByGroupIDAndMemberValuesTx(ctx context.Cont
 }
 
 func (r *MembershipRepository) UpdateMemberTypeTx(ctx context.Context, tx jdbc.Executor, membershipID, wsID uuid.UUID, memberType string) error {
+	if tx == nil {
+		return r.UpdateMemberType(ctx, membershipID, wsID, memberType)
+	}
 	_, err := tx.ExecContext(ctx,
 		`UPDATE scim_group_memberships SET member_type = $1 WHERE id = $2 AND workspace_id = $3`,
 		memberType, membershipID, wsID)

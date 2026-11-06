@@ -319,6 +319,9 @@ func replaceCollectionEmails(emails []model.ScimUserEmail) []model.ScimUserEmail
 
 // Transactional variants
 func (r *UserRepository) FindByIDAndWorkspaceIDTx(ctx context.Context, tx jdbc.Executor, id, workspaceID uuid.UUID) (*model.ScimUser, error) {
+	if tx == nil {
+		return r.FindByIDAndWorkspaceID(ctx, id, workspaceID)
+	}
 	query := `SELECT ` + userColumns + ` FROM scim_users WHERE id = $1 AND workspace_id = $2`
 	row := tx.QueryRowContext(ctx, query, id, workspaceID)
 	u, err := scanUser(row)

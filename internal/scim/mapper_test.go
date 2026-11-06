@@ -186,25 +186,23 @@ func TestHashPassword(t *testing.T) {
 		t.Fatalf("bcrypt verification failed: %v", err)
 	}
 
-	// Pre-hashed $2a$ password should remain untouched
-	preHashed := "$2a$10$abcdefghijklmnopqrstuvwxyz0123456789"
-	sameHashed, err := HashPassword(&preHashed)
-	if err != nil || sameHashed == nil || *sameHashed != preHashed {
-		t.Fatalf("expected pre-hashed $2a$ password to remain unchanged, got %v (err=%v)", sameHashed, err)
-	}
-
-	// Pre-hashed $2b$ password should remain untouched
-	preHashed2b := "$2b$10$abcdefghijklmnopqrstuvwxyz0123456789"
-	sameHashed2b, err := HashPassword(&preHashed2b)
-	if err != nil || sameHashed2b == nil || *sameHashed2b != preHashed2b {
-		t.Fatalf("expected pre-hashed $2b$ password to remain unchanged, got %v (err=%v)", sameHashed2b, err)
-	}
-
-	// Pre-hashed $2y$ password should remain untouched
-	preHashed2y := "$2y$10$abcdefghijklmnopqrstuvwxyz0123456789"
-	sameHashed2y, err := HashPassword(&preHashed2y)
-	if err != nil || sameHashed2y == nil || *sameHashed2y != preHashed2y {
-		t.Fatalf("expected pre-hashed $2y$ password to remain unchanged, got %v (err=%v)", sameHashed2y, err)
+	// Inputs starting with $2a$, $2b$, and $2y$ must still be hashed as plaintext passwords
+	for _, prefixInput := range []string{
+		"$2a$10$abcdefghijklmnopqrstuvwxyz0123456789",
+		"$2b$10$abcdefghijklmnopqrstuvwxyz0123456789",
+		"$2y$10$abcdefghijklmnopqrstuvwxyz0123456789",
+	} {
+		input := prefixInput
+		hashedPrefix, err := HashPassword(&input)
+		if err != nil || hashedPrefix == nil {
+			t.Fatalf("expected password starting with bcrypt prefix %q to be hashed, got err=%v", input, err)
+		}
+		if *hashedPrefix == input {
+			t.Fatalf("expected password starting with bcrypt prefix %q to be hashed, but returned unchanged", input)
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(*hashedPrefix), []byte(input)); err != nil {
+			t.Fatalf("bcrypt verification failed for %q: %v", input, err)
+		}
 	}
 
 	// Nil / empty stays nil / empty

@@ -13,10 +13,11 @@ import (
 
 // PaginationRequest contains resolved pagination parameters.
 type PaginationRequest struct {
-	IsCursor   bool
-	Offset     int
-	Count      int
-	StartIndex int
+	IsCursor     bool
+	Offset       int
+	Count        int
+	StartIndex   int
+	PrevPageSize int
 }
 
 // parsePagination parses cursor or index-based pagination parameters from query string and optional JSON body.
@@ -93,7 +94,7 @@ func parsePagination(
 	}
 
 	if hasCursor {
-		offset, err := scim.DecodeCursor(cursorVal, wsID)
+		offset, prevPageSize, err := scim.DecodeCursorWithPageSize(cursorVal, wsID)
 		if err != nil {
 			if scimErr, ok := err.(*scim.ScimError); ok {
 				return nil, scimErr
@@ -104,9 +105,10 @@ func parsePagination(
 			return nil, scim.NewScimError(http.StatusBadRequest, "tooMany", "Requested count exceeds maxPageSize (200)")
 		}
 		return &PaginationRequest{
-			IsCursor: true,
-			Offset:   offset,
-			Count:    count,
+			IsCursor:     true,
+			Offset:       offset,
+			Count:        count,
+			PrevPageSize: prevPageSize,
 		}, nil
 	}
 
@@ -142,18 +144,25 @@ func buildListResponse(
 		resp["startIndex"] = pag.StartIndex
 	} else {
 		// RFC 9865 §2: In cursor mode, startIndex is omitted.
-		// If offset > 0: previousCursor = EncodeCursor(wsID, max(0, offset - count), 3600)
 		if pag.Offset > 0 {
-			prevOffset := max(0, pag.Offset-pag.Count)
-			if prevCur, err := scim.EncodeCursor(wsID, prevOffset, scim.DefaultCursorTimeoutSeconds); err == nil {
-				resp["previousCursor"] = prevCur
+			step := pag.PrevPageSize
+			if step <= 0 {
+				step = pag.Count
+			}
+			prevOffset := pag.Offset - step
+			if prevOffset < 0 || step <= 0 {
+				prevOffset = 0
+			}
+			if pc, err := scim.EncodeCursorWithPageSize(wsID, prevOffset, step, scim.DefaultCursorTimeoutSeconds); err == nil {
+				resp["previousCursor"] = pc
 			}
 		}
-		// If offset + len(resources) < totalResults: nextCursor = EncodeCursor(wsID, offset + len(resources), 3600)
-		if pag.Offset+len(resources) < totalResults {
+		if len(resources) > 0 {
 			nextOffset := pag.Offset + len(resources)
-			if nextCur, err := scim.EncodeCursor(wsID, nextOffset, scim.DefaultCursorTimeoutSeconds); err == nil {
-				resp["nextCursor"] = nextCur
+			if nextOffset < totalResults {
+				if nc, err := scim.EncodeCursorWithPageSize(wsID, nextOffset, len(resources), scim.DefaultCursorTimeoutSeconds); err == nil {
+					resp["nextCursor"] = nc
+				}
 			}
 		}
 	}

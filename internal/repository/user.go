@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
+	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
 type rowScanner interface {
@@ -94,6 +95,7 @@ func (r *UserRepository) Create(ctx context.Context, u *model.ScimUser) error {
 	u.CreatedAt = now
 	u.LastModified = now
 	u.Version = 0
+	u.Emails = replaceCollectionEmails(u.Emails)
 
 	query := `INSERT INTO scim_users (` + userColumns + `)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)`
@@ -119,6 +121,7 @@ func (r *UserRepository) Update(ctx context.Context, u *model.ScimUser) error {
 	u.LastModified = time.Now().UTC()
 	oldVersion := u.Version
 	u.Version++
+	u.Emails = replaceCollectionEmails(u.Emails)
 
 	query := `UPDATE scim_users SET
 		user_name=$1, external_id=$2,
@@ -196,11 +199,7 @@ func (r *UserRepository) List(ctx context.Context, workspaceID uuid.UUID, whereC
 	}
 
 	sortCol := resolveUserSortColumn(sortAttr)
-	direction := "ASC"
-	if strings.EqualFold(sortDir, "descending") {
-		direction = "DESC"
-	}
-	query += fmt.Sprintf(" ORDER BY %s %s", sortCol, direction)
+	query += " " + buildOrderClause(sortCol, sortDir)
 	query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := jdbc.QueryContext(ctx, query, args...)
@@ -220,35 +219,109 @@ func (r *UserRepository) List(ctx context.Context, workspaceID uuid.UUID, whereC
 	return users, rows.Err()
 }
 
+const userSortEmailsExpression = `COALESCE((SELECT elem->>'value' FROM jsonb_array_elements(emails::jsonb) elem WHERE (COALESCE(elem->>'primaryFlag', elem->>'primary'))::boolean IS TRUE LIMIT 1), emails::jsonb->0->>'value')`
+
+func buildOrderClause(sortCol, sortDir string) string {
+	direction := "ASC"
+	nullsOrder := "NULLS LAST"
+	if strings.EqualFold(sortDir, "descending") || strings.EqualFold(sortDir, "desc") {
+		direction = "DESC"
+		nullsOrder = "NULLS FIRST"
+	}
+	if sortCol == "id" {
+		return fmt.Sprintf("ORDER BY id::text COLLATE \"C\" %s", direction)
+	}
+	switch sortCol {
+	case "external_id", "profile_url", "enterprise_manager_value", "enterprise_manager_ref":
+		return fmt.Sprintf("ORDER BY %s COLLATE \"C\" %s %s, id ASC", sortCol, direction, nullsOrder)
+	case "active", "created_at", "last_modified":
+		return fmt.Sprintf("ORDER BY %s %s %s, id ASC", sortCol, direction, nullsOrder)
+	case userSortEmailsExpression:
+		return fmt.Sprintf("ORDER BY LOWER(%s) %s %s, id ASC", sortCol, direction, nullsOrder)
+	default:
+		return fmt.Sprintf("ORDER BY LOWER(%s) %s %s, %s COLLATE \"C\" %s %s, id ASC",
+			sortCol, direction, nullsOrder, sortCol, direction, nullsOrder)
+	}
+}
+
 func resolveUserSortColumn(sortBy string) string {
 	switch strings.ToLower(sortBy) {
+	case "id":
+		return "id"
 	case "username", "user_name":
 		return "user_name"
-	case "name.familyname":
+	case "name.formatted", "name_formatted":
+		return "name_formatted"
+	case "name.familyname", "name_family_name":
 		return "name_family_name"
-	case "name.givenname":
+	case "name.givenname", "name_given_name":
 		return "name_given_name"
-	case "displayname":
+	case "name.middlename", "name_middle_name":
+		return "name_middle_name"
+	case "name.honorificprefix", "name_honorific_prefix":
+		return "name_honorific_prefix"
+	case "name.honorificsuffix", "name_honorific_suffix":
+		return "name_honorific_suffix"
+	case "displayname", "display_name":
 		return "display_name"
+	case "nickname", "nick_name":
+		return "nick_name"
+	case "profileurl", "profile_url":
+		return "profile_url"
 	case "title":
 		return "title"
-	case "emails.value", "email":
-		return "emails"
-	case "meta.created":
+	case "usertype", "user_type":
+		return "user_type"
+	case "preferredlanguage", "preferred_language":
+		return "preferred_language"
+	case "locale":
+		return "locale"
+	case "timezone":
+		return "timezone"
+	case "emails", "emails.value", "email":
+		return userSortEmailsExpression
+	case "meta.created", "created_at":
 		return "created_at"
-	case "meta.lastmodified":
+	case "meta.lastmodified", "last_modified":
 		return "last_modified"
-	case "externalid":
+	case "externalid", "external_id":
 		return "external_id"
 	case "active":
 		return "active"
+	case "employeenumber", "enterprise_employee_number":
+		return "enterprise_employee_number"
+	case "costcenter", "enterprise_cost_center":
+		return "enterprise_cost_center"
+	case "organization", "enterprise_organization":
+		return "enterprise_organization"
+	case "division", "enterprise_division":
+		return "enterprise_division"
+	case "department", "enterprise_department":
+		return "enterprise_department"
+	case "manager", "manager.value", "enterprise_manager_value":
+		return "enterprise_manager_value"
+	case "manager.displayname", "enterprise_manager_display":
+		return "enterprise_manager_display"
 	default:
 		return "user_name"
 	}
 }
 
+// ReplaceCollectionEmails deduplicates identical (type, value) email pairs before database persist (USR_22 / RFC 7643 §2.4).
+// Delegates to scim.DeduplicateEmails as the single source of truth across PATCH, mapper, and repository layers.
+func ReplaceCollectionEmails(emails []model.ScimUserEmail) []model.ScimUserEmail {
+	return scim.DeduplicateEmails(emails)
+}
+
+func replaceCollectionEmails(emails []model.ScimUserEmail) []model.ScimUserEmail {
+	return ReplaceCollectionEmails(emails)
+}
+
 // Transactional variants
 func (r *UserRepository) FindByIDAndWorkspaceIDTx(ctx context.Context, tx jdbc.Executor, id, workspaceID uuid.UUID) (*model.ScimUser, error) {
+	if tx == nil {
+		return r.FindByIDAndWorkspaceID(ctx, id, workspaceID)
+	}
 	query := `SELECT ` + userColumns + ` FROM scim_users WHERE id = $1 AND workspace_id = $2`
 	row := tx.QueryRowContext(ctx, query, id, workspaceID)
 	u, err := scanUser(row)

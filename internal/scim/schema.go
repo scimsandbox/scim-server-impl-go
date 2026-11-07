@@ -16,20 +16,26 @@ func ServiceProviderConfig() map[string]any {
 			"maxResults": 200,
 		},
 		"pagination": map[string]any{
-			"cursor":                false,
-			"index":                 true,
-			"defaultPaginationMode": "index",
-			"defaultPageSize":       10,
-			"maxPageSize":           200,
+			"cursor":                  true,
+			"index":                   true,
+			"defaultPaginationMethod": "index",
+			"defaultPageSize":         10,
+			"maxPageSize":             200,
+			"cursorTimeout":           3600,
 		},
-		"changePassword": map[string]any{"supported": false},
+		"changePassword": map[string]any{"supported": true},
 		"sort":           map[string]any{"supported": true},
 		"etag":           map[string]any{"supported": true},
+		"securityEvents": map[string]any{
+			"supported":    true,
+			"asyncRequest": "request",
+		},
 		"authenticationSchemes": []map[string]any{{
-			"type":        "oauthbearertoken",
-			"name":        "OAuth Bearer Token",
-			"description": "Authentication scheme using the OAuth Bearer Token Standard",
-			"specUri":     "http://www.rfc-editor.org/info/rfc6750",
+			"type":             "oauthbearertoken",
+			"name":             "OAuth Bearer Token",
+			"description":      "Authentication scheme using the OAuth Bearer Token Standard",
+			"specUri":          "https://www.rfc-editor.org/info/rfc6750",
+			"documentationUri": "https://datatracker.ietf.org/doc/html/rfc6750",
 		}},
 	}
 }
@@ -109,7 +115,7 @@ func userSchema() map[string]any {
 	attrs := []map[string]any{
 		withReturned(withCaseExact(attr("id", "string", true, "readOnly", "server",
 			"A unique identifier for a SCIM resource", false)), "always"),
-		withCaseExact(attr("externalId", "string", false, "readWrite", "server",
+		withCaseExact(attr("externalId", "string", false, "readWrite", "none",
 			"An identifier for the resource as defined by the provisioning client", false)),
 		attr("userName", "string", true, "readWrite", "server",
 			"Unique identifier for the User", false),
@@ -159,11 +165,11 @@ func userSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:User",
-		"name":       "User",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:User",
+		"name":        "User",
 		"description": "User Account",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:User",
@@ -175,7 +181,7 @@ func groupSchema() map[string]any {
 	attrs := []map[string]any{
 		withReturned(withCaseExact(attr("id", "string", true, "readOnly", "server",
 			"Unique identifier", false)), "always"),
-		withCaseExact(attr("externalId", "string", false, "readWrite", "server",
+		withCaseExact(attr("externalId", "string", false, "readWrite", "none",
 			"External identifier", false)),
 		attr("displayName", "string", true, "readWrite", "none",
 			"A human-readable name for the Group", false),
@@ -184,11 +190,11 @@ func groupSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:Group",
-		"name":       "Group",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:Group",
+		"name":        "Group",
 		"description": "Group",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:Group",
@@ -214,11 +220,11 @@ func enterpriseUserSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
-		"name":       "EnterpriseUser",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
+		"name":        "EnterpriseUser",
 		"description": "Enterprise User Extension",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
@@ -243,8 +249,8 @@ func serviceProviderConfigSchema() map[string]any {
 		attr("supported", "boolean", true, "readOnly", "none", "Whether filtering is supported", false),
 		attr("maxResults", "integer", true, "readOnly", "none", "Maximum results", false))
 
-	paginationMode := attr("defaultPaginationMode", "string", false, "readOnly", "none", "Default pagination mode", false)
-	paginationMode["canonicalValues"] = []string{"index"}
+	paginationMode := attr("defaultPaginationMethod", "string", false, "readOnly", "none", "Default pagination method", false)
+	paginationMode["canonicalValues"] = []string{"cursor", "index"}
 	delete(paginationMode, "uniqueness")
 
 	pagination := withSubAttributes(attr("pagination", "complex", false, "readOnly", "none", "Pagination configuration", false),
@@ -252,7 +258,8 @@ func serviceProviderConfigSchema() map[string]any {
 		attr("index", "boolean", true, "readOnly", "none", "Index pagination supported", false),
 		paginationMode,
 		attr("defaultPageSize", "integer", false, "readOnly", "none", "Default page size", false),
-		attr("maxPageSize", "integer", false, "readOnly", "none", "Max page size", false))
+		attr("maxPageSize", "integer", false, "readOnly", "none", "Max page size", false),
+		attr("cursorTimeout", "integer", false, "readOnly", "none", "Cursor timeout in seconds", false))
 
 	changePassword := withSubAttributes(attr("changePassword", "complex", true, "readOnly", "none",
 		"Change password configuration", false),
@@ -263,6 +270,15 @@ func serviceProviderConfigSchema() map[string]any {
 
 	etag := withSubAttributes(attr("etag", "complex", true, "readOnly", "none", "ETag configuration", false),
 		attr("supported", "boolean", true, "readOnly", "none", "Whether ETags are supported", false))
+
+	asyncRequest := attr("asyncRequest", "string", false, "readOnly", "none", "Async request mode", false)
+	asyncRequest["canonicalValues"] = []string{"request", "long", "none"}
+	delete(asyncRequest, "uniqueness")
+
+	securityEvents := withSubAttributes(attr("securityEvents", "complex", false, "readOnly", "none",
+		"Security events configuration", false),
+		attr("supported", "boolean", true, "readOnly", "none", "Whether security events are supported", false),
+		asyncRequest)
 
 	schemeType := attr("type", "string", true, "readOnly", "none", "Scheme type", false)
 	schemeType["canonicalValues"] = []string{"httpbasic", "httpdigest", "oauth", "oauth2", "oauthbearertoken"}
@@ -279,14 +295,14 @@ func serviceProviderConfigSchema() map[string]any {
 		specURI,
 		authDocURI)
 
-	attrs := []map[string]any{docURI, patch, bulk, filter, pagination, changePassword, sort, etag, authSchemes}
+	attrs := []map[string]any{docURI, patch, bulk, filter, pagination, changePassword, sort, etag, securityEvents, authSchemes}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig",
-		"name":       "ServiceProviderConfig",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig",
+		"name":        "ServiceProviderConfig",
 		"description": "Schema for representing the service provider's configuration",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig",
@@ -318,11 +334,11 @@ func resourceTypeSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         "urn:ietf:params:scim:schemas:core:2.0:ResourceType",
-		"name":       "ResourceType",
+		"schemas":     []string{coreSchemaURN},
+		"id":          "urn:ietf:params:scim:schemas:core:2.0:ResourceType",
+		"name":        "ResourceType",
 		"description": "Schema for representing resource types",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:ResourceType",
@@ -385,11 +401,11 @@ func schemaSchema() map[string]any {
 	}
 
 	return map[string]any{
-		"schemas":    []string{coreSchemaURN},
-		"id":         coreSchemaURN,
-		"name":       "Schema",
+		"schemas":     []string{coreSchemaURN},
+		"id":          coreSchemaURN,
+		"name":        "Schema",
 		"description": "Schema for representing schemas",
-		"attributes": attrs,
+		"attributes":  attrs,
 		"meta": map[string]any{
 			"resourceType": "Schema",
 			"location":     "/Schemas/urn:ietf:params:scim:schemas:core:2.0:Schema",

@@ -21,6 +21,7 @@ import (
 	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
 	"github.com/scimsandbox/scim-server-impl-go/internal/repository"
+	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 	"github.com/scimsandbox/scim-server-impl-go/internal/testsupport"
 )
 
@@ -42,7 +43,10 @@ func setupTestEnv(t *testing.T) *testEnv {
 			"POSTGRES_PASSWORD": "postgres",
 			"POSTGRES_DB":       "scim_test",
 		},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
+		WaitingFor: wait.ForAll(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			wait.ForListeningPort("5432/tcp"),
+		).WithDeadline(60 * time.Second),
 	}
 
 	pgc, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -78,40 +82,114 @@ func setupTestEnv(t *testing.T) *testEnv {
 	workspaceRepo := repository.NewWorkspaceRepository()
 	tokenRepo := repository.NewTokenRepository()
 	requestLogRepo := repository.NewRequestLogRepository()
+	asyncEventRepo := repository.NewAsyncEventRepository()
 
-	userHandler := NewUserHandler(userRepo, membershipRepo, workspaceRepo)
-	groupHandler := NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo)
+	userHandler := NewUserHandler(userRepo, membershipRepo, workspaceRepo, asyncEventRepo)
+	groupHandler := NewGroupHandler(groupRepo, membershipRepo, userRepo, workspaceRepo, asyncEventRepo)
 	bulkHandler := NewBulkHandler(userHandler, groupHandler)
-	discoveryHandler := NewDiscoveryHandler()
+	discoveryHandler := NewDiscoveryHandler(userHandler, groupHandler)
+	asyncEventHandler := NewAsyncEventHandler(asyncEventRepo)
 
 	r := chi.NewRouter()
 
 	registerScimEndpoints := func(r chi.Router) {
 		r.Post("/Users", userHandler.CreateUser)
 		r.Get("/Users", userHandler.ListUsers)
+		r.Put("/Users", MethodNotAllowedWithAllow("GET, POST"))
+		r.Patch("/Users", MethodNotAllowedWithAllow("GET, POST"))
+		r.Delete("/Users", MethodNotAllowedWithAllow("GET, POST"))
+
 		r.Get("/Users/{id}", userHandler.GetUser)
 		r.Put("/Users/{id}", userHandler.ReplaceUser)
 		r.Patch("/Users/{id}", userHandler.PatchUser)
 		r.Delete("/Users/{id}", userHandler.DeleteUser)
+		r.Post("/Users/{id}", MethodNotAllowedWithAllow("GET, PUT, PATCH, DELETE"))
+
 		r.Post("/Users/.search", userHandler.SearchUsers)
+		r.Get("/Users/.search", MethodNotAllowedWithAllow("POST"))
+		r.Put("/Users/.search", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/Users/.search", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/Users/.search", MethodNotAllowedWithAllow("POST"))
 
 		r.Post("/Groups", groupHandler.CreateGroup)
 		r.Get("/Groups", groupHandler.ListGroups)
+		r.Put("/Groups", MethodNotAllowedWithAllow("GET, POST"))
+		r.Patch("/Groups", MethodNotAllowedWithAllow("GET, POST"))
+		r.Delete("/Groups", MethodNotAllowedWithAllow("GET, POST"))
+
 		r.Get("/Groups/{id}", groupHandler.GetGroup)
 		r.Put("/Groups/{id}", groupHandler.ReplaceGroup)
 		r.Patch("/Groups/{id}", groupHandler.PatchGroup)
 		r.Delete("/Groups/{id}", groupHandler.DeleteGroup)
+		r.Post("/Groups/{id}", MethodNotAllowedWithAllow("GET, PUT, PATCH, DELETE"))
+
 		r.Post("/Groups/.search", groupHandler.SearchGroups)
+		r.Get("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+		r.Put("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/Groups/.search", MethodNotAllowedWithAllow("POST"))
+
+		r.Get("/", discoveryHandler.RootSearch)
+		r.Post("/", MethodNotAllowedWithAllow("GET"))
+		r.Put("/", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/", MethodNotAllowedWithAllow("GET"))
 
 		r.Post("/Bulk", bulkHandler.ProcessBulk)
-		r.Post("/.search", discoveryHandler.GlobalSearchNotImplemented)
+		r.Get("/Bulk", MethodNotAllowedWithAllow("POST"))
+		r.Put("/Bulk", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/Bulk", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/Bulk", MethodNotAllowedWithAllow("POST"))
+
+		r.Post("/.search", discoveryHandler.RootSearch)
+		r.Get("/.search", MethodNotAllowedWithAllow("POST"))
+		r.Put("/.search", MethodNotAllowedWithAllow("POST"))
+		r.Patch("/.search", MethodNotAllowedWithAllow("POST"))
+		r.Delete("/.search", MethodNotAllowedWithAllow("POST"))
+
+		r.Get("/Events/{txnId}", asyncEventHandler.GetEvent)
+		r.Post("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
+		r.Put("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/Events/{txnId}", MethodNotAllowedWithAllow("GET"))
 
 		r.Get("/ServiceProviderConfig", discoveryHandler.GetServiceProviderConfig)
+		r.Post("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+		r.Put("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/ServiceProviderConfig", MethodNotAllowedWithAllow("GET"))
+
 		r.Get("/Schemas", discoveryHandler.GetSchemas)
+		r.Post("/Schemas", MethodNotAllowedWithAllow("GET"))
+		r.Put("/Schemas", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/Schemas", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/Schemas", MethodNotAllowedWithAllow("GET"))
+
 		r.Get("/Schemas/{id}", discoveryHandler.GetSchemaByID)
+		r.Post("/Schemas/{id}", MethodNotAllowedWithAllow("GET"))
+		r.Put("/Schemas/{id}", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/Schemas/{id}", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/Schemas/{id}", MethodNotAllowedWithAllow("GET"))
+
 		r.Get("/ResourceTypes", discoveryHandler.GetResourceTypes)
+		r.Post("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+		r.Put("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/ResourceTypes", MethodNotAllowedWithAllow("GET"))
+
 		r.Get("/ResourceTypes/{id}", discoveryHandler.GetResourceTypeByID)
+		r.Post("/ResourceTypes/{id}", MethodNotAllowedWithAllow("GET"))
+		r.Put("/ResourceTypes/{id}", MethodNotAllowedWithAllow("GET"))
+		r.Patch("/ResourceTypes/{id}", MethodNotAllowedWithAllow("GET"))
+		r.Delete("/ResourceTypes/{id}", MethodNotAllowedWithAllow("GET"))
+
+		r.MethodNotAllowed(MethodNotAllowed)
 	}
+
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Requested SCIM endpoint or protocol version not found"))
+	})
+	r.MethodNotAllowed(MethodNotAllowed)
 
 	r.Route("/ws/{workspaceId}/scim/v2", func(r chi.Router) {
 		r.Use(middleware.ExtractWorkspaceID)

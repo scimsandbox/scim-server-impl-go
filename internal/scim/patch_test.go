@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 )
 
@@ -79,7 +81,7 @@ func TestApplyPatchOperations_AddSingleAttributes(t *testing.T) {
 		{"op": "add", "path": "locale", "value": "en-US"},
 		{"op": "add", "path": "timezone", "value": "UTC"},
 		{"op": "add", "path": "active", "value": true},
-		{"op": "add", "path": "password", "value": "secret"},
+		{"op": "add", "path": "password", "value": "newsecret123"},
 	}
 	if err := ApplyPatchOperations(u, ops); err != nil {
 		t.Fatalf("apply failed: %v", err)
@@ -96,7 +98,12 @@ func TestApplyPatchOperations_AddSingleAttributes(t *testing.T) {
 	if !u.Active {
 		t.Fatalf("active expected true")
 	}
-	assertStringPtrEquals(t, "password", u.Password, "secret")
+	if u.Password == nil {
+		t.Fatalf("expected password to be set")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*u.Password), []byte("newsecret123")); err != nil {
+		t.Fatalf("bcrypt comparison failed: %v", err)
+	}
 }
 
 func TestApplyPatchOperations_AddSubAttributes(t *testing.T) {
@@ -161,7 +168,10 @@ func TestApplyPatchOperations_AddEnterpriseAttributes(t *testing.T) {
 	}
 	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, "alice")
 	assertStringPtrEquals(t, "managerRef", u.EnterpriseManagerRef, "http://example.com/Users/alice")
-	assertStringPtrEquals(t, "managerDisplay", u.EnterpriseManagerDisplay, "Alice")
+	// RFC 7643 §4.3: manager.displayName is readOnly and must not be populated from client input
+	if u.EnterpriseManagerDisplay != nil {
+		t.Fatalf("expected EnterpriseManagerDisplay to remain nil on client input (readOnly), got %q", *u.EnterpriseManagerDisplay)
+	}
 
 	// Unknown enterprise attribute
 	opsErr := []map[string]any{{"op": "add", "path": prefix + "unknown", "value": "Val"}}
@@ -775,3 +785,373 @@ func assertStringPtrEquals(t *testing.T, name string, ptr *string, want string) 
 		t.Fatalf("%s = %q, want %q", name, *ptr, want)
 	}
 }
+
+func TestApplyPatchOperations_AddMissingValue_PAT24(t *testing.T) {
+	tests := []struct {
+		name string
+		op   map[string]any
+	}{
+		{
+			name: "missing value key with path",
+			op: map[string]any{
+				"op":   "add",
+				"path": "title",
+			},
+		},
+		{
+			name: "explicit nil value with path",
+			op: map[string]any{
+				"op":    "add",
+				"path":  "title",
+				"value": nil,
+			},
+		},
+		{
+			name: "missing value key without path",
+			op: map[string]any{
+				"op": "add",
+			},
+		},
+		{
+			name: "explicit nil value without path",
+			op: map[string]any{
+				"op":    "add",
+				"value": nil,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			u := newTestUser()
+			err := ApplyPatchOperations(u, []map[string]any{tc.op})
+			if err == nil {
+				t.Fatalf("expected error for PATCH add missing value member (RFC 7644 §3.5.2.1)")
+			}
+			scimErr, ok := err.(*ScimError)
+			if !ok {
+				t.Fatalf("expected *ScimError, got %T: %v", err, err)
+			}
+			if scimErr.Status != 400 {
+				t.Errorf("status = %d, want 400", scimErr.Status)
+			}
+			if scimErr.ScimType != "invalidValue" {
+				t.Errorf("scimType = %q, want invalidValue", scimErr.ScimType)
+			}
+		})
+	}
+}
+
+func TestApplyPatchOperations_PrimaryFlagDemotion_PAT27(t *testing.T) {
+	t.Run("filtered replace .primary sets new primary and demotes existing primary across all collections", func(t *testing.T) {
+		u := newTestUser()
+		u.Emails = []model.ScimUserEmail{
+			{Value: "work@example.com", Type: "work", PrimaryFlag: true},
+			{Value: "home@example.com", Type: "home", PrimaryFlag: false},
+		}
+		u.PhoneNumbers = []model.ScimUserPhoneNumber{
+			{Value: "111", Type: "work", PrimaryFlag: true},
+			{Value: "222", Type: "home", PrimaryFlag: false},
+		}
+		u.Addresses = []model.ScimUserAddress{
+			{StreetAddress: "1 Work Way", Type: "work", PrimaryFlag: true},
+			{StreetAddress: "2 Home Ln", Type: "home", PrimaryFlag: false},
+		}
+		u.Ims = []model.ScimUserIm{
+			{Value: "im1", Type: "aim", PrimaryFlag: true},
+			{Value: "im2", Type: "xmpp", PrimaryFlag: false},
+		}
+		u.Photos = []model.ScimUserPhoto{
+			{Value: "https://example.com/1.png", Type: "photo", PrimaryFlag: true},
+			{Value: "https://example.com/2.png", Type: "thumbnail", PrimaryFlag: false},
+		}
+		u.Entitlements = []model.ScimUserEntitlement{
+			{Value: "ent1", Type: "t1", PrimaryFlag: true},
+			{Value: "ent2", Type: "t2", PrimaryFlag: false},
+		}
+		u.Roles = []model.ScimUserRole{
+			{Value: "role1", Type: "t1", PrimaryFlag: true},
+			{Value: "role2", Type: "t2", PrimaryFlag: false},
+		}
+		u.X509Certificates = []model.ScimUserX509Certificate{
+			{Value: "Y2VydDE=", Type: "t1", PrimaryFlag: true},
+			{Value: "Y2VydDI=", Type: "t2", PrimaryFlag: false},
+		}
+
+		ops := []map[string]any{
+			{"op": "replace", "path": `emails[type eq "home"].primary`, "value": true},
+			{"op": "replace", "path": `phoneNumbers[type eq "home"].primary`, "value": true},
+			{"op": "replace", "path": `addresses[type eq "home"].primary`, "value": true},
+			{"op": "replace", "path": `ims[type eq "xmpp"].primary`, "value": true},
+			{"op": "replace", "path": `photos[type eq "thumbnail"].primary`, "value": true},
+			{"op": "replace", "path": `entitlements[value eq "ent2"].primary`, "value": true},
+			{"op": "replace", "path": `roles[value eq "role2"].primary`, "value": true},
+			{"op": "replace", "path": `x509Certificates[value eq "Y2VydDI="].primary`, "value": true},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+
+		if u.Emails[0].PrimaryFlag || !u.Emails[1].PrimaryFlag {
+			t.Errorf("emails primary flags = [%v, %v], want [false, true]", u.Emails[0].PrimaryFlag, u.Emails[1].PrimaryFlag)
+		}
+		if u.PhoneNumbers[0].PrimaryFlag || !u.PhoneNumbers[1].PrimaryFlag {
+			t.Errorf("phoneNumbers primary flags = [%v, %v], want [false, true]", u.PhoneNumbers[0].PrimaryFlag, u.PhoneNumbers[1].PrimaryFlag)
+		}
+		if u.Addresses[0].PrimaryFlag || !u.Addresses[1].PrimaryFlag {
+			t.Errorf("addresses primary flags = [%v, %v], want [false, true]", u.Addresses[0].PrimaryFlag, u.Addresses[1].PrimaryFlag)
+		}
+		if u.Ims[0].PrimaryFlag || !u.Ims[1].PrimaryFlag {
+			t.Errorf("ims primary flags = [%v, %v], want [false, true]", u.Ims[0].PrimaryFlag, u.Ims[1].PrimaryFlag)
+		}
+		if u.Photos[0].PrimaryFlag || !u.Photos[1].PrimaryFlag {
+			t.Errorf("photos primary flags = [%v, %v], want [false, true]", u.Photos[0].PrimaryFlag, u.Photos[1].PrimaryFlag)
+		}
+		if u.Entitlements[0].PrimaryFlag || !u.Entitlements[1].PrimaryFlag {
+			t.Errorf("entitlements primary flags = [%v, %v], want [false, true]", u.Entitlements[0].PrimaryFlag, u.Entitlements[1].PrimaryFlag)
+		}
+		if u.Roles[0].PrimaryFlag || !u.Roles[1].PrimaryFlag {
+			t.Errorf("roles primary flags = [%v, %v], want [false, true]", u.Roles[0].PrimaryFlag, u.Roles[1].PrimaryFlag)
+		}
+		if u.X509Certificates[0].PrimaryFlag || !u.X509Certificates[1].PrimaryFlag {
+			t.Errorf("x509Certificates primary flags = [%v, %v], want [false, true]", u.X509Certificates[0].PrimaryFlag, u.X509Certificates[1].PrimaryFlag)
+		}
+	})
+
+	t.Run("filtered replace without subAttr object containing primary:true demotes existing primary", func(t *testing.T) {
+		u := newTestUser()
+		u.Emails = []model.ScimUserEmail{
+			{Value: "work@example.com", Type: "work", PrimaryFlag: true},
+			{Value: "home@example.com", Type: "home", PrimaryFlag: false},
+		}
+
+		ops := []map[string]any{
+			{
+				"op":   "replace",
+				"path": `emails[type eq "home"]`,
+				"value": map[string]any{
+					"value":   "home-updated@example.com",
+					"primary": true,
+				},
+			},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+		if u.Emails[0].PrimaryFlag {
+			t.Errorf("expected work email primaryFlag=false, got true")
+		}
+		if !u.Emails[1].PrimaryFlag || u.Emails[1].Value != "home-updated@example.com" {
+			t.Errorf("expected home email updated with primaryFlag=true, got %+v", u.Emails[1])
+		}
+	})
+
+	t.Run("PATCH add new primary email demotes previously primary email", func(t *testing.T) {
+		u := newTestUser()
+		u.Emails = []model.ScimUserEmail{
+			{Value: "work@example.com", Type: "work", PrimaryFlag: true},
+		}
+
+		ops := []map[string]any{
+			{
+				"op":   "add",
+				"path": "emails",
+				"value": []any{
+					map[string]any{"value": "other@example.com", "type": "other", "primary": true},
+				},
+			},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+		if len(u.Emails) != 2 {
+			t.Fatalf("expected 2 emails, got %d", len(u.Emails))
+		}
+		if u.Emails[0].PrimaryFlag {
+			t.Errorf("expected existing email primaryFlag to be demoted to false, got true")
+		}
+		if !u.Emails[1].PrimaryFlag {
+			t.Errorf("expected newly added email primaryFlag=true, got false")
+		}
+	})
+
+	t.Run("PATCH add without path adding primary phoneNumber demotes existing primary", func(t *testing.T) {
+		u := newTestUser()
+		u.PhoneNumbers = []model.ScimUserPhoneNumber{
+			{Value: "111-2222", Type: "work", PrimaryFlag: true},
+		}
+
+		ops := []map[string]any{
+			{
+				"op": "add",
+				"value": map[string]any{
+					"phoneNumbers": []any{
+						map[string]any{"value": "333-4444", "type": "mobile", "primary": true},
+					},
+				},
+			},
+		}
+		if err := ApplyPatchOperations(u, ops); err != nil {
+			t.Fatalf("ApplyPatchOperations failed: %v", err)
+		}
+		if len(u.PhoneNumbers) != 2 {
+			t.Fatalf("expected 2 phoneNumbers, got %d", len(u.PhoneNumbers))
+		}
+		if u.PhoneNumbers[0].PrimaryFlag || !u.PhoneNumbers[1].PrimaryFlag {
+			t.Errorf("phoneNumbers primary flags = [%v, %v], want [false, true]", u.PhoneNumbers[0].PrimaryFlag, u.PhoneNumbers[1].PrimaryFlag)
+		}
+	})
+}
+
+func TestStrictTypeMutabilityAndNoOpPatch(t *testing.T) {
+	t.Run("PATCH replace active with non-boolean returns 400 invalidValue", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "replace", "path": "active", "value": "not-a-boolean"},
+		})
+		if err == nil {
+			t.Fatal("expected error for non-boolean active")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+			t.Fatalf("got %v, want 400 invalidValue", err)
+		}
+	})
+
+	t.Run("PATCH add with two primary=true emails returns 400 invalidValue", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{
+				"op":   "add",
+				"path": "emails",
+				"value": []any{
+					map[string]any{"value": "one@example.com", "primary": true},
+					map[string]any{"value": "two@example.com", "primary": true},
+				},
+			},
+		})
+		if err == nil {
+			t.Fatal("expected error for multiple primary=true emails")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+			t.Fatalf("got %v, want 400 invalidValue", err)
+		}
+	})
+
+	t.Run("PATCH remove on required userName returns 400 mutability", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "remove", "path": "userName"},
+		})
+		if err == nil {
+			t.Fatal("expected error when removing required userName")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "mutability" {
+			t.Fatalf("got %v, want 400 mutability", err)
+		}
+	})
+
+	t.Run("PATCH replace on readOnly manager.displayName returns 400 mutability", func(t *testing.T) {
+		u := newTestUser()
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "replace", "path": EnterpriseSchemaURN + ":manager.displayName", "value": "Spoofed"},
+		})
+		if err == nil {
+			t.Fatal("expected error when modifying readOnly manager.displayName")
+		}
+		se, ok := err.(*ScimError)
+		if !ok || se.Status != 400 || se.ScimType != "mutability" {
+			t.Fatalf("got %v, want 400 mutability", err)
+		}
+	})
+
+	t.Run("ScimUserMutableEqual detects no-op PATCH and duplicate multi-valued add", func(t *testing.T) {
+		u := newTestUser()
+		dn := "Existing Display"
+		u.DisplayName = &dn
+		u.PhoneNumbers = []model.ScimUserPhoneNumber{{Value: "+155733333333", Type: "work"}}
+
+		before := CloneScimUser(u)
+		err := ApplyPatchOperations(u, []map[string]any{
+			{"op": "replace", "path": "displayName", "value": "Existing Display"},
+			{"op": "add", "path": "phoneNumbers", "value": []any{map[string]any{"value": "+155733333333", "type": "work"}}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ScimUserMutableEqual(before, u) {
+			t.Fatal("expected ScimUserMutableEqual to be true for no-op PATCH")
+		}
+		if len(u.PhoneNumbers) != 1 {
+			t.Fatalf("expected duplicate phoneNumber not to be appended, got %d items", len(u.PhoneNumbers))
+		}
+	})
+}
+
+func TestEnterpriseManagerVersionAgnosticRefAndConflict_RFC7643_2_4(t *testing.T) {
+	mgrA := "11111111-1111-1111-1111-111111111111"
+	mgrB := "22222222-2222-2222-2222-222222222222"
+
+	// 1. ApplyFromScimInput: $ref-only manager (v1 URI) extracts manager.value
+	u := newTestUser()
+	if err := ApplyFromScimInput(u, map[string]any{
+		"userName": "emp1@example.com",
+		EnterpriseSchemaURN: map[string]any{
+			"manager": map[string]any{
+				"$ref": "https://legacy.idp.example/scim/v1/Users/" + mgrA,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyFromScimInput $ref-only manager failed: %v", err)
+	}
+	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, mgrA)
+
+	// 2. ApplyFromScimInput: conflicting value vs $ref UUID -> 400 invalidValue
+	if err := ApplyFromScimInput(newTestUser(), map[string]any{
+		"userName": "emp2@example.com",
+		EnterpriseSchemaURN: map[string]any{
+			"manager": map[string]any{
+				"value": mgrA,
+				"$ref":  "/Users/" + mgrB,
+			},
+		},
+	}); err == nil {
+		t.Fatal("expected 400 invalidValue for conflicting manager.value and manager.$ref")
+	} else if se, ok := err.(*ScimError); !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+		t.Fatalf("got %v, want 400 invalidValue", err)
+	}
+
+	// 3. ApplyPatchOperations: manager.$ref path with omitted-version URI updates EnterpriseManagerValue
+	if err := ApplyPatchOperations(u, []map[string]any{
+		{"op": "replace", "path": EnterpriseSchemaURN + ":manager.$ref", "value": "/Users/" + mgrB},
+	}); err != nil {
+		t.Fatalf("PATCH manager.$ref failed: %v", err)
+	}
+	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, mgrB)
+
+	// 4. ApplyPatchOperations: manager object with $ref-only v1 URI updates EnterpriseManagerValue
+	if err := ApplyPatchOperations(u, []map[string]any{
+		{"op": "replace", "path": EnterpriseSchemaURN + ":manager", "value": map[string]any{
+			"$ref": "https://legacy.idp.example/scim/v1/Users/" + mgrA,
+		}},
+	}); err != nil {
+		t.Fatalf("PATCH manager $ref-only object failed: %v", err)
+	}
+	assertStringPtrEquals(t, "managerValue", u.EnterpriseManagerValue, mgrA)
+
+	// 5. ApplyPatchOperations: conflicting value vs $ref UUID -> 400 invalidValue
+	if err := ApplyPatchOperations(u, []map[string]any{
+		{"op": "replace", "path": EnterpriseSchemaURN + ":manager", "value": map[string]any{
+			"value": mgrA,
+			"$ref":  "https://legacy.idp.example/scim/v1/Users/" + mgrB,
+		}},
+	}); err == nil {
+		t.Fatal("expected 400 invalidValue on PATCH manager with conflicting value and $ref")
+	} else if se, ok := err.(*ScimError); !ok || se.Status != 400 || se.ScimType != "invalidValue" {
+		t.Fatalf("got %v, want 400 invalidValue", err)
+	}
+}
+
+

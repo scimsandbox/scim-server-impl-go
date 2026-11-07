@@ -19,14 +19,22 @@ func TestResolveUserSortColumn(t *testing.T) {
 		{"user_name", "user_name"},
 		{"USERNAME", "user_name"},
 		{"name.familyname", "name_family_name"},
+		{"name_family_name", "name_family_name"},
+		{"NAME_FAMILY_NAME", "name_family_name"},
 		{"name.givenname", "name_given_name"},
+		{"name_given_name", "name_given_name"},
 		{"displayname", "display_name"},
+		{"display_name", "display_name"},
 		{"title", "title"},
-		{"emails.value", "emails"},
-		{"email", "emails"},
+		{"emails", userSortEmailsExpression},
+		{"emails.value", userSortEmailsExpression},
+		{"email", userSortEmailsExpression},
 		{"meta.created", "created_at"},
+		{"created_at", "created_at"},
 		{"meta.lastmodified", "last_modified"},
+		{"last_modified", "last_modified"},
 		{"externalid", "external_id"},
+		{"external_id", "external_id"},
 		{"active", "active"},
 		{"", "user_name"},
 		{"unknown_attr", "user_name"},
@@ -38,6 +46,86 @@ func TestResolveUserSortColumn(t *testing.T) {
 			got := resolveUserSortColumn(tc.input)
 			if got != tc.want {
 				t.Fatalf("resolveUserSortColumn(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUserSortEmailsExpressionConstant(t *testing.T) {
+	t.Parallel()
+
+	const expected = `COALESCE((SELECT elem->>'value' FROM jsonb_array_elements(emails::jsonb) elem WHERE (COALESCE(elem->>'primaryFlag', elem->>'primary'))::boolean IS TRUE LIMIT 1), emails::jsonb->0->>'value')`
+	if userSortEmailsExpression != expected {
+		t.Fatalf("userSortEmailsExpression = %q, want %q", userSortEmailsExpression, expected)
+	}
+}
+
+// --- buildOrderClause ---
+// Updated per RFC 7644 §3.4.2.3: string attributes with caseExact:false sort via LOWER(col)
+// with deterministic COLLATE "C" and id tie-breakers, while caseExact:true attributes use COLLATE "C".
+
+func TestBuildOrderClause(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		col  string
+		dir  string
+		want string
+	}{
+		{"default_ascending", "user_name", "", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"explicit_asc", "user_name", "ASC", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"lowercase_asc", "user_name", "asc", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"full_ascending", "user_name", "ascending", `ORDER BY LOWER(user_name) ASC NULLS LAST, user_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"explicit_desc", "user_name", "DESC", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"lowercase_desc", "user_name", "desc", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"full_descending", "user_name", "descending", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"mixed_case_descending", "user_name", "Descending", `ORDER BY LOWER(user_name) DESC NULLS FIRST, user_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"group_display_name_asc", "display_name", "ascending", `ORDER BY LOWER(display_name) ASC NULLS LAST, display_name COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"group_display_name_desc", "display_name", "descending", `ORDER BY LOWER(display_name) DESC NULLS FIRST, display_name COLLATE "C" DESC NULLS FIRST, id ASC`},
+		{"emails_expression_asc", userSortEmailsExpression, "ascending", "ORDER BY LOWER(" + userSortEmailsExpression + ") ASC NULLS LAST, id ASC"},
+		{"emails_expression_desc", userSortEmailsExpression, "descending", "ORDER BY LOWER(" + userSortEmailsExpression + ") DESC NULLS FIRST, id ASC"},
+		{"case_exact_external_id_asc", "external_id", "ascending", `ORDER BY external_id COLLATE "C" ASC NULLS LAST, id ASC`},
+		{"case_exact_id_desc", "id", "descending", `ORDER BY id::text COLLATE "C" DESC`},
+		{"non_string_created_at_asc", "created_at", "ascending", `ORDER BY created_at ASC NULLS LAST, id ASC`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := buildOrderClause(tc.col, tc.dir)
+			if got != tc.want {
+				t.Fatalf("buildOrderClause(%q, %q) = %q, want %q", tc.col, tc.dir, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- resolveGroupSortColumn ---
+
+func TestResolveGroupSortColumn(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"displayname", "display_name"},
+		{"display_name", "display_name"},
+		{"DISPLAYNAME", "display_name"},
+		{"meta.created", "created_at"},
+		{"meta.lastmodified", "last_modified"},
+		{"externalid", "external_id"},
+		{"", "display_name"},
+		{"unknown_attr", "display_name"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			t.Parallel()
+			got := resolveGroupSortColumn(tc.input)
+			if got != tc.want {
+				t.Fatalf("resolveGroupSortColumn(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
 	}
@@ -175,3 +263,83 @@ func TestMarshalUnmarshalRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip[1].Value = %q, want viewer", got[1].Value)
 	}
 }
+
+func TestReplaceCollectionEmails_Deduplication_USR22(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil or empty slice returns as-is", func(t *testing.T) {
+		if replaceCollectionEmails(nil) != nil {
+			t.Fatal("expected nil for nil input")
+		}
+		empty := []model.ScimUserEmail{}
+		res := replaceCollectionEmails(empty)
+		if len(res) != 0 {
+			t.Fatalf("expected empty slice, got len %d", len(res))
+		}
+	})
+
+	t.Run("single item returned as-is", func(t *testing.T) {
+		single := []model.ScimUserEmail{
+			{Value: "a@example.com", Type: "work"},
+		}
+		res := replaceCollectionEmails(single)
+		if len(res) != 1 || res[0].Value != "a@example.com" {
+			t.Fatalf("unexpected result: %+v", res)
+		}
+	})
+
+	t.Run("duplicate (type, value) entries deduplicated", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "dup@example.com", Type: "work"},
+			{Value: "dup@example.com", Type: "work"},
+			{Value: "other@example.com", Type: "home"},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 2 {
+			t.Fatalf("expected 2 emails after deduplication, got %d: %+v", len(res), res)
+		}
+		if res[0].Value != "dup@example.com" || res[0].Type != "work" {
+			t.Errorf("res[0] = %+v, want dup@example.com", res[0])
+		}
+		if res[1].Value != "other@example.com" || res[1].Type != "home" {
+			t.Errorf("res[1] = %+v, want other@example.com", res[1])
+		}
+	})
+
+	t.Run("case-insensitive duplicate detection and whitespace trimming", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "User@Example.Com ", Type: "WORK"},
+			{Value: " user@example.com", Type: "work"},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 1 {
+			t.Fatalf("expected 1 email after case-insensitive deduplication, got %d: %+v", len(res), res)
+		}
+	})
+
+	t.Run("primaryFlag preserved when duplicate has primaryFlag true", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "dup@example.com", Type: "work", PrimaryFlag: false},
+			{Value: "dup@example.com", Type: "work", PrimaryFlag: true},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 1 {
+			t.Fatalf("expected 1 email after deduplication, got %d", len(res))
+		}
+		if !res[0].PrimaryFlag {
+			t.Errorf("expected primaryFlag to be preserved as true, got false")
+		}
+	})
+
+	t.Run("distinct types with same value are retained", func(t *testing.T) {
+		input := []model.ScimUserEmail{
+			{Value: "common@example.com", Type: "work"},
+			{Value: "common@example.com", Type: "home"},
+		}
+		res := replaceCollectionEmails(input)
+		if len(res) != 2 {
+			t.Fatalf("expected 2 emails with distinct types, got %d", len(res))
+		}
+	})
+}
+

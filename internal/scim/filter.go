@@ -5,7 +5,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode"
 )
 
 // FilterResult holds a SQL WHERE clause fragment and its parameter values.
@@ -51,6 +50,7 @@ const (
 	attrActive                = "active"
 	attrMetaCreated           = "meta.created"
 	attrMetaLastModified      = "meta.lastmodified"
+	attrMetaResourceType      = "meta.resourcetype"
 	attrID                    = "id"
 	attrEmployeeNumber        = "employeenumber"
 	attrCostCenter            = "costcenter"
@@ -115,8 +115,6 @@ const (
 	sqlLowerLikeSeparator      = ") LIKE LOWER("
 	sqlLike                    = " LIKE "
 	sqlTextCast                = "::text"
-	sqlTextLike                = sqlTextCast + sqlLike
-	sqlTextLowerLikeSeparator  = sqlTextCast + sqlLowerLikeSeparator
 	sqlIsNotNull               = " IS NOT NULL"
 	sqlIsNotNullAnd            = sqlIsNotNull + " AND "
 	sqlTextNotEqualsEmptyArray = sqlTextCast + " != '[]'"
@@ -125,36 +123,43 @@ const (
 // ParseUserFilter parses a SCIM filter string and returns a SQL WHERE clause
 // for scim_users. The parameter placeholders start at $startParam.
 func ParseUserFilter(filter string, startParam int) (*FilterResult, error) {
-	if filter == "" {
-		return nil, nil
-	}
-	p := &filterParser{
-		tokens:     tokenize(filter),
-		pos:        0,
-		paramIdx:   startParam,
-		entityType: entityTypeUser,
-	}
-	result, err := p.parseOrExpression()
-	if err != nil {
-		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
-	}
-	return result, nil
+	return parseEntityFilter(filter, startParam, entityTypeUser, false)
+}
+
+// ParseUserFilterForRoot parses a SCIM filter string on the root endpoint for scim_users,
+// treating attributes belonging exclusively to other SCIM resource types as unassigned (FALSE).
+func ParseUserFilterForRoot(filter string, startParam int) (*FilterResult, error) {
+	return parseEntityFilter(filter, startParam, entityTypeUser, true)
 }
 
 // ParseGroupFilter parses a SCIM filter for scim_groups.
 func ParseGroupFilter(filter string, startParam int) (*FilterResult, error) {
+	return parseEntityFilter(filter, startParam, entityTypeGroup, false)
+}
+
+// ParseGroupFilterForRoot parses a SCIM filter string on the root endpoint for scim_groups,
+// treating attributes belonging exclusively to other SCIM resource types as unassigned (FALSE).
+func ParseGroupFilterForRoot(filter string, startParam int) (*FilterResult, error) {
+	return parseEntityFilter(filter, startParam, entityTypeGroup, true)
+}
+
+func parseEntityFilter(filter string, startParam int, entityType string, crossResource bool) (*FilterResult, error) {
 	if filter == "" {
 		return nil, nil
 	}
 	p := &filterParser{
-		tokens:     tokenize(filter),
-		pos:        0,
-		paramIdx:   startParam,
-		entityType: entityTypeGroup,
+		tokens:        tokenize(filter),
+		pos:           0,
+		paramIdx:      startParam,
+		entityType:    entityType,
+		crossResource: crossResource,
 	}
 	result, err := p.parseOrExpression()
 	if err != nil {
 		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
+	}
+	if p.pos < len(p.tokens) {
+		return nil, NewScimError(400, "invalidFilter", fmt.Sprintf("Invalid filter: unexpected token '%s'", p.tokens[p.pos].val))
 	}
 	return result, nil
 }
@@ -163,16 +168,40 @@ func ParseGroupFilter(filter string, startParam int) (*FilterResult, error) {
 func ResolveUserSortAttribute(sortBy string) string {
 	attr := stripURNPrefix(sortBy)
 	switch strings.ToLower(attr) {
+	case attrID:
+		return sqlID
 	case attrUsername:
 		return sqlUserName
+	case attrNameFormatted:
+		return sqlNameFormatted
 	case attrNameFamilyName:
 		return sqlNameFamilyName
 	case attrNameGivenName:
 		return sqlNameGivenName
+	case attrNameMiddleName:
+		return sqlNameMiddleName
+	case attrNameHonorificPrefix:
+		return sqlNameHonorificPrefix
+	case attrNameHonorificSuffix:
+		return sqlNameHonorificSuffix
 	case attrDisplayName:
 		return sqlDisplayName
+	case attrNickname:
+		return sqlNickName
+	case attrProfileURL:
+		return sqlProfileURL
 	case attrTitle:
 		return sqlTitle
+	case attrUserType:
+		return sqlUserType
+	case attrPreferredLanguage:
+		return sqlPreferredLanguage
+	case attrLocale:
+		return sqlLocale
+	case attrTimeZone:
+		return sqlTimeZone
+	case "emails", "emails.value", "email":
+		return "emails"
 	case attrMetaCreated:
 		return sqlCreatedAt
 	case attrMetaLastModified:
@@ -181,6 +210,20 @@ func ResolveUserSortAttribute(sortBy string) string {
 		return sqlExternalID
 	case attrActive:
 		return sqlActive
+	case attrEmployeeNumber:
+		return sqlEnterpriseEmployeeNumber
+	case attrCostCenter:
+		return sqlEnterpriseCostCenter
+	case attrOrganization:
+		return sqlEnterpriseOrganization
+	case attrDivision:
+		return sqlEnterpriseDivision
+	case attrDepartment:
+		return sqlEnterpriseDepartment
+	case "manager", attrManagerValue:
+		return sqlEnterpriseManagerValue
+	case attrManagerDisplayName:
+		return sqlEnterpriseManagerDisplay
 	default:
 		return sqlUserName
 	}
@@ -190,6 +233,8 @@ func ResolveUserSortAttribute(sortBy string) string {
 func ResolveGroupSortAttribute(sortBy string) string {
 	attr := stripURNPrefix(sortBy)
 	switch strings.ToLower(attr) {
+	case attrID:
+		return sqlID
 	case attrDisplayName:
 		return sqlDisplayName
 	case attrMetaCreated:
@@ -222,6 +267,7 @@ type token struct {
 var tokenRegex = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|[()]|[^\s()]+`)
 
 func tokenize(filter string) []token {
+	filter = NormalizeNFC(filter)
 	matches := tokenRegex.FindAllString(filter, -1)
 	tokens := make([]token, 0, len(matches))
 	for _, m := range matches {
@@ -230,7 +276,7 @@ func tokenize(filter string) []token {
 		} else if m == ")" {
 			tokens = append(tokens, token{typ: tokenRParen, val: ")"})
 		} else if len(m) >= 2 && m[0] == '"' && m[len(m)-1] == '"' {
-			tokens = append(tokens, token{typ: tokenString, val: m[1 : len(m)-1]})
+			tokens = append(tokens, token{typ: tokenString, val: NormalizeNFC(m[1 : len(m)-1])})
 		} else {
 			tokens = append(tokens, token{typ: tokenWord, val: m})
 		}
@@ -241,9 +287,9 @@ func tokenize(filter string) []token {
 // ── Case-insensitive attribute set ──────────────────
 
 var caseInsensitiveAttrs = map[string]bool{
+	attrMetaResourceType:       true,
 	attrUsername:               true,
 	attrDisplayName:            true,
-	attrExternalID:             true,
 	attrNameFamilyName:         true,
 	attrNameGivenName:          true,
 	attrNameFormatted:          true,
@@ -293,13 +339,31 @@ const (
 )
 
 func stripURNPrefix(attr string) string {
-	if strings.HasPrefix(attr, coreUserURN) {
+	lower := strings.ToLower(attr)
+	if strings.HasPrefix(lower, strings.ToLower(coreUserURN)) {
 		return attr[len(coreUserURN):]
 	}
-	if strings.HasPrefix(attr, coreGroupURN) {
+	if strings.HasPrefix(lower, strings.ToLower(coreGroupURN)) {
 		return attr[len(coreGroupURN):]
 	}
-	if strings.HasPrefix(attr, enterpriseURN) {
+	if strings.HasPrefix(lower, strings.ToLower(enterpriseURN)) {
+		return attr[len(enterpriseURN):]
+	}
+	return attr
+}
+
+func (p *filterParser) stripEntityURNPrefix(attr string) string {
+	lower := strings.ToLower(attr)
+	if p.entityType == entityTypeGroup {
+		if strings.HasPrefix(lower, strings.ToLower(coreGroupURN)) {
+			return attr[len(coreGroupURN):]
+		}
+		return attr
+	}
+	if strings.HasPrefix(lower, strings.ToLower(coreUserURN)) {
+		return attr[len(coreUserURN):]
+	}
+	if strings.HasPrefix(lower, strings.ToLower(enterpriseURN)) {
 		return attr[len(enterpriseURN):]
 	}
 	return attr
@@ -308,10 +372,11 @@ func stripURNPrefix(attr string) string {
 // ── Parser ──────────────────────────────────────────
 
 type filterParser struct {
-	tokens     []token
-	pos        int
-	paramIdx   int
-	entityType string // "user" or "group"
+	tokens        []token
+	pos           int
+	paramIdx      int
+	entityType    string // "user" or "group"
+	crossResource bool
 }
 
 func (p *filterParser) peek() *token {
@@ -448,8 +513,8 @@ func (p *filterParser) parseAtom() (*FilterResult, error) {
 	if t.typ != tokenWord {
 		return nil, fmt.Errorf("expected attribute name, got: %s", t.val)
 	}
-	attrName := p.next().val
-	attrName = stripURNPrefix(attrName)
+	rawAttrName := p.next().val
+	attrName := p.stripEntityURNPrefix(rawAttrName)
 
 	// Check for "pr" (present) operator
 	opToken := p.peek()
@@ -458,14 +523,7 @@ func (p *filterParser) parseAtom() (*FilterResult, error) {
 	}
 	if opToken.typ == tokenWord && strings.EqualFold(opToken.val, filterOpPr) {
 		p.next() // consume "pr"
-		col, err := p.resolveColumn(attrName)
-		if err != nil {
-			return nil, err
-		}
-		if isJSONColumn(attrName) {
-			return &FilterResult{SQL: col + sqlIsNotNullAnd + col + sqlTextNotEqualsEmptyArray, Args: nil}, nil
-		}
-		return &FilterResult{SQL: col + sqlIsNotNull, Args: nil}, nil
+		return p.buildPresentFilter(rawAttrName, attrName)
 	}
 
 	// Regular operator
@@ -482,7 +540,48 @@ func (p *filterParser) parseAtom() (*FilterResult, error) {
 	}
 	value := valToken.val
 
-	return p.buildComparison(attrName, operator, value)
+	return p.buildComparisonWithRaw(rawAttrName, attrName, operator, value)
+}
+
+func (p *filterParser) buildPresentFilter(rawAttrName, attrName string) (*FilterResult, error) {
+	lower := strings.ToLower(attrName)
+	if lower == "schemas" {
+		return &FilterResult{SQL: "TRUE", Args: nil}, nil
+	}
+	if p.entityType == entityTypeGroup && isGroupMembersAttr(lower) {
+		return buildGroupMembersPresentFilter(lower)
+	}
+	if p.entityType == entityTypeUser {
+		if isUserGroupsAttr(lower) {
+			return buildUserGroupsPresentFilter(lower)
+		}
+		if lower == "name" {
+			return &FilterResult{
+				SQL:  "(name_formatted IS NOT NULL OR name_family_name IS NOT NULL OR name_given_name IS NOT NULL OR name_middle_name IS NOT NULL OR name_honorific_prefix IS NOT NULL OR name_honorific_suffix IS NOT NULL)",
+				Args: nil,
+			}, nil
+		}
+		if lower == "manager" {
+			return &FilterResult{SQL: "enterprise_manager_value IS NOT NULL", Args: nil}, nil
+		}
+		parts := strings.SplitN(attrName, ".", 2)
+		if len(parts) == 2 && isJSONCollection(parts[0]) {
+			col := p.resolveJSONColumn(parts[0])
+			return p.buildJSONAttributeFilter(col, parts[0], parts[1], filterOpPr, "")
+		}
+	}
+
+	col, err := p.resolveColumn(attrName)
+	if err != nil {
+		if p.crossResource && isValidAnyResourceAttr(rawAttrName) {
+			return &FilterResult{SQL: "FALSE", Args: nil}, nil
+		}
+		return nil, err
+	}
+	if isJSONColumn(attrName) {
+		return &FilterResult{SQL: col + sqlIsNotNullAnd + col + sqlTextNotEqualsEmptyArray, Args: nil}, nil
+	}
+	return &FilterResult{SQL: col + sqlIsNotNull, Args: nil}, nil
 }
 
 type innerToken struct {
@@ -500,21 +599,38 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	// Parse something like: emails[type eq "work"].value eq "example@example.com"
 	raw := p.next().val // e.g., "emails[type"
 	bracketIdx := strings.Index(raw, "[")
-	collectionAttr := raw[:bracketIdx]
+	rawCollectionAttr := raw[:bracketIdx]
 	filterStart := raw[bracketIdx+1:]
 
-	if !isJSONCollection(collectionAttr) {
-		if strings.EqualFold(collectionAttr, "members") {
+	if p.entityType == entityTypeGroup && !p.crossResource {
+		if strings.EqualFold(stripURNPrefix(rawCollectionAttr), "members") {
 			return nil, fmt.Errorf("value path filters on 'members' are not supported")
 		}
-		return nil, fmt.Errorf("attribute '%s' is not a multi-valued complex attribute", collectionAttr)
+		return nil, fmt.Errorf("unknown attribute: %s", rawCollectionAttr)
+	}
+
+	collectionAttr := rawCollectionAttr
+	lowerRawCol := strings.ToLower(rawCollectionAttr)
+	if strings.HasPrefix(lowerRawCol, strings.ToLower(coreUserURN)) {
+		collectionAttr = rawCollectionAttr[len(coreUserURN):]
+	}
+
+	if strings.EqualFold(stripURNPrefix(rawCollectionAttr), "members") {
+		return nil, fmt.Errorf("value path filters on 'members' are not supported")
+	}
+
+	if !isJSONCollection(collectionAttr) {
+		if p.entityType == entityTypeGroup {
+			return nil, fmt.Errorf("unknown attribute: %s", rawCollectionAttr)
+		}
+		return nil, fmt.Errorf("attribute '%s' is not a multi-valued complex attribute", rawCollectionAttr)
 	}
 
 	var innerTokens []innerToken
 	var subAttr string
 
 	if closeIdx := strings.Index(filterStart, "]"); closeIdx >= 0 {
-		before := filterStart[:closeIdx]
+		before := strings.TrimSpace(filterStart[:closeIdx])
 		if before != "" {
 			innerTokens = append(innerTokens, innerToken{val: before, isString: false})
 		}
@@ -523,7 +639,7 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 			subAttr = after[1:]
 		}
 	} else {
-		if filterStart != "" {
+		if strings.TrimSpace(filterStart) != "" {
 			innerTokens = append(innerTokens, innerToken{val: filterStart, isString: false})
 		}
 		for {
@@ -534,7 +650,7 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 			p.next()
 			if t.typ != tokenString {
 				if closeIdx := strings.Index(t.val, "]"); closeIdx >= 0 {
-					before := t.val[:closeIdx]
+					before := strings.TrimSpace(t.val[:closeIdx])
 					if before != "" {
 						innerTokens = append(innerTokens, innerToken{val: before, isString: false})
 					}
@@ -549,6 +665,11 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 				innerTokens = append(innerTokens, innerToken{val: t.val, isString: true})
 			}
 		}
+	}
+
+	// Reject empty valuePath filter expressions like emails[] (RFC 7644 §3.4.2.2)
+	if len(innerTokens) == 0 {
+		return nil, fmt.Errorf("empty valuePath filter expression in '%s[]'", collectionAttr)
 	}
 
 	// Check for sub-attribute after "]" if not already extracted (e.g. ".value" as a separate token)
@@ -585,6 +706,9 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 		attr := innerTokens[0].val
 		op := strings.ToLower(innerTokens[1].val)
 		val := innerTokens[2].val
+		if !isValidComparisonOp(op) {
+			return nil, fmt.Errorf("unsupported operator in value path filter: %s", op)
+		}
 		_, isBool, err := resolveSubAttribute(collectionAttr, attr)
 		if err != nil {
 			return nil, err
@@ -620,6 +744,9 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 	opToken := p.peek()
 	if opToken == nil || opToken.typ != tokenWord {
 		// Just a path filter without outer comparison (pr-style)
+		if p.entityType == entityTypeGroup && p.crossResource {
+			return &FilterResult{SQL: "FALSE", Args: nil}, nil
+		}
 		return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, "", "")
 	}
 
@@ -627,6 +754,9 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 
 	// If the next token is a logical keyword, this is a standalone value path filter
 	if operator == filterOpAnd || operator == filterOpOr || operator == filterOpNot {
+		if p.entityType == entityTypeGroup && p.crossResource {
+			return &FilterResult{SQL: "FALSE", Args: nil}, nil
+		}
 		return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, "", "")
 	}
 
@@ -641,7 +771,14 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 
 	if operator == filterOpPr {
 		p.next()
+		if p.entityType == entityTypeGroup && p.crossResource {
+			return &FilterResult{SQL: "FALSE", Args: nil}, nil
+		}
 		return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, filterOpPr, "")
+	}
+
+	if !isValidComparisonOp(operator) {
+		return nil, fmt.Errorf("unsupported operator in value path filter: %s", operator)
 	}
 
 	// Regular comparison
@@ -661,17 +798,44 @@ func (p *filterParser) parseValuePathFilter() (*FilterResult, error) {
 		}
 	}
 
+	if p.entityType == entityTypeGroup && p.crossResource {
+		return &FilterResult{SQL: "FALSE", Args: nil}, nil
+	}
+
 	return p.buildJSONContainsFilter(col, collectionAttr, clause, subAttr, operator, value)
 }
 
 func (p *filterParser) resolveColumn(attr string) (string, error) {
-	// Handle enterprise extension prefix
-	if strings.HasPrefix(attr, enterpriseURNBase+":") {
+	lower := strings.ToLower(attr)
+
+	if p.entityType == entityTypeGroup {
+		switch lower {
+		case attrID:
+			return "id::text", nil
+		case attrDisplayName:
+			return sqlDisplayName, nil
+		case attrExternalID:
+			return sqlExternalID, nil
+		case attrMetaCreated:
+			return sqlCreatedAt, nil
+		case attrMetaLastModified:
+			return sqlLastModified, nil
+		case attrMetaResourceType:
+			return "'Group'::text", nil
+		case "meta.location":
+			return "id::text", nil
+		case "meta.version":
+			return "version::text", nil
+		default:
+			return "", fmt.Errorf("unknown attribute: %s", attr)
+		}
+	}
+
+	// Handle enterprise extension prefix (User only)
+	if strings.HasPrefix(lower, strings.ToLower(enterpriseURNBase)+":") {
 		attr = attr[len(enterpriseURN):]
 		return p.resolveEnterpriseColumn(attr)
 	}
-
-	lower := strings.ToLower(attr)
 
 	// JSON collection attributes → use LIKE-based filtering
 	if isJSONCollection(lower) {
@@ -718,8 +882,14 @@ func (p *filterParser) resolveColumn(attr string) (string, error) {
 		return sqlCreatedAt, nil
 	case attrMetaLastModified:
 		return sqlLastModified, nil
+	case attrMetaResourceType:
+		return "'User'::text", nil
+	case "meta.location":
+		return "id::text", nil
+	case "meta.version":
+		return "version::text", nil
 	case attrID:
-		return sqlID, nil
+		return "id::text", nil
 	// Enterprise extension
 	case attrEmployeeNumber,
 		"urn:ietf:params:scim:schemas:extension:enterprise:2.0:user:employeenumber":
@@ -734,11 +904,10 @@ func (p *filterParser) resolveColumn(attr string) (string, error) {
 		return sqlEnterpriseDepartment, nil
 	case attrManagerValue:
 		return sqlEnterpriseManagerValue, nil
+	case "manager.$ref":
+		return "enterprise_manager_ref", nil
 	case attrManagerDisplayName:
 		return sqlEnterpriseManagerDisplay, nil
-	// Group attributes
-	case attrMembersValue:
-		return sqlMemberValue, nil
 	default:
 		return "", fmt.Errorf("unknown attribute: %s", attr)
 	}
@@ -758,6 +927,8 @@ func (p *filterParser) resolveEnterpriseColumn(attr string) (string, error) {
 		return sqlEnterpriseDepartment, nil
 	case attrManagerValue:
 		return sqlEnterpriseManagerValue, nil
+	case "manager.$ref":
+		return "enterprise_manager_ref", nil
 	case attrManagerDisplayName:
 		return sqlEnterpriseManagerDisplay, nil
 	default:
@@ -802,20 +973,341 @@ func (p *filterParser) resolveJSONColumn(attr string) string {
 	}
 }
 
-func (p *filterParser) buildComparison(attr, operator, value string) (*FilterResult, error) {
-	// Handle JSON sub-attribute paths like emails.value
-	parts := strings.SplitN(attr, ".", 2)
+func isValidComparisonOp(op string) bool {
+	switch op {
+	case filterOpEq, filterOpNe, filterOpCo, filterOpSw, filterOpEw,
+		filterOpGt, filterOpGe, filterOpLt, filterOpLe:
+		return true
+	}
+	return false
+}
+
+func isGroupMembersAttr(lowerAttr string) bool {
+	switch lowerAttr {
+	case "members", "members.value", "members.display", "members.type", "members.$ref":
+		return true
+	}
+	return false
+}
+
+func isUserGroupsAttr(lowerAttr string) bool {
+	switch lowerAttr {
+	case "groups", "groups.value", "groups.display", "groups.type", "groups.$ref":
+		return true
+	}
+	return false
+}
+
+func buildGroupMembersPresentFilter(lowerAttr string) (*FilterResult, error) {
+	switch lowerAttr {
+	case "members", "members.value", "members.$ref":
+		return &FilterResult{
+			SQL:  "EXISTS (SELECT 1 FROM scim_group_memberships m WHERE m.group_id = scim_groups.id AND m.workspace_id = scim_groups.workspace_id)",
+			Args: nil,
+		}, nil
+	case "members.display":
+		return &FilterResult{
+			SQL:  "EXISTS (SELECT 1 FROM scim_group_memberships m WHERE m.group_id = scim_groups.id AND m.workspace_id = scim_groups.workspace_id AND m.display IS NOT NULL)",
+			Args: nil,
+		}, nil
+	case "members.type":
+		return &FilterResult{
+			SQL:  "EXISTS (SELECT 1 FROM scim_group_memberships m WHERE m.group_id = scim_groups.id AND m.workspace_id = scim_groups.workspace_id AND m.member_type IS NOT NULL)",
+			Args: nil,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown attribute: %s", lowerAttr)
+	}
+}
+
+func buildUserGroupsPresentFilter(lowerAttr string) (*FilterResult, error) {
+	return &FilterResult{
+		SQL:  "EXISTS (SELECT 1 FROM scim_group_memberships m WHERE m.member_value = scim_users.id AND m.workspace_id = scim_users.workspace_id)",
+		Args: nil,
+	}, nil
+}
+
+func (p *filterParser) buildGroupMembersFilter(attr, operator, value string) (*FilterResult, error) {
+	if !isValidComparisonOp(operator) {
+		return nil, fmt.Errorf("unsupported operator: %s", operator)
+	}
+	lower := strings.ToLower(attr)
+	if lower == "members" {
+		// Treat bare `members eq "<uuid>"` as matching member_value
+		lower = "members.value"
+	}
+	var expr string
+	switch lower {
+	case "members.value", "members.$ref":
+		if lower == "members.$ref" && (operator == filterOpEq || operator == filterOpNe) {
+			if extracted := ExtractUUIDFromRef(value); extracted != "" {
+				value = extracted
+			}
+		}
+		expr = "m.member_value::text"
+	case "members.display":
+		expr = "m.display"
+	case "members.type":
+		expr = "m.member_type"
+	default:
+		return nil, fmt.Errorf("unknown attribute: %s", attr)
+	}
+	cond, arg, err := p.buildTextExprCondition(expr, operator, value, true)
+	if err != nil {
+		return nil, err
+	}
+	sql := fmt.Sprintf("EXISTS (SELECT 1 FROM scim_group_memberships m WHERE m.group_id = scim_groups.id AND m.workspace_id = scim_groups.workspace_id AND %s)", cond)
+	return &FilterResult{SQL: sql, Args: []any{arg}}, nil
+}
+
+func (p *filterParser) buildUserGroupsFilter(attr, operator, value string) (*FilterResult, error) {
+	if !isValidComparisonOp(operator) {
+		return nil, fmt.Errorf("unsupported operator: %s", operator)
+	}
+	lower := strings.ToLower(attr)
+	if lower == "groups" {
+		lower = "groups.value"
+	}
+	switch lower {
+	case "groups.value", "groups.$ref":
+		if lower == "groups.$ref" && (operator == filterOpEq || operator == filterOpNe) {
+			if extracted := ExtractUUIDFromRef(value); extracted != "" {
+				value = extracted
+			}
+		}
+		cond, arg, err := p.buildTextExprCondition("m.group_id::text", operator, value, true)
+		if err != nil {
+			return nil, err
+		}
+		sql := fmt.Sprintf("EXISTS (SELECT 1 FROM scim_group_memberships m WHERE m.member_value = scim_users.id AND m.workspace_id = scim_users.workspace_id AND %s)", cond)
+		return &FilterResult{SQL: sql, Args: []any{arg}}, nil
+	case "groups.display":
+		cond, arg, err := p.buildTextExprCondition("g.display_name", operator, value, true)
+		if err != nil {
+			return nil, err
+		}
+		sql := fmt.Sprintf("EXISTS (SELECT 1 FROM scim_group_memberships m JOIN scim_groups g ON g.id = m.group_id WHERE m.member_value = scim_users.id AND m.workspace_id = scim_users.workspace_id AND %s)", cond)
+		return &FilterResult{SQL: sql, Args: []any{arg}}, nil
+	case "groups.type":
+		cond, arg, err := p.buildTextExprCondition("'direct'::text", operator, value, true)
+		if err != nil {
+			return nil, err
+		}
+		sql := fmt.Sprintf("EXISTS (SELECT 1 FROM scim_group_memberships m WHERE m.member_value = scim_users.id AND m.workspace_id = scim_users.workspace_id AND %s)", cond)
+		return &FilterResult{SQL: sql, Args: []any{arg}}, nil
+	default:
+		return nil, fmt.Errorf("unknown attribute: %s", attr)
+	}
+}
+
+func (p *filterParser) buildTextExprCondition(expr, operator, value string, caseInsensitive bool) (string, string, error) {
+	param := p.nextParam()
+	switch operator {
+	case filterOpEq:
+		if caseInsensitive {
+			return fmt.Sprintf("LOWER(%s) = LOWER(%s)", expr, param), value, nil
+		}
+		return fmt.Sprintf("%s = %s", expr, param), value, nil
+	case filterOpNe:
+		if caseInsensitive {
+			return fmt.Sprintf("(LOWER(%s) != LOWER(%s) OR %s IS NULL)", expr, param, expr), value, nil
+		}
+		return fmt.Sprintf("(%s != %s OR %s IS NULL)", expr, param, expr), value, nil
+	case filterOpCo:
+		escaped := "%" + escapeLikeValue(value) + "%"
+		if caseInsensitive {
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
+		}
+		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
+	case filterOpSw:
+		escaped := escapeLikeValue(value) + "%"
+		if caseInsensitive {
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
+		}
+		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
+	case filterOpEw:
+		escaped := "%" + escapeLikeValue(value)
+		if caseInsensitive {
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
+		}
+		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
+	case filterOpGt:
+		return fmt.Sprintf("%s > %s", expr, param), value, nil
+	case filterOpGe:
+		return fmt.Sprintf("%s >= %s", expr, param), value, nil
+	case filterOpLt:
+		return fmt.Sprintf("%s < %s", expr, param), value, nil
+	case filterOpLe:
+		return fmt.Sprintf("%s <= %s", expr, param), value, nil
+	default:
+		return "", "", fmt.Errorf("unsupported operator: %s", operator)
+	}
+}
+
+func (p *filterParser) buildSchemasFilter(operator, value string) (*FilterResult, error) {
+	if !isValidComparisonOp(operator) {
+		return nil, fmt.Errorf("unsupported operator: %s", operator)
+	}
+	if p.entityType == entityTypeGroup {
+		cond, arg, err := p.buildTextExprCondition("'urn:ietf:params:scim:schemas:core:2.0:Group'::text", operator, value, false)
+		if err != nil {
+			return nil, err
+		}
+		return &FilterResult{SQL: cond, Args: []any{arg}}, nil
+	}
+	// User: core User URN is always present; Enterprise User URN is present when any enterprise column is non-null.
+	const entPresent = "(enterprise_employee_number IS NOT NULL OR enterprise_cost_center IS NOT NULL OR enterprise_organization IS NOT NULL OR enterprise_division IS NOT NULL OR enterprise_department IS NOT NULL OR enterprise_manager_value IS NOT NULL)"
+	condCore, argCore, err := p.buildTextExprCondition("'urn:ietf:params:scim:schemas:core:2.0:User'::text", operator, value, false)
+	if err != nil {
+		return nil, err
+	}
+	condEnt, argEnt, err := p.buildTextExprCondition("'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User'::text", operator, value, false)
+	if err != nil {
+		return nil, err
+	}
+	if operator == filterOpNe {
+		sql := fmt.Sprintf("(%s AND (NOT %s OR %s))", condCore, entPresent, condEnt)
+		return &FilterResult{SQL: sql, Args: []any{argCore, argEnt}}, nil
+	}
+	sql := fmt.Sprintf("(%s OR (%s AND %s))", condCore, entPresent, condEnt)
+	return &FilterResult{SQL: sql, Args: []any{argCore, argEnt}}, nil
+}
+
+func isValidCommonAttr(lower string) bool {
+	switch lower {
+	case attrID, attrExternalID, "schemas", attrMetaCreated, attrMetaLastModified, attrMetaResourceType, "meta.location", "meta.version":
+		return true
+	}
+	return false
+}
+
+func isValidEnterpriseAttr(lower string) bool {
+	switch lower {
+	case attrEmployeeNumber, attrCostCenter, attrOrganization, attrDivision, attrDepartment,
+		"manager", attrManagerValue, "manager.$ref", attrManagerDisplayName:
+		return true
+	}
+	return false
+}
+
+func isValidUserCoreAttr(lower string) bool {
+	if isValidCommonAttr(lower) || isUserGroupsAttr(lower) {
+		return true
+	}
+	switch lower {
+	case attrUsername, "name", attrNameFormatted, attrNameFamilyName, attrNameGivenName, attrNameMiddleName,
+		attrNameHonorificPrefix, attrNameHonorificSuffix, attrDisplayName, attrNickname, attrProfileURL,
+		attrTitle, attrUserType, attrPreferredLanguage, attrLocale, attrTimeZone, attrActive:
+		return true
+	}
+	if isJSONCollection(lower) {
+		return true
+	}
+	parts := strings.SplitN(lower, ".", 2)
 	if len(parts) == 2 && isJSONCollection(parts[0]) {
+		_, _, err := resolveSubAttribute(parts[0], parts[1])
+		return err == nil
+	}
+	return false
+}
+
+func isValidGroupCoreAttr(lower string) bool {
+	if isValidCommonAttr(lower) || isGroupMembersAttr(lower) {
+		return true
+	}
+	return lower == attrDisplayName
+}
+
+func isValidAnyResourceAttr(rawAttr string) bool {
+	lower := strings.ToLower(strings.TrimSpace(rawAttr))
+	if strings.HasPrefix(lower, strings.ToLower(coreUserURN)) {
+		rem := lower[len(coreUserURN):]
+		return isValidUserCoreAttr(rem)
+	}
+	if strings.HasPrefix(lower, strings.ToLower(enterpriseURN)) {
+		rem := lower[len(enterpriseURN):]
+		return isValidEnterpriseAttr(rem)
+	}
+	if strings.HasPrefix(lower, strings.ToLower(coreGroupURN)) {
+		rem := lower[len(coreGroupURN):]
+		return isValidGroupCoreAttr(rem)
+	}
+	if strings.Contains(lower, ":") {
+		return false
+	}
+	return isValidUserCoreAttr(lower) || isValidEnterpriseAttr(lower) || isValidGroupCoreAttr(lower)
+}
+
+func validateCrossResourceComparison(rawAttr, operator, value string) error {
+	if !isValidComparisonOp(operator) {
+		return fmt.Errorf("unsupported operator: %s", operator)
+	}
+	stripped := strings.ToLower(stripURNPrefix(rawAttr))
+	parts := strings.SplitN(stripped, ".", 2)
+	isBool := isBooleanAttr(stripped) || (len(parts) == 2 && isJSONCollection(parts[0]) && parts[1] == "primary")
+	if isBool {
+		if operator != filterOpEq && operator != filterOpNe {
+			return fmt.Errorf("comparison operator '%s' is not supported for boolean attribute '%s'", operator, rawAttr)
+		}
+		if !strings.EqualFold(value, "true") && !strings.EqualFold(value, "false") {
+			return fmt.Errorf("invalid boolean value for attribute '%s': %s", rawAttr, value)
+		}
+	}
+	if stripped == attrMetaCreated || stripped == attrMetaLastModified {
+		if operator == filterOpCo || operator == filterOpSw || operator == filterOpEw {
+			return fmt.Errorf("comparison operator '%s' is not supported for dateTime attribute '%s'", operator, rawAttr)
+		}
+		if _, err := parseDateTime(value); err != nil {
+			return fmt.Errorf("invalid dateTime format for attribute '%s': %s", rawAttr, value)
+		}
+	}
+	return nil
+}
+
+func (p *filterParser) buildComparison(attr, operator, value string) (*FilterResult, error) {
+	return p.buildComparisonWithRaw(attr, attr, operator, value)
+}
+
+func (p *filterParser) buildComparisonWithRaw(rawAttr, attr, operator, value string) (*FilterResult, error) {
+	lowerAttr := strings.ToLower(attr)
+
+	if lowerAttr == "schemas" {
+		return p.buildSchemasFilter(operator, value)
+	}
+	if p.entityType == entityTypeGroup && isGroupMembersAttr(lowerAttr) {
+		return p.buildGroupMembersFilter(attr, operator, value)
+	}
+	if p.entityType == entityTypeUser && isUserGroupsAttr(lowerAttr) {
+		return p.buildUserGroupsFilter(attr, operator, value)
+	}
+
+	// Handle JSON sub-attribute paths like emails.value (User only)
+	parts := strings.SplitN(attr, ".", 2)
+	if p.entityType == entityTypeUser && len(parts) == 2 && isJSONCollection(parts[0]) {
 		col := p.resolveJSONColumn(parts[0])
 		return p.buildJSONAttributeFilter(col, parts[0], parts[1], operator, value)
 	}
 
 	col, err := p.resolveColumn(attr)
 	if err != nil {
+		if p.crossResource && isValidAnyResourceAttr(rawAttr) {
+			if vErr := validateCrossResourceComparison(rawAttr, operator, value); vErr != nil {
+				return nil, vErr
+			}
+			return &FilterResult{SQL: "FALSE", Args: nil}, nil
+		}
 		return nil, err
 	}
 
-	lowerAttr := strings.ToLower(attr)
+	if col == "enterprise_manager_ref" && (operator == filterOpEq || operator == filterOpNe) {
+		if extracted := ExtractUUIDFromRef(value); extracted != "" {
+			cond, arg, cErr := p.buildTextExprCondition(sqlEnterpriseManagerValue, operator, extracted, true)
+			if cErr != nil {
+				return nil, cErr
+			}
+			return &FilterResult{SQL: cond, Args: []any{arg}}, nil
+		}
+	}
 
 	// Validate boolean attributes: only eq and ne are supported per RFC 7644 §3.4.2.2
 	if isBooleanAttr(lowerAttr) {
@@ -973,52 +1465,35 @@ func (p *filterParser) buildJSONAttributeFilter(col, collectionName, subAttr, op
 		}
 	}
 
-	// For JSON columns, we use casting to text and LIKE patterns
-	// This matches the Java implementation's approach
-	param := p.nextParam()
-	isCaseInsensitive := caseInsensitiveAttrs[strings.ToLower(collectionName+"."+subAttr)]
+	if operator == filterOpPr {
+		sql := fmt.Sprintf(
+			"(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE (elem->>'%s') IS NOT NULL AND (elem->>'%s') != ''))",
+			col, col, col, col, jsonKey, jsonKey,
+		)
+		return &FilterResult{SQL: sql, Args: nil}, nil
+	}
+
+	if isBool {
+		param := p.nextParam()
+		boolStr := strings.ToLower(value)
+		sql := fmt.Sprintf(
+			"(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE (elem->>'%s') = %s))",
+			col, col, col, col, jsonKey, param,
+		)
+		return &FilterResult{SQL: sql, Args: []any{boolStr}}, nil
+	}
 
 	switch operator {
-	case filterOpEq:
-		var pattern string
-		if isBool {
-			pattern = fmt.Sprintf(`%%"primaryFlag":%s%%`, strings.ToLower(value))
-		} else {
-			// Match JSON key-value pair
-			pattern = fmt.Sprintf(`%%"%s":"%s"%%`, jsonKey, escapeLikeValue(value))
+	case filterOpEq, filterOpCo, filterOpSw, filterOpEw:
+		cond, args, err := p.buildElemCondition(collectionName, subAttr, operator, value)
+		if err != nil {
+			return nil, err
 		}
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpCo:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%%%s%%"%%`, jsonKey, escaped)
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpSw:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%s%%"%%`, jsonKey, escaped)
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpEw:
-		escaped := escapeLikeValue(value)
-		pattern := fmt.Sprintf(`%%"%s":"%%%s"%%`, jsonKey, escaped)
-		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlTextLowerLikeSeparator + param + ")", Args: []any{pattern}}, nil
-		}
-		return &FilterResult{SQL: col + sqlTextLike + param, Args: []any{pattern}}, nil
-
-	case filterOpPr:
-		return &FilterResult{SQL: col + sqlIsNotNullAnd + col + sqlTextNotEqualsEmptyArray, Args: nil}, nil
-
+		sql := fmt.Sprintf(
+			"(%s IS NOT NULL AND jsonb_typeof(%s::jsonb) = 'array' AND %s::text != '[]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) AS elem WHERE %s))",
+			col, col, col, col, cond,
+		)
+		return &FilterResult{SQL: sql, Args: args}, nil
 	default:
 		return nil, fmt.Errorf("unsupported operator for JSON attribute: %s", operator)
 	}
@@ -1135,9 +1610,6 @@ func escapeLikeValue(value string) string {
 			b.WriteRune('\\')
 			b.WriteRune(c)
 		default:
-			if !unicode.IsPrint(c) {
-				continue
-			}
 			b.WriteRune(c)
 		}
 	}

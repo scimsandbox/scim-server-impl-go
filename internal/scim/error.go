@@ -8,9 +8,9 @@ import (
 
 // ScimError represents a SCIM protocol error.
 type ScimError struct {
-	Status  int    `json:"-"`
+	Status   int    `json:"-"`
 	ScimType string `json:"scimType,omitempty"`
-	Detail  string `json:"detail"`
+	Detail   string `json:"detail"`
 }
 
 func (e *ScimError) Error() string {

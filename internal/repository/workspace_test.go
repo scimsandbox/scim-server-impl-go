@@ -30,4 +30,3 @@ func TestRequestLogRepository_ListWorkspaceIDsExceedingLogCount_NonPositiveMaxCo
 		}
 	}
 }
-

@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
+	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
 type contextKey string
@@ -34,15 +35,35 @@ func BearerTokenAuth(tokenRepo tokenFinder, workspaceRepo workspaceFinder) func(
 			if wsID == nil {
 				MarkAuthentication(r, AuthenticationFailed)
 				w.Header().Set("WWW-Authenticate", "Bearer")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				scim.WriteScimError(w, scim.NewScimError(http.StatusUnauthorized, "", "Unauthorized"))
 				return
 			}
 
 			authHeader := r.Header.Get("Authorization")
+			trimmedPath := strings.TrimRight(r.URL.Path, "/")
+			if r.Method == http.MethodGet &&
+				strings.HasSuffix(trimmedPath, "/ServiceProviderConfig") &&
+				strings.TrimSpace(authHeader) == "" {
+				workspaceID, ok := wsID.(uuid.UUID)
+				if !ok {
+					scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Workspace not found"))
+					return
+				}
+				if workspaceRepo != nil {
+					ws, err := workspaceRepo.FindByID(r.Context(), workspaceID)
+					if err != nil || ws == nil {
+						scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Workspace not found"))
+						return
+					}
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 				MarkAuthentication(r, AuthenticationFailed)
 				w.Header().Set("WWW-Authenticate", "Bearer")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				scim.WriteScimError(w, scim.NewScimError(http.StatusUnauthorized, "", "Unauthorized"))
 				return
 			}
 
@@ -54,21 +75,21 @@ func BearerTokenAuth(tokenRepo tokenFinder, workspaceRepo workspaceFinder) func(
 			if err != nil || wsToken == nil {
 				MarkAuthentication(r, AuthenticationFailed)
 				w.Header().Set("WWW-Authenticate", "Bearer")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				scim.WriteScimError(w, scim.NewScimError(http.StatusUnauthorized, "", "Unauthorized"))
 				return
 			}
 
 			if wsToken.WorkspaceID != workspaceID {
 				MarkAuthentication(r, AuthenticationFailed)
 				w.Header().Set("WWW-Authenticate", "Bearer")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				scim.WriteScimError(w, scim.NewScimError(http.StatusUnauthorized, "", "Unauthorized"))
 				return
 			}
 
 			if wsToken.ExpiresAt != nil && wsToken.ExpiresAt.Before(time.Now()) {
 				MarkAuthentication(r, AuthenticationFailed)
 				w.Header().Set("WWW-Authenticate", "Bearer")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				scim.WriteScimError(w, scim.NewScimError(http.StatusUnauthorized, "", "Unauthorized"))
 				return
 			}
 
@@ -86,14 +107,14 @@ func ExtractWorkspaceID(next http.Handler) http.Handler {
 		if wsIDStr == "" {
 			MarkWorkspaceID(r, "unknown")
 			MarkAuthentication(r, AuthenticationFailed)
-			http.Error(w, "Not Found", http.StatusNotFound)
+			scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Not Found"))
 			return
 		}
 		wsID, err := uuid.Parse(wsIDStr)
 		if err != nil {
 			MarkWorkspaceID(r, "invalid")
 			MarkAuthentication(r, AuthenticationFailed)
-			http.Error(w, "Not Found", http.StatusNotFound)
+			scim.WriteScimError(w, scim.NewScimError(http.StatusNotFound, "", "Not Found"))
 			return
 		}
 		MarkWorkspaceID(r, wsID.String())

@@ -29,7 +29,10 @@ func TestGroupMembershipTransaction(t *testing.T) {
 			"POSTGRES_PASSWORD": "postgres",
 			"POSTGRES_DB":       "scim_test",
 		},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
+		WaitingFor: wait.ForAll(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			wait.ForListeningPort("5432/tcp"),
+		).WithDeadline(60 * time.Second),
 	}
 
 	pgc, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -144,7 +147,10 @@ func TestRequestLogPruningSQL(t *testing.T) {
 			"POSTGRES_PASSWORD": "postgres",
 			"POSTGRES_DB":       "scim_test",
 		},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
+		WaitingFor: wait.ForAll(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			wait.ForListeningPort("5432/tcp"),
+		).WithDeadline(60 * time.Second),
 	}
 
 	pgc, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{

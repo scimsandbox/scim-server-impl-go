@@ -20,11 +20,13 @@ type Config struct {
 
 type ServerConfig struct {
 	Port              int           `yaml:"port" env:"GO_SERVER_PORT"`
+	BaseURL           string        `yaml:"base_url" env:"GO_SERVER_BASE_URL"`
 	ReadTimeout       time.Duration `yaml:"read_timeout" env:"GO_SERVER_READ_TIMEOUT"`
 	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout" env:"GO_SERVER_READ_HEADER_TIMEOUT"`
 	WriteTimeout      time.Duration `yaml:"write_timeout" env:"GO_SERVER_WRITE_TIMEOUT"`
 	IdleTimeout       time.Duration `yaml:"idle_timeout" env:"GO_SERVER_IDLE_TIMEOUT"`
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout" env:"GO_SERVER_SHUTDOWN_TIMEOUT"`
+	CursorSecret      string        `yaml:"cursor_secret" env:"GO_CURSOR_SECRET"`
 }
 
 type ManagementConfig struct {
@@ -46,12 +48,20 @@ type CleanupConfig struct {
 	Interval    time.Duration            `yaml:"interval" env:"GO_CLEANUP_INTERVAL"`
 	StaleAfter  time.Duration            `yaml:"stale_after" env:"GO_CLEANUP_STALE_AFTER"`
 	RequestLogs CleanupRequestLogsConfig `yaml:"request_logs"`
+	AsyncEvents CleanupAsyncEventsConfig `yaml:"async_events"`
 }
 
 type CleanupRequestLogsConfig struct {
 	Enabled  *bool         `yaml:"enabled" env:"GO_CLEANUP_REQUEST_LOGS_ENABLED"`
 	Interval time.Duration `yaml:"interval" env:"GO_CLEANUP_REQUEST_LOGS_INTERVAL"`
 	MaxCount int           `yaml:"max_count" env:"GO_CLEANUP_REQUEST_LOGS_MAX_COUNT"`
+}
+
+type CleanupAsyncEventsConfig struct {
+	Enabled           *bool         `yaml:"enabled" env:"GO_CLEANUP_ASYNC_EVENTS_ENABLED"`
+	Interval          time.Duration `yaml:"interval" env:"GO_CLEANUP_ASYNC_EVENTS_INTERVAL"`
+	MaxCount          int           `yaml:"max_count" env:"GO_CLEANUP_ASYNC_EVENTS_MAX_COUNT"`
+	StalePendingAfter time.Duration `yaml:"stale_pending_after" env:"GO_CLEANUP_ASYNC_EVENTS_STALE_PENDING_AFTER"`
 }
 
 type LoggingConfig struct {

@@ -87,3 +87,63 @@ func TestBuildBaseURLAppendsCompatSegment(t *testing.T) {
 		t.Fatalf("buildBaseURL() = %q, want %q", got, want)
 	}
 }
+
+func TestApplyAttributeProjection_SubAttributesAndURNPrefixes(t *testing.T) {
+	sample := func() map[string]any {
+		return map[string]any{
+			"schemas":  []string{"urn:ietf:params:scim:schemas:core:2.0:User", "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"},
+			"id":       "11111111-1111-1111-1111-111111111111",
+			"userName": "alice@example.com",
+			"password": "secret",
+			"name": map[string]any{
+				"givenName":  "Alice",
+				"familyName": "Smith",
+			},
+			"emails": []map[string]any{
+				{"value": "alice@example.com", "type": "work", "primary": true},
+			},
+			"meta": map[string]any{"resourceType": "User"},
+			"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": map[string]any{
+				"department": "Engineering",
+				"division":   "Platform",
+			},
+		}
+	}
+
+	t.Run("whitelist complex sub-attributes and multi-valued sub-attributes", func(t *testing.T) {
+		res := applyAttributeProjection(sample(), "name.givenName,emails.value", "")
+		if _, hasPW := res["password"]; hasPW {
+			t.Fatal("password must never be returned")
+		}
+		if res["id"] == nil || res["schemas"] == nil || res["meta"] == nil {
+			t.Fatal("schemas, id, and meta must remain present")
+		}
+		nameMap, ok := res["name"].(map[string]any)
+		if !ok || nameMap["givenName"] != "Alice" || nameMap["familyName"] != nil {
+			t.Fatalf("unexpected projected name map: %v", res["name"])
+		}
+		emails, ok := res["emails"].([]map[string]any)
+		if !ok || len(emails) != 1 || emails[0]["value"] != "alice@example.com" || emails[0]["type"] != nil {
+			t.Fatalf("unexpected projected emails: %v", res["emails"])
+		}
+		if _, hasUN := res["userName"]; hasUN {
+			t.Fatal("userName was not requested and has returned:default, so it must be omitted")
+		}
+	})
+
+	t.Run("blacklist excludedAttributes on sub-attributes and URN-prefixed enterprise attributes", func(t *testing.T) {
+		res := applyAttributeProjection(sample(), "", "name.familyName,emails.type,urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:division,id,schemas")
+		if res["id"] == nil || res["schemas"] == nil {
+			t.Fatal("returned:always attributes id and schemas must never be excluded")
+		}
+		nameMap := res["name"].(map[string]any)
+		if nameMap["givenName"] != "Alice" || nameMap["familyName"] != nil {
+			t.Fatalf("unexpected excluded name map: %v", nameMap)
+		}
+		entMap := res["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"].(map[string]any)
+		if entMap["department"] != "Engineering" || entMap["division"] != nil {
+			t.Fatalf("unexpected excluded enterprise map: %v", entMap)
+		}
+	})
+}
+

@@ -1,11 +1,17 @@
 package handler
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
+	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
@@ -387,3 +393,224 @@ func TestParseBulkTarget_Item(t *testing.T) {
 		})
 	}
 }
+
+func TestBulkHandler_ProcessOperation_BulkIdValidation_BLK20(t *testing.T) {
+	bh := &BulkHandler{}
+	req, _ := http.NewRequest(http.MethodPost, "/Bulk", nil)
+	bulkIdMap := make(map[string]string)
+
+	tests := []struct {
+		name       string
+		op         map[string]any
+		wantStatus string
+	}{
+		{
+			name: "POST without bulkId returns 400 invalidValue",
+			op: map[string]any{
+				"method": "POST",
+				"path":   "/Users",
+				"data": map[string]any{
+					"schemas":  []string{"urn:ietf:params:scim:schemas:core:2.0:User"},
+					"userName": "alice@example.com",
+				},
+			},
+			wantStatus: "400",
+		},
+		{
+			name: "POST with empty whitespace bulkId returns 400 invalidValue",
+			op: map[string]any{
+				"method": "POST",
+				"path":   "/Users",
+				"bulkId": "   ",
+				"data": map[string]any{
+					"schemas":  []string{"urn:ietf:params:scim:schemas:core:2.0:User"},
+					"userName": "alice@example.com",
+				},
+			},
+			wantStatus: "400",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res := bh.processOperation(req, tc.op, uuid.New(), bulkIdMap)
+			if status, _ := res["status"].(string); status != tc.wantStatus {
+				t.Fatalf("expected status %s, got %s", tc.wantStatus, status)
+			}
+			resp, ok := res["response"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected error response map in result")
+			}
+			schemas, _ := resp["schemas"].([]string)
+			if len(schemas) == 0 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:Error" {
+				t.Fatalf("expected error schema in response, got %v", schemas)
+			}
+			if scimType, _ := resp["scimType"].(string); scimType != "invalidValue" {
+				t.Fatalf("expected scimType 'invalidValue', got %q", scimType)
+			}
+		})
+	}
+}
+
+func TestBulk_MissingDataLocationAndTopologicalOrder(t *testing.T) {
+	bh := &BulkHandler{}
+	uid := uuid.New()
+	req, _ := http.NewRequest(http.MethodPost, "https://example.com/ws/123/scim/v2/Bulk", nil)
+	req.Host = "example.com"
+
+	t.Run("PUT without data returns 400 invalidSyntax and still includes location", func(t *testing.T) {
+		res := bh.processOperation(req, map[string]any{
+			"method": "PUT",
+			"path":   "/Users/" + uid.String(),
+		}, uuid.New(), map[string]string{})
+		if res["status"] != "400" {
+			t.Fatalf("status = %v, want 400", res["status"])
+		}
+		if res["location"] == nil || res["location"] == "" {
+			t.Fatalf("expected non-empty location on PUT failure, got %v", res["location"])
+		}
+		errMap, _ := res["response"].(map[string]any)
+		if errMap["scimType"] != "invalidSyntax" {
+			t.Fatalf("scimType = %v, want invalidSyntax", errMap["scimType"])
+		}
+	})
+
+	t.Run("forward bulkId dependency reorders producer ahead of consumer", func(t *testing.T) {
+		ops := []map[string]any{
+			{"method": "POST", "path": "/Groups", "bulkId": "g1", "data": map[string]any{"members": []any{map[string]any{"value": "bulkId:u1"}}}},
+			{"method": "POST", "path": "/Users", "bulkId": "u1", "data": map[string]any{"userName": "u1"}},
+		}
+		producers := map[string]int{"g1": 0, "u1": 1}
+		order := computeBulkExecutionOrder(ops, producers)
+		if len(order) != 2 || order[0] != 1 || order[1] != 0 {
+			t.Fatalf("computeBulkExecutionOrder = %v, want [1 0]", order)
+		}
+	})
+
+	t.Run("circular bulkId dependency schedules cleanly without deadlock", func(t *testing.T) {
+		ops := []map[string]any{
+			{"method": "POST", "path": "/Groups", "bulkId": "qwerty", "data": map[string]any{"members": []any{map[string]any{"value": "bulkId:ytrewq"}}}},
+			{"method": "POST", "path": "/Groups", "bulkId": "ytrewq", "data": map[string]any{"members": []any{map[string]any{"value": "bulkId:qwerty"}}}},
+		}
+		producers := map[string]int{"qwerty": 0, "ytrewq": 1}
+		order := computeBulkExecutionOrder(ops, producers)
+		if len(order) != 2 || order[0] != 0 || order[1] != 1 {
+			t.Fatalf("computeBulkExecutionOrder = %v, want [0 1]", order)
+		}
+	})
+
+	t.Run("same-resource operations preserve client order when first op waits on forward bulkId", func(t *testing.T) {
+		gid := uuid.New().String()
+		ops := []map[string]any{
+			{"method": "PATCH", "path": "/Groups/" + gid, "data": map[string]any{"Operations": []any{map[string]any{"op": "add", "path": "members", "value": []any{map[string]any{"value": "bulkId:u1"}}}}}},
+			{"method": "DELETE", "path": "/Groups/" + gid},
+			{"method": "POST", "path": "/Users", "bulkId": "u1", "data": map[string]any{"userName": "u1"}},
+		}
+		producers := map[string]int{"u1": 2}
+		order := computeBulkExecutionOrder(ops, producers)
+		if len(order) != 3 || order[0] != 2 || order[1] != 0 || order[2] != 1 {
+			t.Fatalf("computeBulkExecutionOrder = %v, want [2 0 1]", order)
+		}
+	})
+
+	t.Run("resolveBulkIdReferences avoids prefix collision and resolves filter paths", func(t *testing.T) {
+		m := map[string]string{
+			"u1":  "11111111-1111-1111-1111-111111111111",
+			"u10": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+		}
+		if got := resolveBulkIdReferences("/Users/bulkId:u10", m); got != "/Users/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" {
+			t.Fatalf("prefix collision in resolveBulkIdReferences: got %q", got)
+		}
+		if got := resolveBulkIdReferences(`members[value eq "bulkId:u1"]`, m); got != `members[value eq "11111111-1111-1111-1111-111111111111"]` {
+			t.Fatalf("embedded filter bulkId failed to resolve: got %q", got)
+		}
+	})
+
+	t.Run("entire POST cycle is scheduled before dependent PUT PATCH DELETE", func(t *testing.T) {
+		ops := []map[string]any{
+			{"method": "POST", "path": "/Groups", "bulkId": "g1", "data": map[string]any{"members": []any{map[string]any{"value": "bulkId:g2"}}}},
+			{"method": "PATCH", "path": "/Groups/bulkId:g1", "data": map[string]any{"Operations": []any{}}},
+			{"method": "POST", "path": "/Groups", "bulkId": "g2", "data": map[string]any{"members": []any{map[string]any{"value": "bulkId:g1"}}}},
+			{"method": "DELETE", "path": "/Groups/bulkId:g1"},
+		}
+		producers := map[string]int{"g1": 0, "g2": 2}
+		order := computeBulkExecutionOrder(ops, producers)
+		// Both POST g1 (0) and POST g2 (2) must execute before PATCH (1) and DELETE (3)
+		if len(order) != 4 || order[0] != 0 || order[1] != 2 || order[2] != 1 || order[3] != 3 {
+			t.Fatalf("computeBulkExecutionOrder = %v, want [0 2 1 3]", order)
+		}
+	})
+}
+
+func TestBulk_MaxBytesReader_ChunkedBodyExceedingLimitReturns413(t *testing.T) {
+	bh := &BulkHandler{}
+	wsID := uuid.New()
+
+	oversized := `{"schemas":["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],"Operations":[{"data":"` +
+		strings.Repeat("x", maxBulkPayloadBytes+1024) + `"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/Bulk", bytes.NewBufferString(oversized))
+	req.ContentLength = -1 // Simulate chunked transfer encoding with unknown Content-Length
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+
+	rec := httptest.NewRecorder()
+	bh.ProcessBulk(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 Request Entity Too Large", rec.Code)
+	}
+}
+
+func TestBulk_DeferredFixupRollback_RemovesBulkIdAndCountsErrors(t *testing.T) {
+	bh := &BulkHandler{
+		userHandler:  &UserHandler{},
+		groupHandler: &GroupHandler{},
+	}
+	wsID := uuid.New()
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/ws/"+wsID.String()+"/scim/v2/Bulk", nil)
+
+	g1ID := uuid.New()
+	g2ID := uuid.New()
+	bulkIdMap := map[string]string{
+		"g1": g1ID.String(),
+		"g2": g2ID.String(),
+	}
+	indexedResults := []map[string]any{
+		{"method": "POST", "bulkId": "g1", "status": "201", "location": "https://example.com/Groups/" + g1ID.String(), "version": `W/"0"`},
+		{"method": "POST", "bulkId": "g2", "status": "201", "location": "https://example.com/Groups/" + g2ID.String(), "version": `W/"0"`},
+	}
+	createdPosts := map[int]*createdPostRecord{
+		0: {origIdx: 0, resourceType: bulkResourceGroups, resourceID: g1ID, bulkID: "g1", depBulkIDs: []string{"bad"}},
+		1: {origIdx: 1, resourceType: bulkResourceGroups, resourceID: g2ID, bulkID: "g2", depBulkIDs: []string{"g1"}},
+	}
+	fixups := []deferredBulkFixup{
+		{
+			kind:            bulkFixupGroupMembers,
+			origIdx:         0,
+			resourceID:      g1ID,
+			bulkID:          "g1",
+			deferredMembers: []map[string]any{{"value": "bulkId:bad"}},
+		},
+	}
+
+	rolledBack := make(map[string]bool)
+	rollbackErrors := bh.applyDeferredBulkFixups(req, wsID, "https://example.com", bulkIdMap, indexedResults, fixups, createdPosts, rolledBack)
+
+	// Both g1 (direct fixup failure) and g2 (cascade dependency on g1) must be rolled back
+	if rollbackErrors != 2 {
+		t.Fatalf("rollbackErrors = %d, want 2", rollbackErrors)
+	}
+	if _, exists := bulkIdMap["g1"]; exists {
+		t.Fatal("expected g1 to be removed from bulkIdMap after rollback")
+	}
+	if _, exists := bulkIdMap["g2"]; exists {
+		t.Fatal("expected g2 to be removed from bulkIdMap after cascade rollback")
+	}
+	if indexedResults[0]["status"] != "400" || indexedResults[1]["status"] != "400" {
+		t.Fatalf("expected both POST operations to have status 400 after rollback, got %v and %v",
+			indexedResults[0]["status"], indexedResults[1]["status"])
+	}
+	var _ *model.ScimGroup
+}
+
+

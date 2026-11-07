@@ -1,10 +1,14 @@
 package scim
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 )
 
@@ -162,5 +166,92 @@ func TestApplyMsCompat(t *testing.T) {
 	roles := result["roles"].([]map[string]any)
 	if roles[0]["primary"] != "false" {
 		t.Fatalf("roles primary = %v, want string false", roles[0]["primary"])
+	}
+}
+
+func TestHashPassword(t *testing.T) {
+	// Plaintext password should be hashed
+	pw := "mySecretPass123"
+	hashed, err := HashPassword(&pw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hashed == nil {
+		t.Fatalf("expected non-nil hashed password")
+	}
+	if *hashed == pw {
+		t.Fatalf("expected password to be hashed, but was identical to plaintext")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*hashed), []byte(pw)); err != nil {
+		t.Fatalf("bcrypt verification failed: %v", err)
+	}
+
+	// Inputs starting with $2a$, $2b$, and $2y$ must still be hashed as plaintext passwords
+	for _, prefixInput := range []string{
+		"$2a$10$abcdefghijklmnopqrstuvwxyz0123456789",
+		"$2b$10$abcdefghijklmnopqrstuvwxyz0123456789",
+		"$2y$10$abcdefghijklmnopqrstuvwxyz0123456789",
+	} {
+		input := prefixInput
+		hashedPrefix, err := HashPassword(&input)
+		if err != nil || hashedPrefix == nil {
+			t.Fatalf("expected password starting with bcrypt prefix %q to be hashed, got err=%v", input, err)
+		}
+		if *hashedPrefix == input {
+			t.Fatalf("expected password starting with bcrypt prefix %q to be hashed, but returned unchanged", input)
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(*hashedPrefix), []byte(input)); err != nil {
+			t.Fatalf("bcrypt verification failed for %q: %v", input, err)
+		}
+	}
+
+	// Nil / empty stays nil / empty
+	if res, err := HashPassword(nil); err != nil || res != nil {
+		t.Fatalf("nil password should return nil, nil")
+	}
+	empty := ""
+	resEmpty, err := HashPassword(&empty)
+	if err != nil || resEmpty == nil || *resEmpty != "" {
+		t.Fatalf("empty password should remain empty")
+	}
+
+	// Password exceeding 72 bytes must return error
+	longPw := strings.Repeat("a", 73)
+	resLong, err := HashPassword(&longPw)
+	if err == nil {
+		t.Fatalf("expected error for password > 72 bytes, got %v", resLong)
+	}
+	var scimErr *ScimError
+	if !errors.As(err, &scimErr) {
+		t.Fatalf("expected *ScimError, got %T", err)
+	}
+	if scimErr.Status != 400 || scimErr.ScimType != "invalidValue" {
+		t.Fatalf("expected status 400 and invalidValue, got %d, %s", scimErr.Status, scimErr.ScimType)
+	}
+}
+
+func TestApplyUserAttributes_Password(t *testing.T) {
+	u := &model.ScimUser{}
+	input := map[string]any{
+		"userName": "test@example.com",
+		"password": "Password123!",
+	}
+	if err := ApplyFromScimInput(u, input); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u.Password == nil {
+		t.Fatalf("expected user password to be set")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*u.Password), []byte("Password123!")); err != nil {
+		t.Fatalf("bcrypt compare failed: %v", err)
+	}
+
+	// Long password rejected
+	inputLong := map[string]any{
+		"userName": "test2@example.com",
+		"password": strings.Repeat("X", 80),
+	}
+	if err := ApplyFromScimInput(&model.ScimUser{}, inputLong); err == nil {
+		t.Fatalf("expected error for password > 72 bytes in ApplyFromScimInput")
 	}
 }

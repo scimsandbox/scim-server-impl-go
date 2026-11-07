@@ -338,7 +338,7 @@ func TestServerBaseURLAndEnsureCursorSecret(t *testing.T) {
 	})
 
 	t.Run("ensureCursorSecret uses configured secret without DB", func(t *testing.T) {
-		cfg := Config{Server: ServerConfig{CursorSecret: "configured-secret-123"}}
+		cfg := Config{Server: ServerConfig{CursorSecret: "configured-cursor-secret-at-least-32-bytes"}}
 		if err := ensureCursorSecret(cfg, nil); err != nil {
 			t.Fatalf("ensureCursorSecret() error = %v", err)
 		}
@@ -348,12 +348,37 @@ func TestServerBaseURLAndEnsureCursorSecret(t *testing.T) {
 		cfg := Config{}
 		err := ensureCursorSecret(cfg, func(k string) (string, bool) {
 			if k == "SCIM_CURSOR_SECRET" {
-				return "env-secret-456", true
+				return "env-cursor-secret-at-least-32-bytes-long", true
 			}
 			return "", false
 		})
 		if err != nil {
 			t.Fatalf("ensureCursorSecret() error = %v", err)
+		}
+	})
+
+	t.Run("rejects cursor secret shorter than minimum length", func(t *testing.T) {
+		t.Setenv("SCIM_CURSOR_SECRET", "")
+		shortCfg := Config{
+			Server: ServerConfig{CursorSecret: "too-short-secret"},
+			Cleanup: CleanupConfig{
+				RequestLogs: CleanupRequestLogsConfig{Interval: time.Hour, MaxCount: 1000},
+				AsyncEvents: CleanupAsyncEventsConfig{Interval: time.Hour, MaxCount: 1000, StalePendingAfter: time.Minute},
+			},
+		}
+		if err := validateConfig(shortCfg); err == nil {
+			t.Fatal("expected validateConfig error for cursor_secret shorter than 32 characters")
+		}
+		if err := ensureCursorSecret(shortCfg, nil); err == nil {
+			t.Fatal("expected ensureCursorSecret error for cursor_secret shorter than 32 characters")
+		}
+		if err := ensureCursorSecret(Config{}, func(k string) (string, bool) {
+			if k == "SCIM_CURSOR_SECRET" {
+				return "short-env-secret", true
+			}
+			return "", false
+		}); err == nil {
+			t.Fatal("expected ensureCursorSecret error for SCIM_CURSOR_SECRET shorter than 32 characters")
 		}
 	})
 

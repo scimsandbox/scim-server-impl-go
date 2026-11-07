@@ -9,6 +9,7 @@ import (
 
 const (
 	defaultManagementPort = 9090
+	minCursorSecretLength = 32
 )
 
 func resolveDSN(cfg Config) string {
@@ -89,6 +90,9 @@ func applyConfigDefaults(cfg *Config) {
 func validateConfig(cfg Config) error {
 	if cfg.Server.BaseURL != "" && !strings.HasPrefix(cfg.Server.BaseURL, "http://") && !strings.HasPrefix(cfg.Server.BaseURL, "https://") {
 		return fmt.Errorf("server.base_url must start with http:// or https://")
+	}
+	if s := strings.TrimSpace(cfg.Server.CursorSecret); s != "" && len(s) < minCursorSecretLength {
+		return fmt.Errorf("server.cursor_secret must be at least %d characters long", minCursorSecretLength)
 	}
 	if cfg.RateLimit.Enabled && cfg.RateLimit.RequestsPerSecond <= 0 {
 		return fmt.Errorf("rate_limit.requests_per_second must be greater than 0 when rate limiting is enabled")

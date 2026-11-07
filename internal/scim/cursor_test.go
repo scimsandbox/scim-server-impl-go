@@ -253,7 +253,7 @@ func TestSetCursorSecret_DeterminismAndKeyRotation(t *testing.T) {
 	}()
 
 	wsID := uuid.New()
-	SetCursorSecret("replica-shared-secret-key-A")
+	SetCursorSecret("replica-shared-cursor-secret-key-000000A")
 	tokenA, err := EncodeCursorWithPageSize(wsID, 20, 10, 3600)
 	if err != nil {
 		t.Fatalf("EncodeCursorWithPageSize failed: %v", err)
@@ -269,13 +269,13 @@ func TestSetCursorSecret_DeterminismAndKeyRotation(t *testing.T) {
 	}
 
 	// Rotating to a different secret invalidates tokens signed with secret A
-	SetCursorSecret("replica-shared-secret-key-B")
+	SetCursorSecret("replica-shared-cursor-secret-key-000000B")
 	if _, _, err := DecodeCursorWithPageSize(tokenA, wsID); err == nil {
 		t.Fatal("expected token signed with secret A to fail verification under secret B")
 	}
 
 	// Restoring secret A allows decoding tokenA again (simulating multi-replica shared secret)
-	SetCursorSecret("replica-shared-secret-key-A")
+	SetCursorSecret("replica-shared-cursor-secret-key-000000A")
 	off2, pageSize2, err := DecodeCursorWithPageSize(tokenA, wsID)
 	if err != nil || off2 != 20 || pageSize2 != 10 {
 		t.Fatalf("expected tokenA to decode under restored secret A, got off=%d pageSize=%d err=%v", off2, pageSize2, err)

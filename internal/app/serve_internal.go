@@ -394,6 +394,9 @@ func ensureCursorSecret(cfg Config, lookupEnv LookupEnvFunc) error {
 	if secret == "" {
 		return fmt.Errorf("cursor secret is not configured: set GO_CURSOR_SECRET (or SCIM_CURSOR_SECRET / server.cursor_secret)")
 	}
+	if len(secret) < minCursorSecretLength {
+		return fmt.Errorf("cursor secret is too short: must be at least %d characters long", minCursorSecretLength)
+	}
 	scim.SetCursorSecret(secret)
 	return nil
 }

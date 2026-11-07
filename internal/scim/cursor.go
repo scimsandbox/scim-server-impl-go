@@ -28,9 +28,6 @@ var (
 	cursorSecretMu  sync.RWMutex
 	cursorSecretKey = func() []byte {
 		secret := os.Getenv("GO_CURSOR_SECRET")
-		if secret == "" {
-			secret = os.Getenv("SCIM_CURSOR_SECRET")
-		}
 		if secret != "" {
 			sum := sha256.Sum256([]byte(secret))
 			return sum[:]

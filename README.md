@@ -96,7 +96,10 @@ service:
 export GO_DATASOURCE_URL=jdbc:postgresql://localhost:5432/scimplayground
 export GO_DATASOURCE_USERNAME=scim_playground
 export GO_DATASOURCE_PASSWORD=scim_playground
+export GO_CURSOR_SECRET=local-dev-cursor-secret-change-me
 ```
+
+> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long.
 
 Start the service from the repository root:
 
@@ -187,6 +190,8 @@ directory.
 Useful environment overrides:
 
 - `GO_SERVER_PORT`
+- `GO_SERVER_BASE_URL`
+- `GO_CURSOR_SECRET`
 - `GO_MANAGEMENT_PORT`
 - `GO_DATASOURCE_URL`
 - `GO_DATASOURCE_USERNAME`

@@ -2,8 +2,6 @@ package app
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,13 +32,15 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	if err != nil {
 		return err
 	}
-	if cfg.Server.CursorSecret != "" {
-		scim.SetCursorSecret(cfg.Server.CursorSecret)
-	}
 
 	logger := setupLogger(cfg, stderr)
 	localizer := setupLocalizer(cfg)
 	defer logger.Flush()
+
+	if err := ensureCursorSecret(cfg, lookupEnv); err != nil {
+		logger.Error("failed to initialize cursor secret", logging.Error(err))
+		return err
+	}
 
 	// Database — use existing pool-based approach (kept for backward compatibility
 	// with existing repositories that take *pgxpool.Pool)
@@ -57,19 +57,6 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	if val := os.Getenv("SERVER_PORT"); val != "" {
 		if p, err := strconv.Atoi(val); err == nil {
 			cfg.Server.Port = p
-			hasExplicitBaseURL := false
-			if lookupEnv != nil {
-				if v, ok := lookupEnv("GO_SERVER_BASE_URL"); ok && strings.TrimSpace(v) != "" {
-					hasExplicitBaseURL = true
-				}
-			}
-			if !hasExplicitBaseURL && strings.TrimSpace(os.Getenv("GO_SERVER_BASE_URL")) != "" {
-				hasExplicitBaseURL = true
-			}
-			if !hasExplicitBaseURL && (cfg.Server.BaseURL == "" || cfg.Server.BaseURL == "http://localhost:8080") {
-				cfg.Server.BaseURL = ""
-				cfg.Server.BaseURL = serverBaseURL(cfg)
-			}
 		}
 	}
 
@@ -89,11 +76,6 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 		return err
 	}
 	defer jdbc.Close()
-
-	if err := ensureCursorSecret(context.Background(), cfg, lookupEnv); err != nil {
-		logger.Error("failed to initialize cursor secret", logging.Error(err))
-		return err
-	}
 
 	logger.Info(localizer.Text(messages.KeyConfigurationLoaded),
 		logging.String("dsn", resolveDSN(printableConfig(cfg))),
@@ -295,6 +277,11 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 
 	// Async event cleanup scheduler
 	asyncEventsEnabled := cfg.Cleanup.Enabled && (cfg.Cleanup.AsyncEvents.Enabled != nil && *cfg.Cleanup.AsyncEvents.Enabled)
+	if asyncEventsEnabled && cfg.Server.BaseURL == "" {
+		logger.Warn("server.base_url (GO_SERVER_BASE_URL) is not configured; reaped async event tokens will use fallback localhost URL",
+			logging.String("fallback_base_url", serverBaseURL(cfg)),
+		)
+	}
 	asyncEventCleanupService := service.NewAsyncEventCleanupService(
 		asyncEventRepo,
 		logger,
@@ -394,55 +381,22 @@ func shutdownServers(ctx context.Context, servers ...*http.Server) error {
 	return shutdownError
 }
 
-func ensureCursorSecret(ctx context.Context, cfg Config, lookupEnv LookupEnvFunc) error {
+func ensureCursorSecret(cfg Config, lookupEnv LookupEnvFunc) error {
 	secret := strings.TrimSpace(cfg.Server.CursorSecret)
 	if secret == "" && lookupEnv != nil {
-		if v, ok := lookupEnv("SCIM_CURSOR_SECRET"); ok {
+		if v, ok := lookupEnv("GO_CURSOR_SECRET"); ok {
 			secret = strings.TrimSpace(v)
 		}
 	}
 	if secret == "" {
-		secret = strings.TrimSpace(os.Getenv("SCIM_CURSOR_SECRET"))
+		secret = strings.TrimSpace(os.Getenv("GO_CURSOR_SECRET"))
 	}
-	if secret != "" {
-		scim.SetCursorSecret(secret)
-		return nil
+	if secret == "" {
+		return fmt.Errorf("cursor secret is not configured: set GO_CURSOR_SECRET (or server.cursor_secret)")
 	}
-
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return fmt.Errorf("generate cursor secret: %w", err)
+	if len(secret) < minCursorSecretLength {
+		return fmt.Errorf("cursor secret is too short: must be at least %d characters long", minCursorSecretLength)
 	}
-	candidate := hex.EncodeToString(raw)
-
-	const createTableSQL = `
-CREATE TABLE IF NOT EXISTS scim_system_secrets (
-    secret_key VARCHAR(64) PRIMARY KEY,
-    secret_value TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-)`
-	if _, err := jdbc.ExecContext(ctx, createTableSQL); err != nil {
-		return fmt.Errorf("create scim_system_secrets table: %w", err)
-	}
-
-	const insertSQL = `
-INSERT INTO scim_system_secrets (secret_key, secret_value)
-VALUES ('cursor_hmac_secret', $1)
-ON CONFLICT (secret_key) DO NOTHING`
-	if _, err := jdbc.ExecContext(ctx, insertSQL, candidate); err != nil {
-		return fmt.Errorf("insert cursor secret: %w", err)
-	}
-
-	var stored string
-	if err := jdbc.QueryRowContext(ctx,
-		`SELECT secret_value FROM scim_system_secrets WHERE secret_key = 'cursor_hmac_secret'`,
-	).Scan(&stored); err != nil {
-		return fmt.Errorf("load cursor secret: %w", err)
-	}
-	if strings.TrimSpace(stored) == "" {
-		return fmt.Errorf("empty cursor secret in scim_system_secrets")
-	}
-
-	scim.SetCursorSecret(stored)
+	scim.SetCursorSecret(secret)
 	return nil
 }

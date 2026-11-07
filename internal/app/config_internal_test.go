@@ -305,8 +305,24 @@ func TestServerBaseURLAndEnsureCursorSecret(t *testing.T) {
 	t.Run("serverBaseURL defaults and overrides", func(t *testing.T) {
 		cfg := Config{Server: ServerConfig{Port: 8181}}
 		applyConfigDefaults(&cfg)
+		if cfg.Server.BaseURL != "" {
+			t.Fatalf("cfg.Server.BaseURL = %q, want empty string when not configured", cfg.Server.BaseURL)
+		}
 		if got := serverBaseURL(cfg); got != "http://localhost:8181" {
 			t.Fatalf("serverBaseURL() = %q, want http://localhost:8181", got)
+		}
+		// Simulate SERVER_PORT override when BaseURL was not explicitly configured
+		cfg.Server.Port = 9000
+		if got := serverBaseURL(cfg); got != "http://localhost:9000" {
+			t.Fatalf("serverBaseURL() after port override = %q, want http://localhost:9000", got)
+		}
+
+		// Explicit BaseURL set to http://localhost:8080 is preserved even if port changes
+		cfgExplicitLocal := Config{Server: ServerConfig{Port: 8080, BaseURL: "http://localhost:8080"}}
+		applyConfigDefaults(&cfgExplicitLocal)
+		cfgExplicitLocal.Server.Port = 9000
+		if got := serverBaseURL(cfgExplicitLocal); got != "http://localhost:8080" {
+			t.Fatalf("serverBaseURL() with explicit localhost:8080 = %q, want http://localhost:8080", got)
 		}
 
 		cfgCustom := Config{Server: ServerConfig{Port: 8080, BaseURL: "https://scim.example.com/"}}
@@ -323,14 +339,14 @@ func TestServerBaseURLAndEnsureCursorSecret(t *testing.T) {
 
 	t.Run("ensureCursorSecret uses configured secret without DB", func(t *testing.T) {
 		cfg := Config{Server: ServerConfig{CursorSecret: "configured-secret-123"}}
-		if err := ensureCursorSecret(nil, cfg, nil); err != nil {
+		if err := ensureCursorSecret(cfg, nil); err != nil {
 			t.Fatalf("ensureCursorSecret() error = %v", err)
 		}
 	})
 
 	t.Run("ensureCursorSecret uses SCIM_CURSOR_SECRET from lookupEnv without DB", func(t *testing.T) {
 		cfg := Config{}
-		err := ensureCursorSecret(nil, cfg, func(k string) (string, bool) {
+		err := ensureCursorSecret(cfg, func(k string) (string, bool) {
 			if k == "SCIM_CURSOR_SECRET" {
 				return "env-secret-456", true
 			}
@@ -338,6 +354,18 @@ func TestServerBaseURLAndEnsureCursorSecret(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("ensureCursorSecret() error = %v", err)
+		}
+	})
+
+	t.Run("ensureCursorSecret returns error when no secret is configured", func(t *testing.T) {
+		t.Setenv("SCIM_CURSOR_SECRET", "")
+		cfg := Config{}
+		err := ensureCursorSecret(cfg, func(string) (string, bool) { return "", false })
+		if err == nil {
+			t.Fatal("expected ensureCursorSecret error when no cursor secret is configured")
+		}
+		if !strings.Contains(err.Error(), "GO_CURSOR_SECRET") {
+			t.Fatalf("ensureCursorSecret() error = %q, want mention of GO_CURSOR_SECRET", err.Error())
 		}
 	})
 }

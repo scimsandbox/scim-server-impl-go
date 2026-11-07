@@ -60,11 +60,7 @@ func printableConfig(cfg Config) Config {
 }
 
 func applyConfigDefaults(cfg *Config) {
-	if strings.TrimSpace(cfg.Server.BaseURL) == "" {
-		cfg.Server.BaseURL = serverBaseURL(*cfg)
-	} else {
-		cfg.Server.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.Server.BaseURL), "/")
-	}
+	cfg.Server.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.Server.BaseURL), "/")
 	if cfg.Cleanup.RequestLogs.Enabled == nil {
 		defaultEnabled := true
 		cfg.Cleanup.RequestLogs.Enabled = &defaultEnabled

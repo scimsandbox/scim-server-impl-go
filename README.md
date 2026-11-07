@@ -96,6 +96,7 @@ service:
 export GO_DATASOURCE_URL=jdbc:postgresql://localhost:5432/scimplayground
 export GO_DATASOURCE_USERNAME=scim_playground
 export GO_DATASOURCE_PASSWORD=scim_playground
+export GO_CURSOR_SECRET=<your-secret>
 ```
 
 Start the service from the repository root:
@@ -187,6 +188,8 @@ directory.
 Useful environment overrides:
 
 - `GO_SERVER_PORT`
+- `GO_SERVER_BASE_URL`
+- `GO_CURSOR_SECRET`
 - `GO_MANAGEMENT_PORT`
 - `GO_DATASOURCE_URL`
 - `GO_DATASOURCE_USERNAME`

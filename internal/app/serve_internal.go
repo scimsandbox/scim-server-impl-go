@@ -384,15 +384,15 @@ func shutdownServers(ctx context.Context, servers ...*http.Server) error {
 func ensureCursorSecret(cfg Config, lookupEnv LookupEnvFunc) error {
 	secret := strings.TrimSpace(cfg.Server.CursorSecret)
 	if secret == "" && lookupEnv != nil {
-		if v, ok := lookupEnv("SCIM_CURSOR_SECRET"); ok {
+		if v, ok := lookupEnv("GO_CURSOR_SECRET"); ok {
 			secret = strings.TrimSpace(v)
 		}
 	}
 	if secret == "" {
-		secret = strings.TrimSpace(os.Getenv("SCIM_CURSOR_SECRET"))
+		secret = strings.TrimSpace(os.Getenv("GO_CURSOR_SECRET"))
 	}
 	if secret == "" {
-		return fmt.Errorf("cursor secret is not configured: set GO_CURSOR_SECRET (or SCIM_CURSOR_SECRET / server.cursor_secret)")
+		return fmt.Errorf("cursor secret is not configured: set GO_CURSOR_SECRET (or server.cursor_secret)")
 	}
 	if len(secret) < minCursorSecretLength {
 		return fmt.Errorf("cursor secret is too short: must be at least %d characters long", minCursorSecretLength)

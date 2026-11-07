@@ -99,7 +99,7 @@ export GO_DATASOURCE_PASSWORD=scim_playground
 export GO_CURSOR_SECRET=local-dev-cursor-secret-change-me
 ```
 
-> `GO_CURSOR_SECRET` (or `SCIM_CURSOR_SECRET` / `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long.
+> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long.
 
 Start the service from the repository root:
 

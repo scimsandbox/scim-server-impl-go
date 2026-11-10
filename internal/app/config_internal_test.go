@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bytes"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,6 +220,20 @@ func TestResolveDSN(t *testing.T) {
 			}},
 			want: "postgres://host:5432/db?sslmode=disable",
 		},
+		{
+			name: "plain postgresql:// scheme normalized",
+			cfg:  Config{Storage: StorageConfig{DSN: "postgresql://host:5432/db"}},
+			want: "postgres://host:5432/db?sslmode=disable",
+		},
+		{
+			name: "reserved characters in username and password are percent-encoded",
+			cfg: Config{Storage: StorageConfig{
+				DSN:      "postgres://host:5432/db",
+				Username: "alice@example.com",
+				Password: "p@ss:w/rd%1",
+			}},
+			want: "postgres://alice%40example.com:p%40ss%3Aw%2Frd%251@host:5432/db?sslmode=disable",
+		},
 	}
 
 	for _, tc := range tests {
@@ -226,6 +242,148 @@ func TestResolveDSN(t *testing.T) {
 			got := resolveDSN(tc.cfg)
 			if got != tc.want {
 				t.Fatalf("resolveDSN() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRedactDSN(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		rawDSN          string
+		username        string
+		wantExact       string
+		wantScheme      string
+		wantHost        string
+		wantUser        string
+		wantSSLMode     string
+		forbiddenValues []string
+	}{
+		{
+			name:        "jdbc URL with configured username masks credentials",
+			rawDSN:      "jdbc:postgresql://localhost:5432/scimplayground",
+			username:    "scim_playground",
+			wantScheme:  "postgres",
+			wantHost:    "localhost:5432",
+			wantUser:    "scim_playground",
+			wantSSLMode: "disable",
+		},
+		{
+			name:      "plain postgres URL without credentials",
+			rawDSN:    "postgres://host:5432/db",
+			username:  "",
+			wantExact: "postgres://host:5432/db?sslmode=disable",
+		},
+		{
+			name:            "plain postgresql:// URL normalizes scheme and redacts inline secret",
+			rawDSN:          "postgresql://bob:topsecret@host:5432/db",
+			username:        "",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "bob",
+			wantSSLMode:     "disable",
+			forbiddenValues: []string{"topsecret"},
+		},
+		{
+			name:            "inline password in DSN redacted when username empty",
+			rawDSN:          "postgres://bob:supersecret@host:5432/db?sslmode=require",
+			username:        "",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "bob",
+			wantSSLMode:     "require",
+			forbiddenValues: []string{"supersecret"},
+		},
+		{
+			name:            "inline password in DSN stripped when username overridden",
+			rawDSN:          "postgres://bob:supersecret@host:5432/db",
+			username:        "alice",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "alice",
+			wantSSLMode:     "disable",
+			forbiddenValues: []string{"supersecret", "bob"},
+		},
+		{
+			name:        "configured username with reserved characters remains valid URL",
+			rawDSN:      "postgres://host:5432/db",
+			username:    "alice@example.com",
+			wantScheme:  "postgres",
+			wantHost:    "host:5432",
+			wantUser:    "alice@example.com",
+			wantSSLMode: "disable",
+		},
+		{
+			name:            "query parameter password redacted without configured username",
+			rawDSN:          "postgres://host:5432/db?password=mysecret&sslmode=require",
+			username:        "",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantSSLMode:     "require",
+			forbiddenValues: []string{"mysecret"},
+		},
+		{
+			name:            "query parameter password redacted with configured username",
+			rawDSN:          "postgres://host:5432/db?password=mysecret&connect_timeout=5",
+			username:        "alice@example.com",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "alice@example.com",
+			wantSSLMode:     "disable",
+			forbiddenValues: []string{"mysecret"},
+		},
+		{
+			name:            "key-value DSN redacted completely",
+			rawDSN:          "host=localhost user=postgres password=mysecret dbname=db",
+			username:        "",
+			wantExact:       "[REDACTED]",
+			forbiddenValues: []string{"mysecret"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := redactDSN(tc.rawDSN, tc.username)
+			for _, secret := range tc.forbiddenValues {
+				if strings.Contains(got, secret) {
+					t.Fatalf("redactDSN(%q, %q) = %q, leaked forbidden value %q", tc.rawDSN, tc.username, got, secret)
+				}
+			}
+			if tc.wantExact != "" {
+				if got != tc.wantExact {
+					t.Fatalf("redactDSN(%q, %q) = %q, want %q", tc.rawDSN, tc.username, got, tc.wantExact)
+				}
+				return
+			}
+			parsed, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("redactDSN(%q, %q) = %q, produced invalid URL: %v", tc.rawDSN, tc.username, got, err)
+			}
+			if parsed.Scheme != tc.wantScheme {
+				t.Fatalf("scheme = %q, want %q (got %q)", parsed.Scheme, tc.wantScheme, got)
+			}
+			if parsed.Host != tc.wantHost {
+				t.Fatalf("host = %q, want %q (got %q)", parsed.Host, tc.wantHost, got)
+			}
+			if tc.wantUser != "" {
+				if parsed.User == nil || parsed.User.Username() != tc.wantUser {
+					var gotUser string
+					if parsed.User != nil {
+						gotUser = parsed.User.Username()
+					}
+					t.Fatalf("username = %q, want %q (got %q)", gotUser, tc.wantUser, got)
+				}
+				if _, hasPass := parsed.User.Password(); !hasPass {
+					t.Fatalf("expected masked password placeholder in userinfo of %q", got)
+				}
+			}
+			if tc.wantSSLMode != "" {
+				if gotSSL := parsed.Query().Get("sslmode"); gotSSL != tc.wantSSLMode {
+					t.Fatalf("sslmode = %q, want %q (got %q)", gotSSL, tc.wantSSLMode, got)
+				}
 			}
 		})
 	}
@@ -297,6 +455,119 @@ func TestPrintableConfig(t *testing.T) {
 		}
 		if cfg.Server.CursorSecret != "top-secret-hmac-key" {
 			t.Fatalf("original config CursorSecret mutated to %q", cfg.Server.CursorSecret)
+		}
+	})
+
+	t.Run("preserves jdbc DSN shape when no inline credentials are present", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{Storage: StorageConfig{DSN: "jdbc:postgresql://localhost:5432/scimplayground", Username: "scim_playground", Password: "pw"}}
+		result := printableConfig(cfg)
+		if result.Storage.DSN != cfg.Storage.DSN {
+			t.Fatalf("printableConfig() DSN = %q, want %q", result.Storage.DSN, cfg.Storage.DSN)
+		}
+	})
+
+	t.Run("masks inline and query-string DSN credentials without normalizing DSN shape", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name        string
+			dsn         string
+			wantPrefix  string
+			forbidden   []string
+			wantLiteral string
+		}{
+			{
+				name:       "inline password in postgres URL",
+				dsn:        "postgres://bob:supersecret@host:5432/db",
+				wantPrefix: "postgres://bob:",
+				forbidden:  []string{"supersecret", "sslmode="},
+			},
+			{
+				name:       "inline password in jdbc URL preserves jdbc prefix",
+				dsn:        "jdbc:postgresql://bob:supersecret@host:5432/db",
+				wantPrefix: "jdbc:postgresql://bob:",
+				forbidden:  []string{"supersecret", "sslmode="},
+			},
+			{
+				name:       "query parameter password in DSN",
+				dsn:        "postgres://host:5432/db?password=querysecret&connect_timeout=5",
+				wantPrefix: "postgres://host:5432/db?",
+				forbidden:  []string{"querysecret", "sslmode="},
+			},
+			{
+				name:        "key-value DSN redacted completely",
+				dsn:         "host=localhost user=postgres password=kvsecret dbname=db",
+				forbidden:   []string{"kvsecret"},
+				wantLiteral: "[REDACTED]",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				cfg := Config{Storage: StorageConfig{DSN: tc.dsn}}
+				result := printableConfig(cfg)
+				for _, secret := range tc.forbidden {
+					if strings.Contains(result.Storage.DSN, secret) {
+						t.Fatalf("printableConfig() DSN = %q, leaked or injected %q", result.Storage.DSN, secret)
+					}
+				}
+				if tc.wantLiteral != "" && result.Storage.DSN != tc.wantLiteral {
+					t.Fatalf("printableConfig() DSN = %q, want %q", result.Storage.DSN, tc.wantLiteral)
+				}
+				if tc.wantPrefix != "" && !strings.HasPrefix(result.Storage.DSN, tc.wantPrefix) {
+					t.Fatalf("printableConfig() DSN = %q, want prefix %q", result.Storage.DSN, tc.wantPrefix)
+				}
+				if cfg.Storage.DSN != tc.dsn {
+					t.Fatalf("original config DSN mutated to %q", cfg.Storage.DSN)
+				}
+			})
+		}
+	})
+
+	t.Run("printConfig redacts inline and query secrets from printed JSON", func(t *testing.T) {
+		configDir := t.TempDir()
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		yamlBody := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"storage:",
+			"  dsn: \"jdbc:postgresql://localhost:5432/scimplayground\"",
+			"  username: \"scim_playground\"",
+			"  password: \"yaml-db-secret\"",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlBody), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		var out bytes.Buffer
+		err := printConfig(&out, func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_DATASOURCE_URL":
+				return "postgres://bob:supersecret@host:5432/db?password=querysecret", true
+			case "GO_CURSOR_SECRET":
+				return "local-dev-cursor-secret-change-me-1234", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("printConfig() error = %v", err)
+		}
+
+		rendered := out.String()
+		for _, secret := range []string{"supersecret", "querysecret", "yaml-db-secret", "local-dev-cursor-secret-change-me-1234"} {
+			if strings.Contains(rendered, secret) {
+				t.Fatalf("printConfig() output leaked %q:\n%s", secret, rendered)
+			}
+		}
+		if !strings.Contains(rendered, `"Password": "***"`) {
+			t.Fatalf("printConfig() output missing masked Password:\n%s", rendered)
+		}
+		if !strings.Contains(rendered, `"CursorSecret": "***"`) {
+			t.Fatalf("printConfig() output missing masked CursorSecret:\n%s", rendered)
 		}
 	})
 }
@@ -598,4 +869,3 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 		}
 	})
 }
-

@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/scimsandbox/scim-server-impl-go/internal/service"
@@ -10,16 +11,14 @@ import (
 const (
 	defaultManagementPort = 9090
 	minCursorSecretLength = 32
+	pgScheme              = "postgres://"
 )
 
-func resolveDSN(cfg Config) string {
-	dsn := cfg.Storage.DSN
+func normalizeDSN(rawDSN string) string {
 	// Convert JDBC URL to pgx-compatible format
-	dsn = strings.TrimPrefix(dsn, "jdbc:")
-	const newConst = "postgres://"
-	dsn = strings.Replace(dsn, "postgresql://", newConst, 1)
-	if cfg.Storage.Username != "" {
-		dsn = strings.Replace(dsn, newConst, newConst+cfg.Storage.Username+":"+cfg.Storage.Password+"@", 1)
+	dsn := strings.TrimPrefix(rawDSN, "jdbc:")
+	if strings.HasPrefix(dsn, "postgresql://") {
+		dsn = pgScheme + strings.TrimPrefix(dsn, "postgresql://")
 	}
 	if !strings.Contains(dsn, "sslmode=") {
 		if strings.Contains(dsn, "?") {
@@ -29,6 +28,79 @@ func resolveDSN(cfg Config) string {
 		}
 	}
 	return dsn
+}
+
+func resolveDSN(cfg Config) string {
+	dsn := normalizeDSN(cfg.Storage.DSN)
+	if cfg.Storage.Username != "" {
+		if parsed, err := url.Parse(dsn); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+			parsed.User = url.UserPassword(cfg.Storage.Username, cfg.Storage.Password)
+			return parsed.String()
+		}
+		encoded := url.UserPassword(cfg.Storage.Username, cfg.Storage.Password).String()
+		dsn = strings.Replace(dsn, pgScheme, pgScheme+encoded+"@", 1)
+	}
+	return dsn
+}
+
+func redactSensitiveQuery(parsed *url.URL) bool {
+	if parsed.RawQuery == "" {
+		return true
+	}
+	q, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return false
+	}
+	modified := false
+	for k := range q {
+		lower := strings.ToLower(k)
+		if strings.Contains(lower, "pass") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "key") {
+			q.Set(k, "***")
+			modified = true
+		}
+	}
+	if modified {
+		parsed.RawQuery = q.Encode()
+	}
+	return true
+}
+
+func maskDSN(rawDSN string) string {
+	if rawDSN == "" {
+		return ""
+	}
+	prefix := ""
+	dsn := rawDSN
+	if strings.HasPrefix(dsn, "jdbc:") {
+		prefix = "jdbc:"
+		dsn = strings.TrimPrefix(dsn, "jdbc:")
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[REDACTED]"
+	}
+	if !redactSensitiveQuery(parsed) {
+		return "[REDACTED]"
+	}
+	return prefix + parsed.Redacted()
+}
+
+func redactDSN(rawDSN, username string) string {
+	dsn := normalizeDSN(rawDSN)
+	parsed, err := url.Parse(dsn)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[REDACTED]"
+	}
+	if !redactSensitiveQuery(parsed) {
+		return "[REDACTED]"
+	}
+	if username != "" {
+		encodedUser := url.User(username).String()
+		parsed.User = nil
+		schemePrefix := parsed.Scheme + "://"
+		return strings.Replace(parsed.String(), schemePrefix, schemePrefix+encodedUser+":***@", 1)
+	}
+	return parsed.Redacted()
 }
 
 func managementPort(cfg Config) int {
@@ -51,6 +123,9 @@ func serverBaseURL(cfg Config) string {
 
 func printableConfig(cfg Config) Config {
 	masked := cfg
+	if masked.Storage.DSN != "" {
+		masked.Storage.DSN = maskDSN(masked.Storage.DSN)
+	}
 	if masked.Storage.Password != "" {
 		masked.Storage.Password = "***"
 	}

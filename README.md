@@ -37,8 +37,8 @@ The server binary supports three commands:
 
 - `serve` starts the API and management listeners. This is the default.
 - `healthcheck` calls `http://127.0.0.1:<management-port>/actuator/health`.
-- `print-config` prints the merged runtime configuration with the database
-  password masked.
+- `print-config` prints the merged runtime configuration with database
+  credentials and secrets masked.
 
 Examples:
 
@@ -79,7 +79,7 @@ These management endpoints are not authenticated.
 
 Prerequisites:
 
-- Go 1.25
+- Go 1.26
 - PostgreSQL if you want to point the app at a local database
 - Docker if you want to build the image or run container-backed tests
 
@@ -99,7 +99,7 @@ export GO_DATASOURCE_PASSWORD=scim_playground
 export GO_CURSOR_SECRET=local-dev-cursor-secret-change-me
 ```
 
-> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long.
+> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long. `GO_DATASOURCE_USERNAME` and `GO_DATASOURCE_PASSWORD` accept literal plaintext values and are URL-encoded automatically when injected into the DSN.
 
 Start the service from the repository root:
 
@@ -256,7 +256,6 @@ Container-backed validation runs with the normal test set. Common examples:
 ```bash
 go test ./internal/handler -run TestCreateAndGetUser -count=1
 go test ./internal/integration -run TestGroupMembershipTransaction -count=1
-go test ./internal/integration -run TestGroupMembershipTransactionDockertest -count=1
 go test ./internal/integration -run TestGroupMembershipTransactionDockerCLI -count=1
 ```
 

@@ -231,6 +231,64 @@ func TestResolveDSN(t *testing.T) {
 	}
 }
 
+func TestRedactDSN(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		rawDSN   string
+		username string
+		want     string
+	}{
+		{
+			name:     "jdbc URL with configured username masks credentials",
+			rawDSN:   "jdbc:postgresql://localhost:5432/scimplayground",
+			username: "scim_playground",
+			want:     "postgres://scim_playground:***@localhost:5432/scimplayground?sslmode=disable",
+		},
+		{
+			name:     "plain postgres URL without credentials",
+			rawDSN:   "postgres://host:5432/db",
+			username: "",
+			want:     "postgres://host:5432/db?sslmode=disable",
+		},
+		{
+			name:     "inline password in DSN redacted when username empty",
+			rawDSN:   "postgres://bob:supersecret@host:5432/db?sslmode=require",
+			username: "",
+			want:     "postgres://bob:xxxxx@host:5432/db?sslmode=require",
+		},
+		{
+			name:     "inline password in DSN stripped when username overridden",
+			rawDSN:   "postgres://bob:supersecret@host:5432/db",
+			username: "alice",
+			want:     "postgres://alice:***@host:5432/db?sslmode=disable",
+		},
+		{
+			name:     "query parameter password redacted",
+			rawDSN:   "postgres://host:5432/db?password=mysecret&sslmode=require",
+			username: "",
+			want:     "postgres://host:5432/db?password=%2A%2A%2A&sslmode=require",
+		},
+		{
+			name:     "key-value DSN redacted completely",
+			rawDSN:   "host=localhost user=postgres password=mysecret dbname=db",
+			username: "",
+			want:     "[REDACTED]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := redactDSN(tc.rawDSN, tc.username)
+			if got != tc.want {
+				t.Fatalf("redactDSN(%q, %q) = %q, want %q", tc.rawDSN, tc.username, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestManagementPort(t *testing.T) {
 	t.Parallel()
 
@@ -598,4 +656,3 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 		}
 	})
 }
-

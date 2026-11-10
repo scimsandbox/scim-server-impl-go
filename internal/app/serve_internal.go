@@ -61,7 +61,6 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	}
 
 	dsn := resolveDSN(cfg)
-	fmt.Printf("DEBUG: Resolved DSN=%q\n", dsn)
 
 	err = jdbc.Init(context.Background(), jdbc.Config{
 		DSN:               dsn,
@@ -78,7 +77,7 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	defer jdbc.Close()
 
 	logger.Info(localizer.Text(messages.KeyConfigurationLoaded),
-		logging.String("dsn", resolveDSN(printableConfig(cfg))),
+		logging.String("dsn", redactDSN(cfg.Storage.DSN, cfg.Storage.Username)),
 		logging.Int("port", cfg.Server.Port),
 		logging.Int("management_port", managementPort(cfg)),
 	)

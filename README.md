@@ -79,7 +79,7 @@ These management endpoints are not authenticated.
 
 Prerequisites:
 
-- Go 1.25
+- Go 1.26
 - PostgreSQL if you want to point the app at a local database
 - Docker if you want to build the image or run container-backed tests
 

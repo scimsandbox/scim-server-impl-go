@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/scimsandbox/scim-server-impl-go/internal/service"
@@ -29,6 +30,46 @@ func resolveDSN(cfg Config) string {
 		}
 	}
 	return dsn
+}
+
+func redactDSN(rawDSN, username string) string {
+	dsn := strings.TrimPrefix(rawDSN, "jdbc:")
+	const pgScheme = "postgres://"
+	dsn = strings.Replace(dsn, "postgresql://", pgScheme, 1)
+	if !strings.Contains(dsn, "sslmode=") {
+		if strings.Contains(dsn, "?") {
+			dsn += "&sslmode=disable"
+		} else {
+			dsn += "?sslmode=disable"
+		}
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[REDACTED]"
+	}
+	if parsed.RawQuery != "" {
+		q, qErr := url.ParseQuery(parsed.RawQuery)
+		if qErr != nil {
+			return "[REDACTED]"
+		}
+		modified := false
+		for k := range q {
+			lower := strings.ToLower(k)
+			if strings.Contains(lower, "pass") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "key") {
+				q.Set(k, "***")
+				modified = true
+			}
+		}
+		if modified {
+			parsed.RawQuery = q.Encode()
+		}
+	}
+	if username != "" {
+		encodedUser := url.User(username).String()
+		parsed.User = nil
+		return strings.Replace(parsed.String(), pgScheme, pgScheme+encodedUser+":***@", 1)
+	}
+	return parsed.Redacted()
 }
 
 func managementPort(cfg Config) int {

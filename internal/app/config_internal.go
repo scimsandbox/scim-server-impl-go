@@ -43,28 +43,56 @@ func resolveDSN(cfg Config) string {
 	return dsn
 }
 
+func redactSensitiveQuery(parsed *url.URL) bool {
+	if parsed.RawQuery == "" {
+		return true
+	}
+	q, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return false
+	}
+	modified := false
+	for k := range q {
+		lower := strings.ToLower(k)
+		if strings.Contains(lower, "pass") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "key") {
+			q.Set(k, "***")
+			modified = true
+		}
+	}
+	if modified {
+		parsed.RawQuery = q.Encode()
+	}
+	return true
+}
+
+func maskDSN(rawDSN string) string {
+	if rawDSN == "" {
+		return ""
+	}
+	prefix := ""
+	dsn := rawDSN
+	if strings.HasPrefix(dsn, "jdbc:") {
+		prefix = "jdbc:"
+		dsn = strings.TrimPrefix(dsn, "jdbc:")
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[REDACTED]"
+	}
+	if !redactSensitiveQuery(parsed) {
+		return "[REDACTED]"
+	}
+	return prefix + parsed.Redacted()
+}
+
 func redactDSN(rawDSN, username string) string {
 	dsn := normalizeDSN(rawDSN)
 	parsed, err := url.Parse(dsn)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "[REDACTED]"
 	}
-	if parsed.RawQuery != "" {
-		q, qErr := url.ParseQuery(parsed.RawQuery)
-		if qErr != nil {
-			return "[REDACTED]"
-		}
-		modified := false
-		for k := range q {
-			lower := strings.ToLower(k)
-			if strings.Contains(lower, "pass") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "key") {
-				q.Set(k, "***")
-				modified = true
-			}
-		}
-		if modified {
-			parsed.RawQuery = q.Encode()
-		}
+	if !redactSensitiveQuery(parsed) {
+		return "[REDACTED]"
 	}
 	if username != "" {
 		encodedUser := url.User(username).String()
@@ -95,6 +123,9 @@ func serverBaseURL(cfg Config) string {
 
 func printableConfig(cfg Config) Config {
 	masked := cfg
+	if masked.Storage.DSN != "" {
+		masked.Storage.DSN = maskDSN(masked.Storage.DSN)
+	}
 	if masked.Storage.Password != "" {
 		masked.Storage.Password = "***"
 	}

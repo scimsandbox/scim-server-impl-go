@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -454,6 +455,119 @@ func TestPrintableConfig(t *testing.T) {
 		}
 		if cfg.Server.CursorSecret != "top-secret-hmac-key" {
 			t.Fatalf("original config CursorSecret mutated to %q", cfg.Server.CursorSecret)
+		}
+	})
+
+	t.Run("preserves jdbc DSN shape when no inline credentials are present", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{Storage: StorageConfig{DSN: "jdbc:postgresql://localhost:5432/scimplayground", Username: "scim_playground", Password: "pw"}}
+		result := printableConfig(cfg)
+		if result.Storage.DSN != cfg.Storage.DSN {
+			t.Fatalf("printableConfig() DSN = %q, want %q", result.Storage.DSN, cfg.Storage.DSN)
+		}
+	})
+
+	t.Run("masks inline and query-string DSN credentials without normalizing DSN shape", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name        string
+			dsn         string
+			wantPrefix  string
+			forbidden   []string
+			wantLiteral string
+		}{
+			{
+				name:       "inline password in postgres URL",
+				dsn:        "postgres://bob:supersecret@host:5432/db",
+				wantPrefix: "postgres://bob:",
+				forbidden:  []string{"supersecret", "sslmode="},
+			},
+			{
+				name:       "inline password in jdbc URL preserves jdbc prefix",
+				dsn:        "jdbc:postgresql://bob:supersecret@host:5432/db",
+				wantPrefix: "jdbc:postgresql://bob:",
+				forbidden:  []string{"supersecret", "sslmode="},
+			},
+			{
+				name:       "query parameter password in DSN",
+				dsn:        "postgres://host:5432/db?password=querysecret&connect_timeout=5",
+				wantPrefix: "postgres://host:5432/db?",
+				forbidden:  []string{"querysecret", "sslmode="},
+			},
+			{
+				name:        "key-value DSN redacted completely",
+				dsn:         "host=localhost user=postgres password=kvsecret dbname=db",
+				forbidden:   []string{"kvsecret"},
+				wantLiteral: "[REDACTED]",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				cfg := Config{Storage: StorageConfig{DSN: tc.dsn}}
+				result := printableConfig(cfg)
+				for _, secret := range tc.forbidden {
+					if strings.Contains(result.Storage.DSN, secret) {
+						t.Fatalf("printableConfig() DSN = %q, leaked or injected %q", result.Storage.DSN, secret)
+					}
+				}
+				if tc.wantLiteral != "" && result.Storage.DSN != tc.wantLiteral {
+					t.Fatalf("printableConfig() DSN = %q, want %q", result.Storage.DSN, tc.wantLiteral)
+				}
+				if tc.wantPrefix != "" && !strings.HasPrefix(result.Storage.DSN, tc.wantPrefix) {
+					t.Fatalf("printableConfig() DSN = %q, want prefix %q", result.Storage.DSN, tc.wantPrefix)
+				}
+				if cfg.Storage.DSN != tc.dsn {
+					t.Fatalf("original config DSN mutated to %q", cfg.Storage.DSN)
+				}
+			})
+		}
+	})
+
+	t.Run("printConfig redacts inline and query secrets from printed JSON", func(t *testing.T) {
+		configDir := t.TempDir()
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		yamlBody := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"storage:",
+			"  dsn: \"jdbc:postgresql://localhost:5432/scimplayground\"",
+			"  username: \"scim_playground\"",
+			"  password: \"yaml-db-secret\"",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlBody), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		var out bytes.Buffer
+		err := printConfig(&out, func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_DATASOURCE_URL":
+				return "postgres://bob:supersecret@host:5432/db?password=querysecret", true
+			case "GO_CURSOR_SECRET":
+				return "local-dev-cursor-secret-change-me-1234", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("printConfig() error = %v", err)
+		}
+
+		rendered := out.String()
+		for _, secret := range []string{"supersecret", "querysecret", "yaml-db-secret", "local-dev-cursor-secret-change-me-1234"} {
+			if strings.Contains(rendered, secret) {
+				t.Fatalf("printConfig() output leaked %q:\n%s", secret, rendered)
+			}
+		}
+		if !strings.Contains(rendered, `"Password": "***"`) {
+			t.Fatalf("printConfig() output missing masked Password:\n%s", rendered)
+		}
+		if !strings.Contains(rendered, `"CursorSecret": "***"`) {
+			t.Fatalf("printConfig() output missing masked CursorSecret:\n%s", rendered)
 		}
 	})
 }

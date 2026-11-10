@@ -37,8 +37,8 @@ The server binary supports three commands:
 
 - `serve` starts the API and management listeners. This is the default.
 - `healthcheck` calls `http://127.0.0.1:<management-port>/actuator/health`.
-- `print-config` prints the merged runtime configuration with the database
-  password masked.
+- `print-config` prints the merged runtime configuration with database
+  credentials and secrets masked.
 
 Examples:
 
@@ -99,7 +99,7 @@ export GO_DATASOURCE_PASSWORD=scim_playground
 export GO_CURSOR_SECRET=local-dev-cursor-secret-change-me
 ```
 
-> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long.
+> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long. `GO_DATASOURCE_USERNAME` and `GO_DATASOURCE_PASSWORD` accept literal plaintext values and are URL-encoded automatically when injected into the DSN.
 
 Start the service from the repository root:
 

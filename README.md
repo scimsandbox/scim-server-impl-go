@@ -256,7 +256,6 @@ Container-backed validation runs with the normal test set. Common examples:
 ```bash
 go test ./internal/handler -run TestCreateAndGetUser -count=1
 go test ./internal/integration -run TestGroupMembershipTransaction -count=1
-go test ./internal/integration -run TestGroupMembershipTransactionDockertest -count=1
 go test ./internal/integration -run TestGroupMembershipTransactionDockerCLI -count=1
 ```
 

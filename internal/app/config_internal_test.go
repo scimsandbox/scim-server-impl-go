@@ -1,6 +1,7 @@
 package app
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,6 +219,20 @@ func TestResolveDSN(t *testing.T) {
 			}},
 			want: "postgres://host:5432/db?sslmode=disable",
 		},
+		{
+			name: "plain postgresql:// scheme normalized",
+			cfg:  Config{Storage: StorageConfig{DSN: "postgresql://host:5432/db"}},
+			want: "postgres://host:5432/db?sslmode=disable",
+		},
+		{
+			name: "reserved characters in username and password are percent-encoded",
+			cfg: Config{Storage: StorageConfig{
+				DSN:      "postgres://host:5432/db",
+				Username: "alice@example.com",
+				Password: "p@ss:w/rd%1",
+			}},
+			want: "postgres://alice%40example.com:p%40ss%3Aw%2Frd%251@host:5432/db?sslmode=disable",
+		},
 	}
 
 	for _, tc := range tests {
@@ -235,46 +250,95 @@ func TestRedactDSN(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		rawDSN   string
-		username string
-		want     string
+		name            string
+		rawDSN          string
+		username        string
+		wantExact       string
+		wantScheme      string
+		wantHost        string
+		wantUser        string
+		wantSSLMode     string
+		forbiddenValues []string
 	}{
 		{
-			name:     "jdbc URL with configured username masks credentials",
-			rawDSN:   "jdbc:postgresql://localhost:5432/scimplayground",
-			username: "scim_playground",
-			want:     "postgres://scim_playground:***@localhost:5432/scimplayground?sslmode=disable",
+			name:        "jdbc URL with configured username masks credentials",
+			rawDSN:      "jdbc:postgresql://localhost:5432/scimplayground",
+			username:    "scim_playground",
+			wantScheme:  "postgres",
+			wantHost:    "localhost:5432",
+			wantUser:    "scim_playground",
+			wantSSLMode: "disable",
 		},
 		{
-			name:     "plain postgres URL without credentials",
-			rawDSN:   "postgres://host:5432/db",
-			username: "",
-			want:     "postgres://host:5432/db?sslmode=disable",
+			name:      "plain postgres URL without credentials",
+			rawDSN:    "postgres://host:5432/db",
+			username:  "",
+			wantExact: "postgres://host:5432/db?sslmode=disable",
 		},
 		{
-			name:     "inline password in DSN redacted when username empty",
-			rawDSN:   "postgres://bob:supersecret@host:5432/db?sslmode=require",
-			username: "",
-			want:     "postgres://bob:xxxxx@host:5432/db?sslmode=require",
+			name:            "plain postgresql:// URL normalizes scheme and redacts inline secret",
+			rawDSN:          "postgresql://bob:topsecret@host:5432/db",
+			username:        "",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "bob",
+			wantSSLMode:     "disable",
+			forbiddenValues: []string{"topsecret"},
 		},
 		{
-			name:     "inline password in DSN stripped when username overridden",
-			rawDSN:   "postgres://bob:supersecret@host:5432/db",
-			username: "alice",
-			want:     "postgres://alice:***@host:5432/db?sslmode=disable",
+			name:            "inline password in DSN redacted when username empty",
+			rawDSN:          "postgres://bob:supersecret@host:5432/db?sslmode=require",
+			username:        "",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "bob",
+			wantSSLMode:     "require",
+			forbiddenValues: []string{"supersecret"},
 		},
 		{
-			name:     "query parameter password redacted",
-			rawDSN:   "postgres://host:5432/db?password=mysecret&sslmode=require",
-			username: "",
-			want:     "postgres://host:5432/db?password=%2A%2A%2A&sslmode=require",
+			name:            "inline password in DSN stripped when username overridden",
+			rawDSN:          "postgres://bob:supersecret@host:5432/db",
+			username:        "alice",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "alice",
+			wantSSLMode:     "disable",
+			forbiddenValues: []string{"supersecret", "bob"},
 		},
 		{
-			name:     "key-value DSN redacted completely",
-			rawDSN:   "host=localhost user=postgres password=mysecret dbname=db",
-			username: "",
-			want:     "[REDACTED]",
+			name:        "configured username with reserved characters remains valid URL",
+			rawDSN:      "postgres://host:5432/db",
+			username:    "alice@example.com",
+			wantScheme:  "postgres",
+			wantHost:    "host:5432",
+			wantUser:    "alice@example.com",
+			wantSSLMode: "disable",
+		},
+		{
+			name:            "query parameter password redacted without configured username",
+			rawDSN:          "postgres://host:5432/db?password=mysecret&sslmode=require",
+			username:        "",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantSSLMode:     "require",
+			forbiddenValues: []string{"mysecret"},
+		},
+		{
+			name:            "query parameter password redacted with configured username",
+			rawDSN:          "postgres://host:5432/db?password=mysecret&connect_timeout=5",
+			username:        "alice@example.com",
+			wantScheme:      "postgres",
+			wantHost:        "host:5432",
+			wantUser:        "alice@example.com",
+			wantSSLMode:     "disable",
+			forbiddenValues: []string{"mysecret"},
+		},
+		{
+			name:            "key-value DSN redacted completely",
+			rawDSN:          "host=localhost user=postgres password=mysecret dbname=db",
+			username:        "",
+			wantExact:       "[REDACTED]",
+			forbiddenValues: []string{"mysecret"},
 		},
 	}
 
@@ -282,8 +346,43 @@ func TestRedactDSN(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := redactDSN(tc.rawDSN, tc.username)
-			if got != tc.want {
-				t.Fatalf("redactDSN(%q, %q) = %q, want %q", tc.rawDSN, tc.username, got, tc.want)
+			for _, secret := range tc.forbiddenValues {
+				if strings.Contains(got, secret) {
+					t.Fatalf("redactDSN(%q, %q) = %q, leaked forbidden value %q", tc.rawDSN, tc.username, got, secret)
+				}
+			}
+			if tc.wantExact != "" {
+				if got != tc.wantExact {
+					t.Fatalf("redactDSN(%q, %q) = %q, want %q", tc.rawDSN, tc.username, got, tc.wantExact)
+				}
+				return
+			}
+			parsed, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("redactDSN(%q, %q) = %q, produced invalid URL: %v", tc.rawDSN, tc.username, got, err)
+			}
+			if parsed.Scheme != tc.wantScheme {
+				t.Fatalf("scheme = %q, want %q (got %q)", parsed.Scheme, tc.wantScheme, got)
+			}
+			if parsed.Host != tc.wantHost {
+				t.Fatalf("host = %q, want %q (got %q)", parsed.Host, tc.wantHost, got)
+			}
+			if tc.wantUser != "" {
+				if parsed.User == nil || parsed.User.Username() != tc.wantUser {
+					var gotUser string
+					if parsed.User != nil {
+						gotUser = parsed.User.Username()
+					}
+					t.Fatalf("username = %q, want %q (got %q)", gotUser, tc.wantUser, got)
+				}
+				if _, hasPass := parsed.User.Password(); !hasPass {
+					t.Fatalf("expected masked password placeholder in userinfo of %q", got)
+				}
+			}
+			if tc.wantSSLMode != "" {
+				if gotSSL := parsed.Query().Get("sslmode"); gotSSL != tc.wantSSLMode {
+					t.Fatalf("sslmode = %q, want %q (got %q)", gotSSL, tc.wantSSLMode, got)
+				}
 			}
 		})
 	}

@@ -11,16 +11,14 @@ import (
 const (
 	defaultManagementPort = 9090
 	minCursorSecretLength = 32
+	pgScheme              = "postgres://"
 )
 
-func resolveDSN(cfg Config) string {
-	dsn := cfg.Storage.DSN
+func normalizeDSN(rawDSN string) string {
 	// Convert JDBC URL to pgx-compatible format
-	dsn = strings.TrimPrefix(dsn, "jdbc:")
-	const newConst = "postgres://"
-	dsn = strings.Replace(dsn, "postgresql://", newConst, 1)
-	if cfg.Storage.Username != "" {
-		dsn = strings.Replace(dsn, newConst, newConst+cfg.Storage.Username+":"+cfg.Storage.Password+"@", 1)
+	dsn := strings.TrimPrefix(rawDSN, "jdbc:")
+	if strings.HasPrefix(dsn, "postgresql://") {
+		dsn = pgScheme + strings.TrimPrefix(dsn, "postgresql://")
 	}
 	if !strings.Contains(dsn, "sslmode=") {
 		if strings.Contains(dsn, "?") {
@@ -32,17 +30,21 @@ func resolveDSN(cfg Config) string {
 	return dsn
 }
 
-func redactDSN(rawDSN, username string) string {
-	dsn := strings.TrimPrefix(rawDSN, "jdbc:")
-	const pgScheme = "postgres://"
-	dsn = strings.Replace(dsn, "postgresql://", pgScheme, 1)
-	if !strings.Contains(dsn, "sslmode=") {
-		if strings.Contains(dsn, "?") {
-			dsn += "&sslmode=disable"
-		} else {
-			dsn += "?sslmode=disable"
+func resolveDSN(cfg Config) string {
+	dsn := normalizeDSN(cfg.Storage.DSN)
+	if cfg.Storage.Username != "" {
+		if parsed, err := url.Parse(dsn); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+			parsed.User = url.UserPassword(cfg.Storage.Username, cfg.Storage.Password)
+			return parsed.String()
 		}
+		encoded := url.UserPassword(cfg.Storage.Username, cfg.Storage.Password).String()
+		dsn = strings.Replace(dsn, pgScheme, pgScheme+encoded+"@", 1)
 	}
+	return dsn
+}
+
+func redactDSN(rawDSN, username string) string {
+	dsn := normalizeDSN(rawDSN)
 	parsed, err := url.Parse(dsn)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "[REDACTED]"
@@ -67,7 +69,8 @@ func redactDSN(rawDSN, username string) string {
 	if username != "" {
 		encodedUser := url.User(username).String()
 		parsed.User = nil
-		return strings.Replace(parsed.String(), pgScheme, pgScheme+encodedUser+":***@", 1)
+		schemePrefix := parsed.Scheme + "://"
+		return strings.Replace(parsed.String(), schemePrefix, schemePrefix+encodedUser+":***@", 1)
 	}
 	return parsed.Redacted()
 }

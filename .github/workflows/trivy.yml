@@ -1,0 +1,22 @@
+name: Trivy Container Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: read
+  packages: read
+  security-events: write
+
+jobs:
+  trivy:
+    uses: scimsandbox/.github/.github/workflows/reusable-trivy-image.yml@main
+    with:
+      image-name: scim-server-impl-go:scan

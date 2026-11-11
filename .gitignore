@@ -3,6 +3,7 @@
 *.test
 *.coverprofile
 coverage.out
+.scannerwork/
 /server
 /cmd/server/server
 

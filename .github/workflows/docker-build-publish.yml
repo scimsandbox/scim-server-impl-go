@@ -8,8 +8,21 @@ on:
 permissions: {}
 
 jobs:
+  trivy:
+    name: Pre-publish Trivy scan
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    uses: scimsandbox/.github/.github/workflows/reusable-trivy-image.yml@main
+    with:
+      image-name: scim-server-impl-go:release-scan
+      upload-sarif: false
+
   docker-build-publish:
     name: Build and push scim-server-impl-go
+    needs:
+      - trivy
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -50,5 +63,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

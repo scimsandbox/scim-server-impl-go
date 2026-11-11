@@ -1,0 +1,14 @@
+name: Dependabot Auto-Merge
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    uses: scimsandbox/.github/.github/workflows/reusable-dependabot-automerge.yml@c675580705cc902e5762261850f8e1b27ef641a8 # v1.0.0

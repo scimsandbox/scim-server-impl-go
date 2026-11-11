@@ -8,17 +8,62 @@ on:
 permissions: {}
 
 jobs:
-  docker-build-publish:
-    name: Build and push scim-server-impl-go
+  # Multi-arch Buildx builds (linux/amd64,linux/arm64) cannot --load into the local
+  # Docker daemon simultaneously, and Trivy --input does not unpack multi-platform OCI
+  # index archives. Run a least-privilege daemon-loaded scan against the release commit
+  # before publishing (inline rather than reusable-trivy-image.yml, which statically
+  # requests security-events: write and packages: read), complementing the pre-tag
+  # Trivy gate in release.yml.
+  trivy:
+    name: Pre-publish Trivy scan
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
-      packages: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build image for release scan
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: scim-server-impl-go:release-scan
+
+      - name: Enforce pre-publish Trivy vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scim-server-impl-go:release-scan
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+
+  docker-build-publish:
+    name: Build and push scim-server-impl-go
+    needs:
+      - trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
@@ -50,5 +95,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

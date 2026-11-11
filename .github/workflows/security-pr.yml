@@ -1,0 +1,16 @@
+name: Security PR Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  security-pr:
+    uses: scimsandbox/.github/.github/workflows/reusable-security-pr.yml@c675580705cc902e5762261850f8e1b27ef641a8 # v1.0.0
+    with:
+      dependency-review: true

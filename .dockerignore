@@ -1,0 +1,40 @@
+# Version control & CI
+.git
+.github
+
+# Sibling checkout & build/release outputs
+scim-server-db
+dist
+bin
+server
+cmd/server/server
+
+# Test, coverage & analysis artifacts
+.scannerwork
+coverage.out
+*.coverprofile
+*.test
+trivy-image.sarif
+
+# OS & editor files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.idea
+.vscode
+*.iml
+*.iws
+*.ipr
+*.swp
+*~
+
+# Local SOPS / age artifacts
+*.agekey
+*.decrypted.yaml
+*.decrypted.yml
+*.dec.yaml
+*.dec.yml
+.config/sops

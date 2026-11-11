@@ -24,6 +24,13 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "Europe/Berlin"
+    cooldown:
+      default-days: 3
+    ignore:
+      - dependency-name: "golang"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
     groups:
       docker-images:
         patterns:
@@ -39,6 +46,8 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "Europe/Berlin"
+    cooldown:
+      default-days: 3
     groups:
       github-actions:
         patterns:

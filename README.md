@@ -251,6 +251,14 @@ Run the default package test suite from the repository root:
 go test ./...
 ```
 
+Run the CI linter, vulnerability scan, and race-detector test suite locally:
+
+```bash
+golangci-lint run ./...
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+go test -race -count=1 ./...
+```
+
 Container-backed validation runs with the normal test set. Common examples:
 
 ```bash

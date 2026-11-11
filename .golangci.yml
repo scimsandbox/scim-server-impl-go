@@ -10,9 +10,6 @@ linters:
     - ineffassign
     - staticcheck
   settings:
-    errcheck:
-      exclude-functions:
-        - (*encoding/json.Encoder).Encode
     gosec:
       excludes:
         - G104
@@ -28,15 +25,28 @@ linters:
       - comments
       - std-error-handling
     rules:
+      # Test files and shared test helpers intentionally omit production response/error/gosec guards.
       - path: (_test\.go|^internal/testsupport/)
         linters:
           - bodyclose
           - errcheck
           - gosec
+      # writeJSON streams the JSON body after w.WriteHeader(status) has already committed the HTTP response status.
+      - path: ^internal/handler/base\.go$
+        text: '\(\*encoding/json\.Encoder\)\.Encode'
+        linters:
+          - errcheck
+      # WriteScimError streams the error body after w.WriteHeader(err.Status) has already committed the HTTP response status.
+      - path: ^internal/scim/error\.go$
+        text: '\(\*encoding/json\.Encoder\)\.Encode'
+        linters:
+          - errcheck
+      # Config files are read solely from trusted startup paths (GO_CONFIG_DIR / CLI startup wiring), never from user input.
       - path: ^internal/configloader/configloader\.go$
         text: "G304:"
         linters:
           - gosec
+      # Poll handler writes stored RFC 8935/8936 SET JSON payloads with an explicit Content-Type: application/json header.
       - path: ^internal/handler/async_event\.go$
         text: "G705:"
         linters:

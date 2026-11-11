@@ -17,6 +17,6 @@ permissions:
 
 jobs:
   trivy:
-    uses: scimsandbox/.github/.github/workflows/reusable-trivy-image.yml@main
+    uses: scimsandbox/.github/.github/workflows/reusable-trivy-image.yml@c675580705cc902e5762261850f8e1b27ef641a8 # v1.0.0
     with:
       image-name: scim-server-impl-go:scan

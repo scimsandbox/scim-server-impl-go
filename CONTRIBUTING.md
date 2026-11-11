@@ -47,7 +47,9 @@ Validate changes before opening a PR.
 Common checks:
 
 - run `gofmt` on changed Go files
-- run `go test ./...`
+- run `golangci-lint run ./...`
+- run `go run golang.org/x/vuln/cmd/govulncheck@latest ./...`
+- run `go test -race -count=1 ./...`
 - if you changed handler or persistence flows, run a focused test such as `go test ./internal/handler -run TestCreateAndGetUser -count=1`
 - if you changed cross-package database behavior, run a focused integration test such as `go test ./internal/integration -run TestGroupMembershipTransaction -count=1`
 - if Docker-backed tests use a different migration image or local setup, make sure the sibling `../scim-server-db` image can still be built by the test helpers

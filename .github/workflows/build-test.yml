@@ -7,13 +7,15 @@ on:
   pull_request:
     branches:
       - main
+  schedule:
+    - cron: "30 5 * * 1"
 
 permissions:
   contents: read
   packages: read
 
 concurrency:
-  group: build-test-${{ github.event.pull_request.number || github.ref }}
+  group: build-test-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -27,12 +29,14 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Checkout scim-server-db
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ github.repository_owner }}/scim-server-db
           path: scim-server-db
+          persist-credentials: false
 
       - name: Link sibling scim-server-db module
         shell: bash
@@ -68,7 +72,9 @@ jobs:
 
       - name: Check SonarQube Cloud availability
         id: sonar-gate
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        if: >-
+          github.event_name == 'push' ||
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
         shell: bash
         env:
           SONAR_TOKEN_PRESENT: ${{ secrets.SONAR_TOKEN != '' }}

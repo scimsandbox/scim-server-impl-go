@@ -8,13 +8,17 @@ on:
 permissions: {}
 
 jobs:
+  # Multi-arch Buildx builds (linux/amd64,linux/arm64) cannot --load into the local
+  # Docker daemon simultaneously, and Trivy --input does not unpack multi-platform OCI
+  # index archives. Run the pinned reusable daemon-loaded scan against the release commit
+  # before publishing, complementing the pre-tag Trivy gate in release.yml.
   trivy:
     name: Pre-publish Trivy scan
     permissions:
       contents: read
       packages: read
       security-events: write
-    uses: scimsandbox/.github/.github/workflows/reusable-trivy-image.yml@main
+    uses: scimsandbox/.github/.github/workflows/reusable-trivy-image.yml@c675580705cc902e5762261850f8e1b27ef641a8 # v1.0.0
     with:
       image-name: scim-server-impl-go:release-scan
       upload-sarif: false
@@ -24,6 +28,7 @@ jobs:
     needs:
       - trivy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
@@ -32,6 +37,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0

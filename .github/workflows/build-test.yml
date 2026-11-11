@@ -70,6 +70,9 @@ jobs:
 
           go test -race -count=1 -coverprofile=coverage.out ./...
 
+      # Scheduled weekly runs intentionally skip SonarQube Cloud because no code changed;
+      # the Monday schedule exists specifically to re-run govulncheck and race tests
+      # against newly published Go vulnerability DB advisories.
       - name: Check SonarQube Cloud availability
         id: sonar-gate
         if: >-

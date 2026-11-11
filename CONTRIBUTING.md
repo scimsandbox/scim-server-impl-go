@@ -48,7 +48,7 @@ Common checks:
 
 - run `gofmt` on changed Go files
 - run `golangci-lint run ./...`
-- run `go run golang.org/x/vuln/cmd/govulncheck@latest ./...`
+- run `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...`
 - run `go test -race -count=1 ./...`
 - if you changed handler or persistence flows, run a focused test such as `go test ./internal/handler -run TestCreateAndGetUser -count=1`
 - if you changed cross-package database behavior, run a focused integration test such as `go test ./internal/integration -run TestGroupMembershipTransaction -count=1`

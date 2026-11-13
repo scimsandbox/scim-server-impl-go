@@ -268,6 +268,9 @@ func setSingleAttribute(user *model.ScimUser, path string, value any) error {
 		if err != nil {
 			return err
 		}
+		if rawPw != nil && len([]byte(*rawPw)) > MaxBcryptPasswordBytes {
+			return NewScimError(400, "invalidValue", "password cannot be more than 72 bytes")
+		}
 		if user.Password != nil && rawPw != nil && *rawPw != "" && bcrypt.CompareHashAndPassword([]byte(*user.Password), []byte(*rawPw)) == nil {
 			return nil
 		}

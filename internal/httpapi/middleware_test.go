@@ -16,11 +16,22 @@ import (
 )
 
 type stubLimiter struct {
-	wait func(context.Context) error
+	allow func() bool
+	wait  func(context.Context) error
+}
+
+func (s stubLimiter) Allow() bool {
+	if s.allow != nil {
+		return s.allow()
+	}
+	return false
 }
 
 func (s stubLimiter) Wait(ctx context.Context) error {
-	return s.wait(ctx)
+	if s.wait != nil {
+		return s.wait(ctx)
+	}
+	return nil
 }
 
 func TestStatusCapture_DefaultsToOK(t *testing.T) {
@@ -49,15 +60,19 @@ func TestStatusCapture_RecordsWrittenCode(t *testing.T) {
 	}
 }
 
-func TestResolveRateLimitWaitTimeout_DefaultsTo60Seconds(t *testing.T) {
+func TestResolveRateLimitWaitTimeout_DefaultsToFailFastAndCapsMaxWait(t *testing.T) {
 	t.Parallel()
 
-	if got := resolveRateLimitWaitTimeout(0); got != 60*time.Second {
-		t.Fatalf("resolveRateLimitWaitTimeout(0) = %v, want 60s", got)
+	if got := resolveRateLimitWaitTimeout(0); got != 0 {
+		t.Fatalf("resolveRateLimitWaitTimeout(0) = %v, want 0", got)
 	}
 
-	if got := resolveRateLimitWaitTimeout(15 * time.Second); got != 15*time.Second {
-		t.Fatalf("resolveRateLimitWaitTimeout(15s) = %v, want 15s", got)
+	if got := resolveRateLimitWaitTimeout(2 * time.Second); got != 2*time.Second {
+		t.Fatalf("resolveRateLimitWaitTimeout(2s) = %v, want 2s", got)
+	}
+
+	if got := resolveRateLimitWaitTimeout(60 * time.Second); got != maxRateLimitWaitTimeout {
+		t.Fatalf("resolveRateLimitWaitTimeout(60s) = %v, want %v", got, maxRateLimitWaitTimeout)
 	}
 }
 
@@ -158,7 +173,7 @@ func TestThrottlingMiddleware_WaitsForPermitBeforeCallingNext(t *testing.T) {
 	}
 }
 
-func TestThrottlingMiddleware_ReturnsScimServiceUnavailableWhenPermitWaitTimesOut(t *testing.T) {
+func TestThrottlingMiddleware_ReturnsScimTooManyRequestsWhenPermitUnavailable(t *testing.T) {
 	t.Parallel()
 
 	calledNext := false
@@ -176,11 +191,11 @@ func TestThrottlingMiddleware_ReturnsScimServiceUnavailableWhenPermitWaitTimesOu
 	if calledNext {
 		t.Fatal("next handler was called despite limiter timeout")
 	}
-	if rw.Code != http.StatusServiceUnavailable {
-		t.Fatalf("response status = %d, want %d", rw.Code, http.StatusServiceUnavailable)
+	if rw.Code != http.StatusTooManyRequests {
+		t.Fatalf("response status = %d, want %d", rw.Code, http.StatusTooManyRequests)
 	}
-	if got := rw.Header().Get("Retry-After"); got != "300" {
-		t.Fatalf("Retry-After = %q, want %q", got, "300")
+	if got := rw.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want %q", got, "1")
 	}
 	if got := rw.Header().Get("Content-Type"); got != "application/scim+json" {
 		t.Fatalf("Content-Type = %q, want %q", got, "application/scim+json")
@@ -190,8 +205,11 @@ func TestThrottlingMiddleware_ReturnsScimServiceUnavailableWhenPermitWaitTimesOu
 	if err := json.Unmarshal(rw.Body.Bytes(), &body); err != nil {
 		t.Fatalf("response body is not valid JSON: %v", err)
 	}
-	if body["status"] != "503" {
-		t.Fatalf("body status = %v, want %q", body["status"], "503")
+	if body["status"] != "429" {
+		t.Fatalf("body status = %v, want %q", body["status"], "429")
+	}
+	if body["scimType"] != rateLimitScimType {
+		t.Fatalf("body scimType = %v, want %q", body["scimType"], rateLimitScimType)
 	}
 	if body["detail"] != rateLimitCapacityDetail {
 		t.Fatalf("body detail = %v, want %q", body["detail"], rateLimitCapacityDetail)
@@ -200,7 +218,7 @@ func TestThrottlingMiddleware_ReturnsScimServiceUnavailableWhenPermitWaitTimesOu
 	if !ok || len(schemas) != 1 || schemas[0] != "urn:ietf:params:scim:api:messages:2.0:Error" {
 		t.Fatalf("body schemas = %v, want SCIM error schema", body["schemas"])
 	}
-	if strings.Contains(rw.Body.String(), "Service Unavailable") {
+	if strings.Contains(rw.Body.String(), "Too Many Requests") {
 		t.Fatal("response body should use SCIM error payload, not plain http.Error output")
 	}
 }
@@ -243,7 +261,7 @@ func TestNew_WithRateLimit_DelaysSubsequentRequests(t *testing.T) {
 	}), Config{
 		Logger:    logger,
 		Localizer: localizer,
-		RateLimit: RateLimitConfig{Enabled: true, RequestsPerSecond: 5, WaitTimeout: time.Second},
+		RateLimit: RateLimitConfig{Enabled: true, RequestsPerSecond: 5, Burst: 1, WaitTimeout: time.Second},
 	})
 
 	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil))
@@ -304,7 +322,7 @@ func TestNew_RecordsMetricsForThrottledRequests(t *testing.T) {
 	path := "/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Users"
 	before := metricValueWithLabels(t, "scim_go_operation_requests_total", map[string]string{
 		"operation":   "listUsers",
-		"http_status": "503",
+		"http_status": "429",
 	})
 	authBefore := metricValueWithLabels(t, "scim_go_operation_authentication_total", map[string]string{"state": "unknown"})
 	throttledBefore := metricValueWithLabels(t, "scim_go_operation_throttled_total", map[string]string{"state": "yes"})
@@ -313,13 +331,13 @@ func TestNew_RecordsMetricsForThrottledRequests(t *testing.T) {
 	rw := httptest.NewRecorder()
 	handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, path, nil))
 
-	if rw.Code != http.StatusServiceUnavailable {
-		t.Fatalf("response status = %d, want %d", rw.Code, http.StatusServiceUnavailable)
+	if rw.Code != http.StatusTooManyRequests {
+		t.Fatalf("response status = %d, want %d", rw.Code, http.StatusTooManyRequests)
 	}
 
 	after := metricValueWithLabels(t, "scim_go_operation_requests_total", map[string]string{
 		"operation":   "listUsers",
-		"http_status": "503",
+		"http_status": "429",
 	})
 	if after-before != 1 {
 		t.Fatalf("counter delta = %v, want 1", after-before)
@@ -329,6 +347,54 @@ func TestNew_RecordsMetricsForThrottledRequests(t *testing.T) {
 	}
 	if after := metricValueWithLabels(t, "scim_go_operation_throttled_total", map[string]string{"state": "yes"}); after-throttledBefore != 1 {
 		t.Fatalf("throttled counter delta = %v, want 1", after-throttledBefore)
+	}
+}
+
+func TestThrottlingMiddleware_FailFast429BurstAndManagementBypass(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	logger := logging.NewLogger(logging.Config{Writer: &buf, Level: logging.InfoLevel})
+	localizer := messages.New(messages.Config{})
+
+	handler := New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), Config{
+		Logger:    logger,
+		Localizer: localizer,
+		RateLimit: RateLimitConfig{Enabled: true, RequestsPerSecond: 1, Burst: 3, WaitTimeout: 0},
+	})
+
+	// First 3 requests within burst=3 succeed immediately.
+	for i := 0; i < 3; i++ {
+		rw := httptest.NewRecorder()
+		handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Users", nil))
+		if rw.Code != http.StatusOK {
+			t.Fatalf("burst request %d status = %d, want 200", i+1, rw.Code)
+		}
+	}
+
+	// 4th request fails fast (WaitTimeout=0) with 429 SCIM Error and Retry-After: 1 without parking.
+	start := time.Now()
+	rw := httptest.NewRecorder()
+	handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Users", nil))
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("fail-fast 429 took %v, expected immediate response", elapsed)
+	}
+	if rw.Code != http.StatusTooManyRequests {
+		t.Fatalf("4th request status = %d, want 429", rw.Code)
+	}
+	if got := rw.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+
+	// Management endpoints (/actuator/health and /metrics) are never throttled even when bucket is exhausted.
+	for _, mgmtPath := range []string{"/actuator/health", "/actuator/health/readiness", "/metrics"} {
+		mgmtRec := httptest.NewRecorder()
+		handler.ServeHTTP(mgmtRec, httptest.NewRequest(http.MethodGet, mgmtPath, nil))
+		if mgmtRec.Code != http.StatusOK {
+			t.Fatalf("management path %s status = %d, want 200", mgmtPath, mgmtRec.Code)
+		}
 	}
 }
 

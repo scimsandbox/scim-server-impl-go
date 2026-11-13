@@ -1,0 +1,2 @@
+config/app-secrets.yaml export-ignore
+config/*secret* export-ignore

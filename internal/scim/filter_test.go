@@ -774,4 +774,67 @@ func TestBuildJSONAttributeFilter_JsonbArrayElementsAndSpecialChars(t *testing.T
 	}
 }
 
+func TestParseFilter_LengthTokenAndDepthLimits(t *testing.T) {
+	t.Run("oversized filter string returns 400 invalidFilter", func(t *testing.T) {
+		oversized := `userName eq "` + strings.Repeat("a", MaxFilterLength) + `"`
+		for _, fn := range []func(string, int) (*FilterResult, error){ParseUserFilter, ParseGroupFilter} {
+			_, err := fn(oversized, 1)
+			if err == nil {
+				t.Fatal("expected error for filter exceeding MaxFilterLength")
+			}
+			scimErr, ok := err.(*ScimError)
+			if !ok {
+				t.Fatalf("expected *ScimError, got %T: %v", err, err)
+			}
+			if scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+				t.Fatalf("expected 400 invalidFilter, got status=%d scimType=%q detail=%q", scimErr.Status, scimErr.ScimType, scimErr.Detail)
+			}
+		}
+	})
+
+	t.Run("excessive token count returns 400 invalidFilter", func(t *testing.T) {
+		clauses := make([]string, 70) // 70 * 3 + 69 = 279 tokens > MaxFilterTokens (200)
+		for i := range clauses {
+			clauses[i] = `userName eq "a"`
+		}
+		tooManyTokens := strings.Join(clauses, " or ")
+		_, err := ParseUserFilter(tooManyTokens, 1)
+		if err == nil {
+			t.Fatal("expected error for filter exceeding MaxFilterTokens")
+		}
+		scimErr, ok := err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("deeply nested parentheses or NOT expressions return 400 invalidFilter", func(t *testing.T) {
+		deepParens := strings.Repeat("(", MaxFilterDepth+2) + `userName eq "alice"` + strings.Repeat(")", MaxFilterDepth+2)
+		_, err := ParseUserFilter(deepParens, 1)
+		if err == nil {
+			t.Fatal("expected error for deeply nested parentheses")
+		}
+		scimErr, ok := err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter, got %T: %v", err, err)
+		}
+
+		deepNot := strings.Repeat("not (", MaxFilterDepth+1) + `userName eq "alice"` + strings.Repeat(")", MaxFilterDepth+1)
+		_, err = ParseUserFilter(deepNot, 1)
+		if err == nil {
+			t.Fatal("expected error for deeply nested NOT expression")
+		}
+		scimErr, ok = err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter, got %T: %v", err, err)
+		}
+
+		// Nesting at MaxFilterDepth is still accepted
+		okParens := strings.Repeat("(", MaxFilterDepth) + `userName eq "alice"` + strings.Repeat(")", MaxFilterDepth)
+		if _, err := ParseUserFilter(okParens, 1); err != nil {
+			t.Fatalf("expected nesting at MaxFilterDepth (%d) to succeed, got: %v", MaxFilterDepth, err)
+		}
+	})
+}
+
 

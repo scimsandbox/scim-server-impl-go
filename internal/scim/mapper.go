@@ -447,7 +447,7 @@ func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
 	} else {
 		user.Active = true
 	}
-	if v, ok := input["password"]; ok {
+	if v, ok := extractPasswordInput(input); ok {
 		rawPw, err := parseRawStringPtr(v, "password")
 		if err != nil {
 			return err
@@ -459,6 +459,28 @@ func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
 		user.Password = pw
 	}
 	return nil
+}
+
+func extractPasswordInput(input map[string]any) (any, bool) {
+	if v, ok := input["password"]; ok {
+		return v, true
+	}
+	corePwAttr := UserSchemaURN + ":password"
+	for k, v := range input {
+		if strings.EqualFold(k, "password") || strings.EqualFold(k, corePwAttr) {
+			return v, true
+		}
+		if strings.EqualFold(k, UserSchemaURN) {
+			if subMap, ok := v.(map[string]any); ok {
+				for sk, sv := range subMap {
+					if strings.EqualFold(sk, "password") {
+						return sv, true
+					}
+				}
+			}
+		}
+	}
+	return nil, false
 }
 
 func applyNameAttribute(user *model.ScimUser, input map[string]any) error {

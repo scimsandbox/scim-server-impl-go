@@ -78,10 +78,8 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxBulkPayloadBytes)
-
 	var body map[string]any
-	if err := readJSON(r, &body); err != nil {
+	if err := readJSONWithLimit(w, r, maxBulkPayloadBytes, &body); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			scim.WriteScimError(w, scim.NewScimError(http.StatusRequestEntityTooLarge, "",

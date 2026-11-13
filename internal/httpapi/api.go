@@ -12,6 +12,7 @@ import (
 type RateLimitConfig struct {
 	Enabled           bool          `yaml:"enabled" env:"GO_RATE_LIMIT_ENABLED"`
 	RequestsPerSecond float64       `yaml:"requests_per_second" env:"GO_RATE_LIMIT_REQUESTS_PER_SECOND"`
+	Burst             int           `yaml:"burst" env:"GO_RATE_LIMIT_BURST"`
 	WaitTimeout       time.Duration `yaml:"wait_timeout" env:"GO_RATE_LIMIT_WAIT_TIMEOUT"`
 }
 
@@ -27,7 +28,7 @@ func New(handler http.Handler, config Config) http.Handler {
 	wrapped := handler
 	if config.RateLimit.Enabled {
 		wrapped = throttlingMiddleware(
-			newRequestLimiter(config.RateLimit.RequestsPerSecond),
+			newRequestLimiter(config.RateLimit.RequestsPerSecond, config.RateLimit.Burst),
 			resolveRateLimitWaitTimeout(config.RateLimit.WaitTimeout),
 			wrapped,
 		)

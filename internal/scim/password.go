@@ -1,6 +1,8 @@
 package scim
 
 import (
+	"errors"
+
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -20,8 +22,28 @@ func HashPassword(raw *string) (*string, error) {
 	}
 	hashed, err := bcrypt.GenerateFromPassword([]byte(val), bcrypt.DefaultCost)
 	if err != nil {
-		return nil, NewScimError(400, "invalidValue", "Failed to hash password: "+err.Error())
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			return nil, NewScimError(400, "invalidValue", "password cannot be more than 72 bytes")
+		}
+		return nil, NewScimError(400, "invalidValue", "Failed to hash password")
 	}
 	h := string(hashed)
 	return &h, nil
+}
+
+// ValidatePasswordInput validates any password attribute present in a SCIM User payload
+// without mutating the payload, rejecting non-string or >72-byte UTF-8 values with 400 invalidValue.
+func ValidatePasswordInput(input map[string]any) error {
+	v, ok := extractPasswordInput(input)
+	if !ok || v == nil {
+		return nil
+	}
+	rawPw, err := parseRawStringPtr(v, "password")
+	if err != nil {
+		return err
+	}
+	if rawPw != nil && len([]byte(*rawPw)) > MaxBcryptPasswordBytes {
+		return NewScimError(400, "invalidValue", "password cannot be more than 72 bytes")
+	}
+	return nil
 }

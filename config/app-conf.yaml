@@ -10,7 +10,8 @@ management:
 rate_limit:
   enabled: true
   requests_per_second: 1000
-  wait_timeout: 60s
+  burst: 100
+  wait_timeout: 0s
 storage:
   dsn: "jdbc:postgresql://localhost:5432/scimplayground"
   username: "scim_playground"

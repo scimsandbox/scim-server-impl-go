@@ -28,6 +28,10 @@ var (
 	passwordJSONStringRe = regexp.MustCompile(`(?i)("(?:\s*(?:urn:[^"]*:)?password)"\s*:\s*)"(?:\\.|[^"\\])*"`)
 	// Matches truncated JSON-like password string values at the end of a malformed/cut payload.
 	passwordJSONTruncatedRe = regexp.MustCompile(`(?i)("(?:\s*(?:urn:[^"]*:)?password)"\s*:\s*)"(?:\\.|[^"\\])*$`)
+	// Matches JSON-like "authorization" header/token fields and Bearer token strings.
+	authJSONStringRe    = regexp.MustCompile(`(?i)("\s*authorization\s*"\s*:\s*)"(?:\\.|[^"\\])*"`)
+	authJSONTruncatedRe = regexp.MustCompile(`(?i)("\s*authorization\s*"\s*:\s*)"(?:\\.|[^"\\])*$`)
+	bearerTokenRe       = regexp.MustCompile(`(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+`)
 	// Matches malformed/non-JSON PATCH fragments where "path":"password" precedes or follows "value":"..."
 	// within the same JSON object (allowing intervening fields such as "op":"replace" and truncated trailing values).
 	patchPathThenValueRe          = regexp.MustCompile(`(?is)("path"\s*:\s*"\s*(?:urn:ietf:params:scim:schemas:core:2\.0:User:)?password\s*"[^{}]*?"value"\s*:\s*)"(?:\\.|[^"\\])*"`)
@@ -151,7 +155,8 @@ func RedactSensitiveBody(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return raw
 	}
-	if !strings.Contains(strings.ToLower(raw), "password") {
+	lowerRaw := strings.ToLower(raw)
+	if !strings.Contains(lowerRaw, "password") && !strings.Contains(lowerRaw, "authorization") && !strings.Contains(lowerRaw, "bearer ") {
 		return raw
 	}
 
@@ -243,7 +248,7 @@ func redactValue(v any) (any, bool) {
 
 func isPasswordKey(key string) bool {
 	lk := strings.ToLower(strings.TrimSpace(key))
-	return lk == "password" || strings.HasSuffix(lk, ":password")
+	return lk == "password" || strings.HasSuffix(lk, ":password") || lk == "authorization"
 }
 
 func isPasswordPatchPath(path string) bool {
@@ -252,14 +257,24 @@ func isPasswordPatchPath(path string) bool {
 }
 
 func redactRegexFallback(s string) string {
-	if s == "" || !strings.Contains(strings.ToLower(s), "password") {
+	if s == "" {
 		return s
 	}
-	s = passwordJSONStringRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
-	s = patchPathThenValueRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
-	s = patchValueThenPathRe.ReplaceAllString(s, `${1}"[REDACTED]"${2}`)
-	s = patchPathThenValueTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
-	s = passwordJSONTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+	lower := strings.ToLower(s)
+	if strings.Contains(lower, "password") {
+		s = passwordJSONStringRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+		s = patchPathThenValueRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+		s = patchValueThenPathRe.ReplaceAllString(s, `${1}"[REDACTED]"${2}`)
+		s = patchPathThenValueTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+		s = passwordJSONTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+	}
+	if strings.Contains(lower, "authorization") {
+		s = authJSONStringRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+		s = authJSONTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+	}
+	if strings.Contains(lower, "bearer ") {
+		s = bearerTokenRe.ReplaceAllString(s, `${1}[REDACTED]`)
+	}
 	return s
 }
 

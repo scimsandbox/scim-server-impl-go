@@ -868,4 +868,57 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			t.Fatalf("loadConfig() error = %q, want request logs max_count validation message", err.Error())
 		}
 	})
+
+	t.Run("loads cleanly without app-secrets.yaml and applies HTTP server timeout defaults", func(t *testing.T) {
+		t.Parallel()
+
+		configDir := t.TempDir()
+		// Write ONLY app-conf.yaml (no app-secrets.yaml on disk) and omit server timeout fields to verify safe fallback defaults.
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		config := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"rate_limit:",
+			"  enabled: true",
+			"  requests_per_second: 500",
+			"  burst: 50",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfg, err := loadConfig(func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_DATASOURCE_URL":
+				return "postgres://env_user:env_pass@db.internal:5432/scim", true
+			case "GO_CURSOR_SECRET":
+				return "env-provided-cursor-secret-at-least-32-chars", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("loadConfig() without app-secrets.yaml failed: %v", err)
+		}
+		if cfg.RateLimit.Burst != 50 {
+			t.Fatalf("cfg.RateLimit.Burst = %d, want 50", cfg.RateLimit.Burst)
+		}
+		if cfg.Server.ReadTimeout != defaultServerReadTimeout {
+			t.Fatalf("ReadTimeout = %v, want %v", cfg.Server.ReadTimeout, defaultServerReadTimeout)
+		}
+		if cfg.Server.ReadHeaderTimeout != defaultServerReadHeaderTimeout {
+			t.Fatalf("ReadHeaderTimeout = %v, want %v", cfg.Server.ReadHeaderTimeout, defaultServerReadHeaderTimeout)
+		}
+		if cfg.Server.WriteTimeout != defaultServerWriteTimeout {
+			t.Fatalf("WriteTimeout = %v, want %v", cfg.Server.WriteTimeout, defaultServerWriteTimeout)
+		}
+		if cfg.Server.IdleTimeout != defaultServerIdleTimeout {
+			t.Fatalf("IdleTimeout = %v, want %v", cfg.Server.IdleTimeout, defaultServerIdleTimeout)
+		}
+		if cfg.Server.ShutdownTimeout != defaultServerShutdownTimeout {
+			t.Fatalf("ShutdownTimeout = %v, want %v", cfg.Server.ShutdownTimeout, defaultServerShutdownTimeout)
+		}
+	})
 }

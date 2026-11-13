@@ -13,6 +13,13 @@ type FilterResult struct {
 	Args []any
 }
 
+// Limits enforced on incoming SCIM filter expressions to prevent CPU/stack exhaustion.
+const (
+	MaxFilterLength = 4096
+	MaxFilterTokens = 200
+	MaxFilterDepth  = 20
+)
+
 const (
 	entityTypeUser  = "user"
 	entityTypeGroup = "group"
@@ -114,6 +121,7 @@ const (
 	sqlLowerPrefix             = "LOWER("
 	sqlLowerLikeSeparator      = ") LIKE LOWER("
 	sqlLike                    = " LIKE "
+	sqlLikeEscape              = ` ESCAPE '\'`
 	sqlTextCast                = "::text"
 	sqlIsNotNull               = " IS NOT NULL"
 	sqlIsNotNullAnd            = sqlIsNotNull + " AND "
@@ -147,14 +155,21 @@ func parseEntityFilter(filter string, startParam int, entityType string, crossRe
 	if filter == "" {
 		return nil, nil
 	}
+	if len(filter) > MaxFilterLength {
+		return nil, NewScimError(400, "invalidFilter", fmt.Sprintf("Invalid filter: filter length exceeds maximum of %d bytes", MaxFilterLength))
+	}
+	tokens, err := tokenizeLimited(filter, MaxFilterTokens)
+	if err != nil {
+		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
+	}
 	p := &filterParser{
-		tokens:        tokenize(filter),
+		tokens:        tokens,
 		pos:           0,
 		paramIdx:      startParam,
 		entityType:    entityType,
 		crossResource: crossResource,
 	}
-	result, err := p.parseOrExpression()
+	result, err := p.parseOrExpression(0)
 	if err != nil {
 		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
 	}
@@ -267,8 +282,23 @@ type token struct {
 var tokenRegex = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|[()]|[^\s()]+`)
 
 func tokenize(filter string) []token {
+	tokens, _ := tokenizeLimited(filter, -1)
+	return tokens
+}
+
+func tokenizeLimited(filter string, maxTokens int) ([]token, error) {
 	filter = NormalizeNFC(filter)
-	matches := tokenRegex.FindAllString(filter, -1)
+	if maxTokens > 0 && len(filter) > MaxFilterLength {
+		return nil, fmt.Errorf("filter length exceeds maximum of %d bytes", MaxFilterLength)
+	}
+	limit := -1
+	if maxTokens > 0 {
+		limit = maxTokens + 1
+	}
+	matches := tokenRegex.FindAllString(filter, limit)
+	if maxTokens > 0 && len(matches) > maxTokens {
+		return nil, fmt.Errorf("filter exceeds maximum token count (%d)", maxTokens)
+	}
 	tokens := make([]token, 0, len(matches))
 	for _, m := range matches {
 		if m == "(" {
@@ -281,7 +311,7 @@ func tokenize(filter string) []token {
 			tokens = append(tokens, token{typ: tokenWord, val: m})
 		}
 	}
-	return tokens
+	return tokens, nil
 }
 
 // ── Case-insensitive attribute set ──────────────────
@@ -401,8 +431,11 @@ func (p *filterParser) nextParam() string {
 	return s
 }
 
-func (p *filterParser) parseOrExpression() (*FilterResult, error) {
-	left, err := p.parseAndExpression()
+func (p *filterParser) parseOrExpression(depth int) (*FilterResult, error) {
+	if depth > MaxFilterDepth {
+		return nil, fmt.Errorf("filter exceeds maximum nesting depth (%d)", MaxFilterDepth)
+	}
+	left, err := p.parseAndExpression(depth)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +446,7 @@ func (p *filterParser) parseOrExpression() (*FilterResult, error) {
 			break
 		}
 		p.next() // consume "or"
-		right, err := p.parseAndExpression()
+		right, err := p.parseAndExpression(depth)
 		if err != nil {
 			return nil, err
 		}
@@ -425,8 +458,8 @@ func (p *filterParser) parseOrExpression() (*FilterResult, error) {
 	return left, nil
 }
 
-func (p *filterParser) parseAndExpression() (*FilterResult, error) {
-	left, err := p.parseNotExpression()
+func (p *filterParser) parseAndExpression(depth int) (*FilterResult, error) {
+	left, err := p.parseNotExpression(depth)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +470,7 @@ func (p *filterParser) parseAndExpression() (*FilterResult, error) {
 			break
 		}
 		p.next() // consume "and"
-		right, err := p.parseNotExpression()
+		right, err := p.parseNotExpression(depth)
 		if err != nil {
 			return nil, err
 		}
@@ -449,16 +482,19 @@ func (p *filterParser) parseAndExpression() (*FilterResult, error) {
 	return left, nil
 }
 
-func (p *filterParser) parseNotExpression() (*FilterResult, error) {
+func (p *filterParser) parseNotExpression(depth int) (*FilterResult, error) {
 	t := p.peek()
 	if t != nil && t.typ == tokenWord && strings.EqualFold(t.val, filterOpNot) {
+		if depth+1 > MaxFilterDepth {
+			return nil, fmt.Errorf("filter exceeds maximum nesting depth (%d)", MaxFilterDepth)
+		}
 		p.next() // consume "not"
 
 		// Expect opening paren after NOT
 		lp := p.peek()
 		if lp != nil && lp.typ == tokenLParen {
 			p.next() // consume "("
-			inner, err := p.parseOrExpression()
+			inner, err := p.parseOrExpression(depth + 1)
 			if err != nil {
 				return nil, err
 			}
@@ -472,7 +508,7 @@ func (p *filterParser) parseNotExpression() (*FilterResult, error) {
 			}, nil
 		}
 
-		inner, err := p.parseAtom()
+		inner, err := p.parseAtom(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -481,10 +517,10 @@ func (p *filterParser) parseNotExpression() (*FilterResult, error) {
 			Args: inner.Args,
 		}, nil
 	}
-	return p.parseAtom()
+	return p.parseAtom(depth)
 }
 
-func (p *filterParser) parseAtom() (*FilterResult, error) {
+func (p *filterParser) parseAtom(depth int) (*FilterResult, error) {
 	t := p.peek()
 	if t == nil {
 		return nil, fmt.Errorf("unexpected end of filter")
@@ -493,7 +529,7 @@ func (p *filterParser) parseAtom() (*FilterResult, error) {
 	// Grouped expression
 	if t.typ == tokenLParen {
 		p.next() // consume "("
-		inner, err := p.parseOrExpression()
+		inner, err := p.parseOrExpression(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -1116,21 +1152,21 @@ func (p *filterParser) buildTextExprCondition(expr, operator, value string, case
 	case filterOpCo:
 		escaped := "%" + escapeLikeValue(value) + "%"
 		if caseInsensitive {
-			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)%s", expr, param, sqlLikeEscape), escaped, nil
 		}
-		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
+		return fmt.Sprintf("%s LIKE %s%s", expr, param, sqlLikeEscape), escaped, nil
 	case filterOpSw:
 		escaped := escapeLikeValue(value) + "%"
 		if caseInsensitive {
-			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)%s", expr, param, sqlLikeEscape), escaped, nil
 		}
-		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
+		return fmt.Sprintf("%s LIKE %s%s", expr, param, sqlLikeEscape), escaped, nil
 	case filterOpEw:
 		escaped := "%" + escapeLikeValue(value)
 		if caseInsensitive {
-			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)%s", expr, param, sqlLikeEscape), escaped, nil
 		}
-		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
+		return fmt.Sprintf("%s LIKE %s%s", expr, param, sqlLikeEscape), escaped, nil
 	case filterOpGt:
 		return fmt.Sprintf("%s > %s", expr, param), value, nil
 	case filterOpGe:
@@ -1362,25 +1398,25 @@ func (p *filterParser) buildComparisonWithRaw(rawAttr, attr, operator, value str
 		param := p.nextParam()
 		escaped := escapeLikeValue(value)
 		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")", Args: []any{"%" + escaped + "%"}}, nil
+			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")" + sqlLikeEscape, Args: []any{"%" + escaped + "%"}}, nil
 		}
-		return &FilterResult{SQL: col + sqlLike + param, Args: []any{"%" + escaped + "%"}}, nil
+		return &FilterResult{SQL: col + sqlLike + param + sqlLikeEscape, Args: []any{"%" + escaped + "%"}}, nil
 
 	case filterOpSw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(value)
 		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")", Args: []any{escaped + "%"}}, nil
+			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")" + sqlLikeEscape, Args: []any{escaped + "%"}}, nil
 		}
-		return &FilterResult{SQL: col + sqlLike + param, Args: []any{escaped + "%"}}, nil
+		return &FilterResult{SQL: col + sqlLike + param + sqlLikeEscape, Args: []any{escaped + "%"}}, nil
 
 	case filterOpEw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(value)
 		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")", Args: []any{"%" + escaped}}, nil
+			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")" + sqlLikeEscape, Args: []any{"%" + escaped}}, nil
 		}
-		return &FilterResult{SQL: col + sqlLike + param, Args: []any{"%" + escaped}}, nil
+		return &FilterResult{SQL: col + sqlLike + param + sqlLikeEscape, Args: []any{"%" + escaped}}, nil
 
 	case filterOpGt:
 		param := p.nextParam()
@@ -1536,15 +1572,15 @@ func (p *filterParser) buildElemCondition(collectionAttr, attr, op, val string) 
 	case filterOpCo:
 		param := p.nextParam()
 		escaped := escapeLikeValue(val)
-		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{"%" + escaped + "%"}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)%s", jsonKey, param, sqlLikeEscape), []any{"%" + escaped + "%"}, nil
 	case filterOpSw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(val)
-		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{escaped + "%"}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)%s", jsonKey, param, sqlLikeEscape), []any{escaped + "%"}, nil
 	case filterOpEw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(val)
-		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{"%" + escaped}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)%s", jsonKey, param, sqlLikeEscape), []any{"%" + escaped}, nil
 	case filterOpGt:
 		param := p.nextParam()
 		return fmt.Sprintf("LOWER(elem->>'%s') > LOWER(%s)", jsonKey, param), []any{val}, nil

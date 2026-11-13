@@ -311,3 +311,36 @@ func TestRequestResponseLogging_DoesNotPreReadUnboundedStreamBeforeMaxBytesReade
 		t.Fatalf("logged request body exceeded maxBodyLog truncation limit")
 	}
 }
+
+func TestRequestResponseLogging_NeverLogsAuthHeaderAndRedactsAuthorizationInBody(t *testing.T) {
+	wsID := uuid.New()
+	logStore := &stubRequestLogCreator{}
+	bearerSecret := "super-secret-bearer-token-xyz123"
+	bodyAuthSecret := "Bearer body-embedded-token-abc987"
+	reqJSON := `{"userName":"alice@example.com","Authorization":"` + bodyAuthSecret + `","password":"SecretPassword!1"}`
+
+	downstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"11111111-1111-1111-1111-111111111111"}`))
+	})
+
+	mw := RequestResponseLogging(logStore)(downstream)
+	req := httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", bytes.NewBufferString(reqJSON))
+	req.Header.Set("Authorization", "Bearer "+bearerSecret)
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	if len(logStore.logs) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(logStore.logs))
+	}
+	saved := logStore.logs[0]
+	if saved.RequestBody == nil {
+		t.Fatal("expected non-nil RequestBody")
+	}
+	for _, secret := range []string{bearerSecret, "body-embedded-token-abc987", "SecretPassword!1"} {
+		if strings.Contains(*saved.RequestBody, secret) {
+			t.Fatalf("secret %q leaked into RequestBody: %s", secret, *saved.RequestBody)
+		}
+	}
+}

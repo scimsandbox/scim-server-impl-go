@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/scimsandbox/scim-server-impl-go/internal/logging"
@@ -14,9 +16,13 @@ import (
 )
 
 const (
-	defaultRateLimitWaitTimeout = 60 * time.Second
-	rateLimitRetryAfter         = 5 * time.Minute
-	rateLimitCapacityDetail     = "The server reached max capacity. Try again later."
+	defaultRateLimitWaitTimeout = time.Duration(0)
+	maxRateLimitWaitTimeout     = 5 * time.Second
+	maxConcurrentRateLimitWaits = 64
+	maxDefaultRateLimitBurst    = 1000
+	rateLimitRetryAfterSeconds  = 1
+	rateLimitScimType           = "tooMany"
+	rateLimitCapacityDetail     = "Rate limit exceeded. Try again later."
 )
 
 type statusCapture struct {
@@ -25,6 +31,7 @@ type statusCapture struct {
 }
 
 type requestLimiter interface {
+	Allow() bool
 	Wait(context.Context) error
 }
 
@@ -33,21 +40,79 @@ func (s *statusCapture) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-func newRequestLimiter(requestsPerSecond float64) requestLimiter {
-	return rate.NewLimiter(rate.Limit(requestsPerSecond), 1)
+func resolveRateLimitBurst(requestsPerSecond float64, burst int) int {
+	if burst > 0 {
+		return burst
+	}
+	if requestsPerSecond <= 1 {
+		return 1
+	}
+	computed := int(math.Ceil(requestsPerSecond))
+	if computed > maxDefaultRateLimitBurst {
+		return maxDefaultRateLimitBurst
+	}
+	return computed
+}
+
+func newRequestLimiter(requestsPerSecond float64, burst int) requestLimiter {
+	return rate.NewLimiter(rate.Limit(requestsPerSecond), resolveRateLimitBurst(requestsPerSecond, burst))
 }
 
 func resolveRateLimitWaitTimeout(waitTimeout time.Duration) time.Duration {
-	if waitTimeout == 0 {
+	if waitTimeout <= 0 {
 		return defaultRateLimitWaitTimeout
 	}
-
+	if waitTimeout > maxRateLimitWaitTimeout {
+		return maxRateLimitWaitTimeout
+	}
 	return waitTimeout
 }
 
+func isManagementPath(path string) bool {
+	return path == "/metrics" || path == "/actuator" || strings.HasPrefix(path, "/actuator/")
+}
+
+func writeRateLimitExceeded(w http.ResponseWriter, r *http.Request) {
+	middleware.MarkThrottled(r, middleware.ThrottledYes)
+	w.Header().Set("Retry-After", strconv.Itoa(rateLimitRetryAfterSeconds))
+	scim.WriteScimError(w, scim.NewScimError(http.StatusTooManyRequests, rateLimitScimType, rateLimitCapacityDetail))
+}
+
 func throttlingMiddleware(limiter requestLimiter, waitTimeout time.Duration, next http.Handler) http.Handler {
+	var waitSem chan struct{}
+	if waitTimeout > 0 {
+		waitSem = make(chan struct{}, maxConcurrentRateLimitWaits)
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isManagementPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		middleware.MarkThrottled(r, middleware.ThrottledNo)
+		if r.Context().Err() != nil {
+			return
+		}
+
+		if limiter.Allow() {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if waitTimeout <= 0 {
+			writeRateLimitExceeded(w, r)
+			return
+		}
+
+		select {
+		case waitSem <- struct{}{}:
+			defer func() { <-waitSem }()
+		default:
+			writeRateLimitExceeded(w, r)
+			return
+		}
+
 		waitCtx, cancel := context.WithTimeout(r.Context(), waitTimeout)
 		defer cancel()
 
@@ -55,10 +120,7 @@ func throttlingMiddleware(limiter requestLimiter, waitTimeout time.Duration, nex
 			if r.Context().Err() != nil {
 				return
 			}
-
-			middleware.MarkThrottled(r, middleware.ThrottledYes)
-			w.Header().Set("Retry-After", strconv.Itoa(int(rateLimitRetryAfter/time.Second)))
-			scim.WriteScimError(w, scim.NewScimError(http.StatusServiceUnavailable, "", rateLimitCapacityDetail))
+			writeRateLimitExceeded(w, r)
 			return
 		}
 

@@ -70,4 +70,37 @@ func TestPassword_RejectsOver72UTF8BytesWith400InvalidValue(t *testing.T) {
 			t.Fatalf("ApplyPatchOperations(same 72B prefix + suffix) = %T %v, want 400 invalidValue", err, err)
 		}
 	})
+
+	t.Run("ValidatePasswordInput and nested UserSchemaURN password extraction", func(t *testing.T) {
+		if err := ValidatePasswordInput(map[string]any{"userName": "alice"}); err != nil {
+			t.Fatalf("missing password should succeed, got %v", err)
+		}
+		if err := ValidatePasswordInput(map[string]any{"userName": "alice", "password": nil}); err != nil {
+			t.Fatalf("nil password should succeed, got %v", err)
+		}
+		if err := ValidatePasswordInput(map[string]any{"userName": "alice", "password": "ValidPassword!1"}); err != nil {
+			t.Fatalf("valid password should succeed, got %v", err)
+		}
+		if err := ValidatePasswordInput(map[string]any{"userName": "alice", "password": 12345}); err == nil {
+			t.Fatal("non-string password should fail")
+		}
+		if err := ValidatePasswordInput(map[string]any{
+			"userName": "alice",
+			UserSchemaURN: map[string]any{
+				"Password": strings.Repeat("z", 73),
+			},
+		}); err == nil {
+			t.Fatal("nested UserSchemaURN >72B password should fail")
+		}
+
+		u := &model.ScimUser{}
+		if err := ApplyFromScimInput(u, map[string]any{
+			"userName": "alice",
+			UserSchemaURN: map[string]any{
+				"password": "NestedValidPassword!1",
+			},
+		}); err != nil || u.Password == nil {
+			t.Fatalf("expected nested UserSchemaURN password to hash cleanly, err=%v", err)
+		}
+	})
 }

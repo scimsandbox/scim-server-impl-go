@@ -921,4 +921,39 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			t.Fatalf("ShutdownTimeout = %v, want %v", cfg.Server.ShutdownTimeout, defaultServerShutdownTimeout)
 		}
 	})
+
+	t.Run("rejects negative server timeouts and negative rate limit burst", func(t *testing.T) {
+		t.Parallel()
+
+		baseValid := func() Config {
+			return Config{
+				Cleanup: CleanupConfig{
+					RequestLogs: CleanupRequestLogsConfig{Interval: time.Hour, MaxCount: 100},
+					AsyncEvents: CleanupAsyncEventsConfig{Interval: time.Hour, MaxCount: 100, StalePendingAfter: time.Minute},
+				},
+			}
+		}
+
+		cases := []struct {
+			name    string
+			mutate  func(*Config)
+			wantMsg string
+		}{
+			{"negative ReadTimeout", func(c *Config) { c.Server.ReadTimeout = -time.Second }, "server.read_timeout"},
+			{"negative ReadHeaderTimeout", func(c *Config) { c.Server.ReadHeaderTimeout = -time.Second }, "server.read_header_timeout"},
+			{"negative WriteTimeout", func(c *Config) { c.Server.WriteTimeout = -time.Second }, "server.write_timeout"},
+			{"negative IdleTimeout", func(c *Config) { c.Server.IdleTimeout = -time.Second }, "server.idle_timeout"},
+			{"negative ShutdownTimeout", func(c *Config) { c.Server.ShutdownTimeout = -time.Second }, "server.shutdown_timeout"},
+			{"negative RateLimit.Burst", func(c *Config) { c.RateLimit.Burst = -1 }, "rate_limit.burst"},
+		}
+
+		for _, tc := range cases {
+			cfg := baseValid()
+			tc.mutate(&cfg)
+			err := validateConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("%s: validateConfig() = %v, want error containing %q", tc.name, err, tc.wantMsg)
+			}
+		}
+	})
 }

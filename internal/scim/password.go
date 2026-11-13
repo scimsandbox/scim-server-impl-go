@@ -1,8 +1,6 @@
 package scim
 
 import (
-	"errors"
-
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -22,9 +20,6 @@ func HashPassword(raw *string) (*string, error) {
 	}
 	hashed, err := bcrypt.GenerateFromPassword([]byte(val), bcrypt.DefaultCost)
 	if err != nil {
-		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
-			return nil, NewScimError(400, "invalidValue", "password cannot be more than 72 bytes")
-		}
 		return nil, NewScimError(400, "invalidValue", "Failed to hash password")
 	}
 	h := string(hashed)

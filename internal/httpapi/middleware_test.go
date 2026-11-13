@@ -398,6 +398,60 @@ func TestThrottlingMiddleware_FailFast429BurstAndManagementBypass(t *testing.T) 
 	}
 }
 
+func TestResolveRateLimitBurst_AndWaiterCapOverflow(t *testing.T) {
+	t.Parallel()
+
+	if got := resolveRateLimitBurst(0.5, 0); got != 1 {
+		t.Fatalf("resolveRateLimitBurst(0.5, 0) = %d, want 1", got)
+	}
+	if got := resolveRateLimitBurst(25.2, 0); got != 26 {
+		t.Fatalf("resolveRateLimitBurst(25.2, 0) = %d, want 26", got)
+	}
+	if got := resolveRateLimitBurst(5000, 0); got != maxDefaultRateLimitBurst {
+		t.Fatalf("resolveRateLimitBurst(5000, 0) = %d, want %d", got, maxDefaultRateLimitBurst)
+	}
+	if got := resolveRateLimitBurst(5000, 42); got != 42 {
+		t.Fatalf("resolveRateLimitBurst(5000, 42) = %d, want 42", got)
+	}
+
+	// Fill all maxConcurrentRateLimitWaits slots and verify the next request fails fast with 429.
+	entered := make(chan struct{}, maxConcurrentRateLimitWaits)
+	release := make(chan struct{})
+	done := make(chan struct{}, maxConcurrentRateLimitWaits)
+
+	mw := throttlingMiddleware(stubLimiter{
+		allow: func() bool { return false },
+		wait: func(ctx context.Context) error {
+			entered <- struct{}{}
+			<-release
+			return nil
+		},
+	}, time.Second, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < maxConcurrentRateLimitWaits; i++ {
+		go func() {
+			mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil))
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < maxConcurrentRateLimitWaits; i++ {
+		<-entered
+	}
+
+	overflowRec := httptest.NewRecorder()
+	mw.ServeHTTP(overflowRec, httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil))
+	if overflowRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("overflow waiter status = %d, want 429", overflowRec.Code)
+	}
+
+	close(release)
+	for i := 0; i < maxConcurrentRateLimitWaits; i++ {
+		<-done
+	}
+}
+
 func metricValueWithLabels(t *testing.T, metricName string, labels map[string]string) float64 {
 	t.Helper()
 

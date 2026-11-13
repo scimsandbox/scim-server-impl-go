@@ -281,11 +281,6 @@ type token struct {
 
 var tokenRegex = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|[()]|[^\s()]+`)
 
-func tokenize(filter string) []token {
-	tokens, _ := tokenizeLimited(filter, -1)
-	return tokens
-}
-
 func tokenizeLimited(filter string, maxTokens int) ([]token, error) {
 	filter = NormalizeNFC(filter)
 	if maxTokens > 0 && len(filter) > MaxFilterLength {

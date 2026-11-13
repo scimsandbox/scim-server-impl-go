@@ -321,4 +321,21 @@ func TestUserHandler_OversizedAndDeepFilter_Returns400InvalidFilter(t *testing.T
 	if resp["status"] != "400" || resp["scimType"] != "invalidFilter" {
 		t.Fatalf("got status=%v scimType=%v, want 400 invalidFilter", resp["status"], resp["scimType"])
 	}
+
+	// Also verify nil body and malformed JSON (<1 MiB) return 400 invalidSyntax via readJSON/writeReadJSONError.
+	nilBodyRec := httptest.NewRecorder()
+	nilBodyReq, _ := http.NewRequest(http.MethodPost, "/Users", nil)
+	nilBodyReq = nilBodyReq.WithContext(context.WithValue(nilBodyReq.Context(), middleware.WorkspaceIDKey, wsID))
+	uh.CreateUser(nilBodyRec, nilBodyReq)
+	if nilBodyRec.Code != http.StatusBadRequest {
+		t.Fatalf("nil body status = %d, want 400", nilBodyRec.Code)
+	}
+
+	badJSONRec := httptest.NewRecorder()
+	badJSONReq := httptest.NewRequest(http.MethodPost, "/Users", strings.NewReader("{bad-json"))
+	badJSONReq = badJSONReq.WithContext(context.WithValue(badJSONReq.Context(), middleware.WorkspaceIDKey, wsID))
+	uh.CreateUser(badJSONRec, badJSONReq)
+	if badJSONRec.Code != http.StatusBadRequest || !strings.Contains(badJSONRec.Body.String(), "invalidSyntax") {
+		t.Fatalf("malformed JSON got status=%d body=%s, want 400 invalidSyntax", badJSONRec.Code, badJSONRec.Body.String())
+	}
 }

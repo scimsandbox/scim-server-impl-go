@@ -343,4 +343,14 @@ func TestRequestResponseLogging_NeverLogsAuthHeaderAndRedactsAuthorizationInBody
 			t.Fatalf("secret %q leaked into RequestBody: %s", secret, *saved.RequestBody)
 		}
 	}
+
+	// Verify standalone Bearer token and truncated Authorization field fallback redaction.
+	rawBearer := RedactSensitiveBody(`{"detail":"upstream header Bearer secret-jwt-999999"}`)
+	if strings.Contains(rawBearer, "secret-jwt-999999") || !strings.Contains(rawBearer, "Bearer [REDACTED]") {
+		t.Fatalf("expected inline Bearer token to be redacted, got: %s", rawBearer)
+	}
+	truncAuth := RedactSensitiveBody(`{"Authorization":"Bearer cut-off-secret`)
+	if strings.Contains(truncAuth, "cut-off-secret") || !strings.Contains(truncAuth, "[REDACTED]") {
+		t.Fatalf("expected truncated Authorization value to be redacted, got: %s", truncAuth)
+	}
 }

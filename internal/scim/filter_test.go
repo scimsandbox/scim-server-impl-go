@@ -834,6 +834,58 @@ func TestParseFilter_LengthTokenAndDepthLimits(t *testing.T) {
 		if _, err := ParseUserFilter(okParens, 1); err != nil {
 			t.Fatalf("expected nesting at MaxFilterDepth (%d) to succeed, got: %v", MaxFilterDepth, err)
 		}
+
+		// Unparenthesized NOT atom expression succeeds at normal depth
+		notAtom, err := ParseUserFilter(`not userName eq "alice"`, 1)
+		if err != nil || notAtom == nil || !strings.HasPrefix(notAtom.SQL, "NOT (") {
+			t.Fatalf("expected unparenthesized NOT atom to succeed, got res=%v err=%v", notAtom, err)
+		}
+	})
+
+	t.Run("NFC-expanding filter exceeding MaxFilterLength after normalization returns 400 invalidFilter", func(t *testing.T) {
+		// U+0F73 (3 UTF-8 bytes) canonically decomposes to U+0F71 + U+0F72 (6 UTF-8 bytes) under NFC.
+		// 900 runes = 2700 raw bytes (< 4096), expanding to 5400 bytes (> 4096) after NormalizeNFC.
+		nfcExpanding := `userName eq "` + strings.Repeat("\u0F73", 900) + `"`
+		if len(nfcExpanding) >= MaxFilterLength {
+			t.Fatalf("pre-NFC input length %d must be < %d", len(nfcExpanding), MaxFilterLength)
+		}
+		_, err := ParseUserFilter(nfcExpanding, 1)
+		scimErr, ok := err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter after NFC expansion, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("LIKE operators include explicit ESCAPE clause across all filter builders", func(t *testing.T) {
+		userFilters := []string{
+			`schemas co "core"`,
+			`schemas sw "urn:"`,
+			`schemas ew ":User"`,
+			`externalId co "ext_1"`,
+			`externalId sw "ext_"`,
+			`externalId ew "_1"`,
+			`emails.value co "@example.com"`,
+			`emails.value sw "alice@"`,
+			`emails.value ew ".com"`,
+		}
+		for _, f := range userFilters {
+			res, err := ParseUserFilter(f, 1)
+			if err != nil || res == nil || !strings.Contains(res.SQL, `ESCAPE '\'`) {
+				t.Fatalf("ParseUserFilter(%q) = (%v, %v), want SQL with ESCAPE '\\'", f, res, err)
+			}
+		}
+
+		groupFilters := []string{
+			`members.display co "admin"`,
+			`members.display sw "adm"`,
+			`members.display ew "min"`,
+		}
+		for _, f := range groupFilters {
+			res, err := ParseGroupFilter(f, 1)
+			if err != nil || res == nil || !strings.Contains(res.SQL, `ESCAPE '\'`) {
+				t.Fatalf("ParseGroupFilter(%q) = (%v, %v), want SQL with ESCAPE '\\'", f, res, err)
+			}
+		}
 	})
 }
 

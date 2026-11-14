@@ -1598,6 +1598,9 @@ func (h *GroupHandler) applyMemberSubAttrAdd(
 	if targetValue == "" || err != nil {
 		return &scim.ScimError{Status: 400, ScimType: "noTarget", Detail: "No matching member found for path: " + path}
 	}
+	if group != nil && group.ID != uuid.Nil && targetUUID == group.ID {
+		return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "A group cannot be a member of itself"}
+	}
 
 	matchIdx := -1
 	for i := range group.Members {

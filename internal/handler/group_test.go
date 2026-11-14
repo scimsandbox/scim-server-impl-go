@@ -461,3 +461,37 @@ func TestAddMemberTx_RejectsSelfMembershipAndInvalidMemberIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyMemberSubAttrAdd_RejectsSelfMembershipWithoutMutatingGroup(t *testing.T) {
+	t.Parallel()
+
+	gh := &GroupHandler{}
+	wsID := uuid.New()
+	groupID := uuid.New()
+
+	group := &model.ScimGroup{
+		ID:          groupID,
+		WorkspaceID: wsID,
+		DisplayName: "Self SubAttr Test",
+		Members: []model.ScimGroupMembership{
+			{MemberValue: groupID, MemberType: nil},
+		},
+	}
+
+	for _, path := range []string{
+		`members[value eq "` + groupID.String() + `"].type`,
+		`members[$ref eq "/Groups/` + strings.ToUpper(groupID.String()) + `"].type`,
+	} {
+		err := gh.applyMemberSubAttrAdd(context.Background(), nil, group, wsID, path, "Group")
+		scimErr, ok := err.(*scim.ScimError)
+		if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidValue" {
+			t.Fatalf("applyMemberSubAttrAdd(%s) = %T %v, want 400 invalidValue", path, err, err)
+		}
+		if scimErr.Detail != "A group cannot be a member of itself" {
+			t.Fatalf("detail = %q, want %q", scimErr.Detail, "A group cannot be a member of itself")
+		}
+		if group.Members[0].MemberType != nil {
+			t.Fatalf("expected group.Members not to be mutated in memory, got MemberType=%v", *group.Members[0].MemberType)
+		}
+	}
+}

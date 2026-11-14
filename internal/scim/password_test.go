@@ -212,5 +212,59 @@ func TestPassword_RejectsOver72UTF8BytesWith400InvalidValue(t *testing.T) {
 				t.Fatalf("iter %d: extractAndValidatePassword without exact key = (%v, %v, %v), want FirstLexical", i, got, ok, err)
 			}
 		}
+
+		// 3) Pathless PATCH applyValueMap has the same deterministic precedence and validates all variants.
+		for _, badPatchMap := range []map[string]any{
+			{"password": "ValidPassword!1", "Password": ""},
+			{"Password": "ValidPassword!1", "password": 123},
+			{UserSchemaURN + ":Password": "", "password": "ValidPassword!1"},
+		} {
+			uPatchBad := &model.ScimUser{UserName: "alice"}
+			err := ApplyPatchOperations(uPatchBad, []map[string]any{
+				{"op": "replace", "value": badPatchMap},
+			})
+			if scimErr, ok := err.(*ScimError); !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidValue" {
+				t.Fatalf("ApplyPatchOperations(%v) = %T %v, want 400 invalidValue", badPatchMap, err, err)
+			}
+		}
+
+		for i := 0; i < 10; i++ {
+			uExactPatch := &model.ScimUser{UserName: "alice"}
+			if err := ApplyPatchOperations(uExactPatch, []map[string]any{
+				{
+					"op": "replace",
+					"value": map[string]any{
+						"PASSWORD":       "UpperCaseLoser",
+						"Password":       "MixedCaseLoser",
+						"password":       "ExactLowerWinner",
+						"DISPLAYNAME":    "UpperDisplayLoser",
+						"displayName":    "MixedDisplayLoser",
+						"displayname":    "ExactLowerDisplayWinner",
+					},
+				},
+			}); err != nil || uExactPatch.Password == nil {
+				t.Fatalf("iter %d: ApplyPatchOperations exact winner failed: %v", i, err)
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(*uExactPatch.Password), []byte("ExactLowerWinner")); err != nil {
+				t.Fatalf("iter %d: expected ExactLowerWinner in pathless PATCH: %v", i, err)
+			}
+
+			uLexPatch := &model.ScimUser{UserName: "alice"}
+			if err := ApplyPatchOperations(uLexPatch, []map[string]any{
+				{
+					"op": "replace",
+					"value": map[string]any{
+						"pAssword": "ThirdLexical",
+						"Password": "SecondLexical",
+						"PASSWORD": "FirstLexical",
+					},
+				},
+			}); err != nil || uLexPatch.Password == nil {
+				t.Fatalf("iter %d: ApplyPatchOperations lexical winner failed: %v", i, err)
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(*uLexPatch.Password), []byte("FirstLexical")); err != nil {
+				t.Fatalf("iter %d: expected FirstLexical in pathless PATCH: %v", i, err)
+			}
+		}
 	})
 }

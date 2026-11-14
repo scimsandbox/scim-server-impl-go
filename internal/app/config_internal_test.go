@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1036,6 +1037,19 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			{"negative IdleTimeout", func(c *Config) { c.Server.IdleTimeout = -time.Second }, "server.idle_timeout"},
 			{"negative ShutdownTimeout", func(c *Config) { c.Server.ShutdownTimeout = -time.Second }, "server.shutdown_timeout"},
 			{"negative RateLimit.Burst", func(c *Config) { c.RateLimit.Burst = -1 }, "rate_limit.burst"},
+			{"negative RateLimit.PerIPRequestsPerSecond", func(c *Config) { c.RateLimit.PerIPRequestsPerSecond = -0.5 }, "rate_limit.per_ip_requests_per_second"},
+			{"negative RateLimit.PerIPBurst", func(c *Config) { c.RateLimit.PerIPBurst = -1 }, "rate_limit.per_ip_burst"},
+			{"negative RateLimit.PerWorkspaceRequestsPerSecond", func(c *Config) { c.RateLimit.PerWorkspaceRequestsPerSecond = -1 }, "rate_limit.per_workspace_requests_per_second"},
+			{"negative RateLimit.PerWorkspaceBurst", func(c *Config) { c.RateLimit.PerWorkspaceBurst = -2 }, "rate_limit.per_workspace_burst"},
+			{"invalid RateLimit.TrustedProxies IP", func(c *Config) { c.RateLimit.TrustedProxies = "not-an-ip" }, "rate_limit.trusted_proxies"},
+			{"invalid RateLimit.TrustedProxies CIDR", func(c *Config) { c.RateLimit.TrustedProxies = "10.0.0.0/99" }, "rate_limit.trusted_proxies"},
+			{"NaN RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = true; c.RateLimit.RequestsPerSecond = math.NaN() }, "rate_limit.requests_per_second"},
+			{"Inf RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = true; c.RateLimit.RequestsPerSecond = math.Inf(1) }, "rate_limit.requests_per_second"},
+			{"negative disabled RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = false; c.RateLimit.RequestsPerSecond = -1 }, "rate_limit.requests_per_second"},
+			{"NaN RateLimit.PerIPRequestsPerSecond", func(c *Config) { c.RateLimit.PerIPRequestsPerSecond = math.NaN() }, "rate_limit.per_ip_requests_per_second"},
+			{"Inf RateLimit.PerIPRequestsPerSecond", func(c *Config) { c.RateLimit.PerIPRequestsPerSecond = math.Inf(1) }, "rate_limit.per_ip_requests_per_second"},
+			{"NaN RateLimit.PerWorkspaceRequestsPerSecond", func(c *Config) { c.RateLimit.PerWorkspaceRequestsPerSecond = math.NaN() }, "rate_limit.per_workspace_requests_per_second"},
+			{"Inf RateLimit.PerWorkspaceRequestsPerSecond", func(c *Config) { c.RateLimit.PerWorkspaceRequestsPerSecond = math.Inf(-1) }, "rate_limit.per_workspace_requests_per_second"},
 		}
 
 		for _, tc := range cases {
@@ -1045,6 +1059,61 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
 				t.Fatalf("%s: validateConfig() = %v, want error containing %q", tc.name, err, tc.wantMsg)
 			}
+		}
+	})
+
+	t.Run("loads 3-tier rate limit settings from YAML and env overrides", func(t *testing.T) {
+		t.Parallel()
+
+		configDir := t.TempDir()
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		yamlText := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"rate_limit:",
+			"  enabled: true",
+			"  requests_per_second: 1000",
+			"  burst: 100",
+			"  per_ip_requests_per_second: 250",
+			"  per_ip_burst: 50",
+			"  per_workspace_requests_per_second: 250",
+			"  per_workspace_burst: 50",
+			"  trusted_proxies: \"10.0.0.0/8, 127.0.0.1\"",
+			"  wait_timeout: 0s",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlText), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfg, err := loadConfig(func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_RATE_LIMIT_PER_IP_REQUESTS_PER_SECOND":
+				return "120.5", true
+			case "GO_RATE_LIMIT_PER_IP_BURST":
+				return "30", true
+			case "GO_RATE_LIMIT_PER_WORKSPACE_REQUESTS_PER_SECOND":
+				return "300", true
+			case "GO_RATE_LIMIT_PER_WORKSPACE_BURST":
+				return "60", true
+			case "GO_RATE_LIMIT_TRUSTED_PROXIES":
+				return "172.16.0.0/12, ::1", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("loadConfig() error = %v", err)
+		}
+		if cfg.RateLimit.PerIPRequestsPerSecond != 120.5 || cfg.RateLimit.PerIPBurst != 30 {
+			t.Fatalf("PerIP = (%v, %d), want (120.5, 30)", cfg.RateLimit.PerIPRequestsPerSecond, cfg.RateLimit.PerIPBurst)
+		}
+		if cfg.RateLimit.PerWorkspaceRequestsPerSecond != 300 || cfg.RateLimit.PerWorkspaceBurst != 60 {
+			t.Fatalf("PerWorkspace = (%v, %d), want (300, 60)", cfg.RateLimit.PerWorkspaceRequestsPerSecond, cfg.RateLimit.PerWorkspaceBurst)
+		}
+		if cfg.RateLimit.TrustedProxies != "172.16.0.0/12, ::1" {
+			t.Fatalf("TrustedProxies = %q, want %q", cfg.RateLimit.TrustedProxies, "172.16.0.0/12, ::1")
 		}
 	})
 }

@@ -2,10 +2,12 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/scimsandbox/scim-server-impl-go/internal/httpapi"
 	"github.com/scimsandbox/scim-server-impl-go/internal/service"
 )
 
@@ -202,11 +204,32 @@ func validateConfig(cfg Config) error {
 	if cfg.Server.ShutdownTimeout < 0 {
 		return fmt.Errorf("server.shutdown_timeout must be greater than or equal to 0")
 	}
+	if math.IsNaN(cfg.RateLimit.RequestsPerSecond) || math.IsInf(cfg.RateLimit.RequestsPerSecond, 0) {
+		return fmt.Errorf("rate_limit.requests_per_second must be a finite number")
+	}
 	if cfg.RateLimit.Enabled && cfg.RateLimit.RequestsPerSecond <= 0 {
 		return fmt.Errorf("rate_limit.requests_per_second must be greater than 0 when rate limiting is enabled")
 	}
+	if !cfg.RateLimit.Enabled && cfg.RateLimit.RequestsPerSecond < 0 {
+		return fmt.Errorf("rate_limit.requests_per_second must be greater than or equal to 0")
+	}
 	if cfg.RateLimit.Burst < 0 {
 		return fmt.Errorf("rate_limit.burst must be greater than or equal to 0")
+	}
+	if math.IsNaN(cfg.RateLimit.PerIPRequestsPerSecond) || math.IsInf(cfg.RateLimit.PerIPRequestsPerSecond, 0) || cfg.RateLimit.PerIPRequestsPerSecond < 0 {
+		return fmt.Errorf("rate_limit.per_ip_requests_per_second must be a finite number greater than or equal to 0")
+	}
+	if cfg.RateLimit.PerIPBurst < 0 {
+		return fmt.Errorf("rate_limit.per_ip_burst must be greater than or equal to 0")
+	}
+	if math.IsNaN(cfg.RateLimit.PerWorkspaceRequestsPerSecond) || math.IsInf(cfg.RateLimit.PerWorkspaceRequestsPerSecond, 0) || cfg.RateLimit.PerWorkspaceRequestsPerSecond < 0 {
+		return fmt.Errorf("rate_limit.per_workspace_requests_per_second must be a finite number greater than or equal to 0")
+	}
+	if cfg.RateLimit.PerWorkspaceBurst < 0 {
+		return fmt.Errorf("rate_limit.per_workspace_burst must be greater than or equal to 0")
+	}
+	if _, err := httpapi.ParseTrustedProxies(cfg.RateLimit.TrustedProxies); err != nil {
+		return fmt.Errorf("rate_limit.trusted_proxies: %w", err)
 	}
 	if cfg.RateLimit.WaitTimeout < 0 {
 		return fmt.Errorf("rate_limit.wait_timeout must be greater than or equal to 0")

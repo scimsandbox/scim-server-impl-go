@@ -234,6 +234,7 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	apiRouter.Route("/ws/{workspaceId}/scim/v2", func(r chi.Router) {
 		r.Use(middleware.ExtractWorkspaceID)
 		r.Use(middleware.BearerTokenAuth(tokenRepo, workspaceRepo))
+		r.Use(httpapi.NewWorkspaceRateLimitMiddleware(cfg.RateLimit))
 		r.Use(middleware.RequestResponseLogging(requestLogRepo))
 
 		registerScimEndpoints(r)

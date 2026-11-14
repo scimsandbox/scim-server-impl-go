@@ -563,7 +563,301 @@ func TestRedactSensitiveBody_UnicodeEscapedKeysAndValues(t *testing.T) {
 
 	oddBackslashTrunc := `{"note":"\\\u0042earer secret-jwt-11`
 	gotOddTrunc := RedactSensitiveBody(oddBackslashTrunc)
-	if strings.Contains(gotOddTrunc, "secret-jwt-11") || !strings.Contains(gotOddTrunc, `\\Bearer [REDACTED]`) {
+	if strings.Contains(gotOddTrunc, "secret-jwt-11") || !strings.Contains(gotOddTrunc, `\\\u0042earer [REDACTED]`) {
 		t.Fatalf("unexpected odd-backslash truncated output: %s", gotOddTrunc)
 	}
+}
+
+func TestRedactSensitiveBody_SurgicalByteForBytePreservationAndNoProseFalsePositives(t *testing.T) {
+	t.Parallel()
+
+	// Multi-line formatted JSON with custom key order, indentation, Unicode escapes,
+	// large numbers, null password field in nested metadata, and English prose containing "Bearer".
+	rawFormatted := "{\n" +
+		"  \"zzzCustomOrderFirst\": true,\n" +
+		"  \"userName\": \"j\\u00f6rg@example.com\",\n" +
+		"  \"displayName\": \"\\u0041lvarez \\uD83D\\uDE00\",\n" +
+		"  \"title\": \"Bearer Bonds Analyst\",\n" +
+		"  \"department\": \"Bearer Securities\",\n" +
+		"  \"bio\": \"Handles Bearer Instruments, BEARER BONDS, bearer authentication, and bearer token docs.\",\n" +
+		"  \"quota\": 1000000000000000001,\n" +
+		"  \"previousAuth\": {\"password\": null},\n" +
+		"  \"password\": \"Secret!123\",\n" +
+		"  \"aaaLastKey\": \"keep\\twhitespace\\nand escapes\"\n" +
+		"}"
+	wantFormatted := strings.Replace(rawFormatted, `"Secret!123"`, `"[REDACTED]"`, 1)
+
+	gotFormatted := RedactSensitiveBody(rawFormatted)
+	if gotFormatted != wantFormatted {
+		t.Fatalf("RedactSensitiveBody mutated unrelated bytes:\ngot:\n%s\nwant:\n%s", gotFormatted, wantFormatted)
+	}
+
+	// Verify RequestResponseLogging also persists the exact byte-for-byte surgical output.
+	wsID := uuid.New()
+	logStore := &stubRequestLogCreator{}
+	mw := RequestResponseLogging(logStore)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(rawFormatted))
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", bytes.NewBufferString(rawFormatted))
+	mw.ServeHTTP(httptest.NewRecorder(), req)
+	if len(logStore.logs) != 1 || logStore.logs[0].RequestBody == nil || logStore.logs[0].ResponseBody == nil {
+		t.Fatalf("expected persisted request and response logs")
+	}
+	if *logStore.logs[0].RequestBody != wantFormatted {
+		t.Fatalf("persisted RequestBody mutated unrelated bytes:\ngot:\n%s\nwant:\n%s", *logStore.logs[0].RequestBody, wantFormatted)
+	}
+	if *logStore.logs[0].ResponseBody != wantFormatted {
+		t.Fatalf("persisted ResponseBody mutated unrelated bytes:\ngot:\n%s\nwant:\n%s", *logStore.logs[0].ResponseBody, wantFormatted)
+	}
+
+	// Exact byte-for-byte check for PATCH (both path-before-value and value-before-path),
+	// Unicode-escaped password key, Authorization field, and inline Bearer token alongside \uXXXX escapes.
+	exactCases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "PATCH path before value and value before path with sibling escapes and prose",
+			raw: "{\n" +
+				"  \"Operations\": [\n" +
+				"    {\"op\": \"replace\", \"path\": \"password\", \"value\": \"PatchSecret!1\"},\n" +
+				"    {\"value\": \"PatchSecret!2\", \"op\": \"replace\", \"path\": \"urn:ietf:params:scim:schemas:core:2.0:User:password\"},\n" +
+				"    {\"op\": \"replace\", \"path\": \"title\", \"value\": \"Bearer Bonds Analyst \\u00f6\"}\n" +
+				"  ]\n" +
+				"}",
+			want: "{\n" +
+				"  \"Operations\": [\n" +
+				"    {\"op\": \"replace\", \"path\": \"password\", \"value\": \"[REDACTED]\"},\n" +
+				"    {\"value\": \"[REDACTED]\", \"op\": \"replace\", \"path\": \"urn:ietf:params:scim:schemas:core:2.0:User:password\"},\n" +
+				"    {\"op\": \"replace\", \"path\": \"title\", \"value\": \"Bearer Bonds Analyst \\u00f6\"}\n" +
+				"  ]\n" +
+				"}",
+		},
+		{
+			name: "Unicode-escaped password key preserves key escape and sibling escapes",
+			raw:  `{"userName": "j\u00f6rg@example.com", "\u0070assword": "EscKeySecret!9"}`,
+			want: `{"userName": "j\u00f6rg@example.com", "\u0070assword": "[REDACTED]"}`,
+		},
+		{
+			name: "Authorization key redacts entire value while preserving sibling escapes",
+			raw:  `{"Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig", "displayName": "\u0041lvarez"}`,
+			want: `{"Authorization": "[REDACTED]", "displayName": "\u0041lvarez"}`,
+		},
+		{
+			name: "Inline real Bearer credentials redacted in-place while preserving escapes in same string",
+			raw:  `{"detail": "user j\u00f6rg sent Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig. Role: Bearer Bonds Analyst"}`,
+			want: `{"detail": "user j\u00f6rg sent Bearer [REDACTED]. Role: Bearer Bonds Analyst"}`,
+		},
+		{
+			name: "Inline Bearer token shapes (base64, underscore, camelCase, long alpha, colon suffix)",
+			raw:  `{"a":"Bearer dG9rZW4=","b":"Bearer sk_live_abc","c":"Bearer mySecretToken:","d":"Bearer abcdefghijklmnopqrstuvwxyz"}`,
+			want: `{"a":"Bearer [REDACTED]","b":"Bearer [REDACTED]","c":"Bearer [REDACTED]:","d":"Bearer [REDACTED]"}`,
+		},
+		{
+			name: "Raw text with literal backslash-t escape and invalid JSON escape sequences",
+			raw:  `upstream=Bearer\traw_token_123 {"misc":"\b\f\/invalid\q","trail":"backslash\`,
+			want: `upstream=Bearer\t[REDACTED] {"misc":"\b\f\/invalid\q","trail":"backslash\`,
+		},
+		{
+			name: "Malformed object with leading garbage and nested object/array recovery",
+			raw:  `{garbage_tok, {"password":"InnerSecret!1"}, ["Bearer tok_arr_99"], "lone_key_no_colon"}`,
+			want: `{garbage_tok, {"password":"[REDACTED]"}, ["Bearer [REDACTED]"], "lone_key_no_colon"}`,
+		},
+		{
+			name: "Malformed truncated colons, arrays with mismatched braces, and raw non-credential bearer words",
+			raw:  `role=cupbearer scheme=Bearer: [ : "Bearer tok_arr_77" } {"password": } "password": `,
+			want: `role=cupbearer scheme=Bearer: [ : "Bearer [REDACTED]" } {"password": } "password": `,
+		},
+	}
+
+	for _, tc := range exactCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RedactSensitiveBody(tc.raw)
+			if got != tc.want {
+				t.Fatalf("%s:\ngot:  %s\nwant: %s", tc.name, got, tc.want)
+			}
+		})
+	}
+
+	// Direct unit check on applyRedactSpans overlap/tie-break safety.
+	overlapped := applyRedactSpans("0123456789", []redactSpan{
+		{start: 2, end: 5, replacement: "A"},
+		{start: 2, end: 8, replacement: "BIG"},
+		{start: 4, end: 7, replacement: "INNER"},
+	})
+	if overlapped != "01BIG89" {
+		t.Fatalf("applyRedactSpans overlap = %q, want 01BIG89", overlapped)
+	}
+}
+
+func TestRedactSensitiveBody_Round2EdgeCases(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+
+	t.Run("enterprise and custom URN :password PATCH paths are redacted", func(t *testing.T) {
+		raw := `{
+			"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+			"Operations":[
+				{"op":"replace","path":"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:password","value":"EntUrnSecret!1"},
+				{"value":"CustomUrnSecret!2","op":"add","path":"urn:example:custom:2.0:User:Password"}
+			]
+		}`
+		got := RedactSensitiveBody(raw)
+		if strings.Contains(got, "EntUrnSecret!1") || strings.Contains(got, "CustomUrnSecret!2") {
+			t.Fatalf("URN :password PATCH value leaked: %s", got)
+		}
+	})
+
+	t.Run("22KB PatchOp with value before path across maxBodyCapture boundary is redacted and marked truncated", func(t *testing.T) {
+		secret := "SuperSecretAdminPass!1"
+		padding := strings.Repeat(" ", 21000)
+		largePatch := `{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"value":"` + secret + `","op":"replace",` + padding + `"path":"password"}]}`
+		if len(largePatch) <= maxBodyCapture {
+			t.Fatalf("expected payload > %d bytes, got %d", maxBodyCapture, len(largePatch))
+		}
+
+		// Case 1: downstream handler reads full 22KB body (200 OK).
+		storeRead := &stubRequestLogCreator{}
+		mwRead := RequestResponseLogging(storeRead)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			full, err := io.ReadAll(r.Body)
+			if err != nil || len(full) != len(largePatch) {
+				t.Errorf("downstream read %d bytes (err=%v), want %d", len(full), err, len(largePatch))
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		mwRead.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPatch, "/ws/"+wsID.String()+"/scim/v2/Users/1", strings.NewReader(largePatch)))
+		if len(storeRead.logs) != 1 || storeRead.logs[0].RequestBody == nil {
+			t.Fatal("expected saved request log")
+		}
+		loggedRead := *storeRead.logs[0].RequestBody
+		if strings.Contains(loggedRead, secret) {
+			t.Fatalf("22KB PatchOp leaked cleartext password across capture boundary: %s", loggedRead[:200])
+		}
+		if !strings.Contains(loggedRead, `"[REDACTED]"`) {
+			t.Fatalf("expected [REDACTED] in logged 22KB PatchOp: %s", loggedRead[:200])
+		}
+		if !strings.HasSuffix(loggedRead, "...[truncated]") {
+			t.Fatalf("expected ...[truncated] suffix on >maxBodyCapture request")
+		}
+
+		// Case 2: downstream handler returns early without reading r.Body (post-handler CopyN + probe path).
+		storeUnread := &stubRequestLogCreator{}
+		mwUnread := RequestResponseLogging(storeUnread)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+		}))
+		mwUnread.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPatch, "/ws/"+wsID.String()+"/scim/v2/Users/1", strings.NewReader(largePatch)))
+		if len(storeUnread.logs) != 1 || storeUnread.logs[0].RequestBody == nil {
+			t.Fatal("expected saved request log for unread body")
+		}
+		loggedUnread := *storeUnread.logs[0].RequestBody
+		if strings.Contains(loggedUnread, secret) || !strings.HasSuffix(loggedUnread, "...[truncated]") {
+			t.Fatalf("unread 22KB PatchOp failed redaction or truncation marker: %s", loggedUnread[:200])
+		}
+	})
+
+	t.Run("22KB BulkRequest shrinking below maxBodyLog after redaction still redacts split op and marks truncated", func(t *testing.T) {
+		var sb strings.Builder
+		sb.WriteString(`{"schemas":["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],"Operations":[`)
+		longPw := "BulkUserLongPassword_" + strings.Repeat("X", 52) // 73 chars -> shrinks by 63 chars each
+		for i := 0; i < 25; i++ {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(`{"method":"POST","path":"/Users","bulkId":"u"`)
+			sb.WriteString(`,"data":{"userName":"user@example.com","password":"` + longPw + `"}}`)
+		}
+		// Pad with spaces up to ~20,940 bytes so the final PATCH operation straddles byte 21,024.
+		if sb.Len() >= 20940 {
+			t.Fatalf("prefix unexpectedly large: %d", sb.Len())
+		}
+		sb.WriteString(strings.Repeat(" ", 20940-sb.Len()))
+		tailSecret := "LeakedBulkPassword!99"
+		sb.WriteString(`,{"method":"PATCH","path":"/Users/1","data":{"Operations":[{"value":"` + tailSecret + `","op":"replace",` + strings.Repeat(" ", 80) + `"path":"password"}]}}]}`)
+		bulkPayload := sb.String()
+		if len(bulkPayload) <= maxBodyCapture {
+			t.Fatalf("expected bulkPayload > %d, got %d", maxBodyCapture, len(bulkPayload))
+		}
+
+		store := &stubRequestLogCreator{}
+		mw := RequestResponseLogging(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			// Also write a >maxBodyCapture response that shrinks below maxBodyLog after redaction.
+			_, _ = w.Write([]byte(bulkPayload))
+		}))
+		mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Bulk", strings.NewReader(bulkPayload)))
+
+		if len(store.logs) != 1 || store.logs[0].RequestBody == nil || store.logs[0].ResponseBody == nil {
+			t.Fatal("expected saved request and response logs")
+		}
+		for label, body := range map[string]string{
+			"RequestBody":  *store.logs[0].RequestBody,
+			"ResponseBody": *store.logs[0].ResponseBody,
+		} {
+			if strings.Contains(body, longPw) || strings.Contains(body, tailSecret) {
+				t.Fatalf("%s leaked password in shrinking 22KB BulkRequest", label)
+			}
+			if !strings.HasSuffix(body, "...[truncated]") {
+				t.Fatalf("%s missing ...[truncated] suffix after redaction shrank length to %d", label, len(body))
+			}
+		}
+	})
+
+	t.Run("unclosed PATCH op preserves closed non-password path value and redacts truncated mid-path value", func(t *testing.T) {
+		safeUnclosed := `{"Operations":[{"path":"title","op":"replace","value":"KeepTitleCut`
+		if got := RedactSensitiveBody(safeUnclosed); got != safeUnclosed {
+			t.Fatalf("expected closed non-password path unclosed op preserved, got: %s", got)
+		}
+
+		midPathUnclosed := `{"Operations":[{"value":"MidPathSecret!1","op":"replace","path":"urn:ietf:params:scim:schemas:core:2.0:User`
+		gotMid := RedactSensitiveBody(midPathUnclosed)
+		if strings.Contains(gotMid, "MidPathSecret!1") || !strings.Contains(gotMid, `"[REDACTED]"`) {
+			t.Fatalf("expected truncated mid-path PATCH op value redacted, got: %s", gotMid)
+		}
+	})
+
+	t.Run("doubled Bearer Bearer and sentence-ending exclamation marks", func(t *testing.T) {
+		cases := []struct {
+			name string
+			raw  string
+			want string
+		}{
+			{
+				name: "doubled Bearer Bearer in JSON string",
+				raw:  `{"detail": "Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig"}`,
+				want: `{"detail": "Bearer Bearer [REDACTED]"}`,
+			},
+			{
+				name: "Scheme Bearer newline Bearer in JSON string",
+				raw:  `{"detail": "Scheme: Bearer\nBearer eyJhbGciOiJIUzI1NiJ9.e30.sig"}`,
+				want: `{"detail": "Scheme: Bearer\nBearer [REDACTED]"}`,
+			},
+			{
+				name: "doubled Bearer Bearer in raw text",
+				raw:  "Authorization=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig",
+				want: "Authorization=Bearer Bearer [REDACTED]",
+			},
+			{
+				name: "sentence-ending exclamation after prose Bearer Bonds! is not redacted",
+				raw:  `{"bio": "Handles Bearer Bonds! Loves Bearer Securities!"}`,
+				want: `{"bio": "Handles Bearer Bonds! Loves Bearer Securities!"}`,
+			},
+			{
+				name: "sentence-ending exclamation after real token preserves trailing !",
+				raw:  `{"detail": "Leaked Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig!"}`,
+				want: `{"detail": "Leaked Bearer [REDACTED]!"}`,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := RedactSensitiveBody(tc.raw); got != tc.want {
+					t.Fatalf("got:  %s\nwant: %s", got, tc.want)
+				}
+			})
+		}
+	})
 }

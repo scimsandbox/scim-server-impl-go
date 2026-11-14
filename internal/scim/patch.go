@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
@@ -264,7 +265,7 @@ func setSingleAttribute(user *model.ScimUser, path string, value any) error {
 		}
 		user.Active = b
 	case "password":
-		rawPw, err := parseRawStringPtr(value, "password")
+		rawPw, err := parsePasswordValue(value)
 		if err != nil {
 			return err
 		}
@@ -527,11 +528,50 @@ func applyValueMap(user *model.ScimUser, value any, isReplace bool) error {
 	if !ok {
 		return NewScimError(400, "invalidValue", "PATCH add/replace without path requires a value object")
 	}
-	for k, v := range m {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b string) int {
+		sa := stripPatchURNPrefix(a)
+		sb := stripPatchURNPrefix(b)
+		la := strings.ToLower(sa)
+		lb := strings.ToLower(sb)
+		if cmp := strings.Compare(la, lb); cmp != 0 {
+			return cmp
+		}
+		// Within duplicate case-variants of the same attribute, order lower-precedence
+		// variants first (validating every variant) so the winning key executes last:
+		// exact canonical lowercase wins (unprefixed "password" > URN-prefixed ":password"),
+		// otherwise the lexically smallest key wins.
+		rank := func(raw, stripped, lower string) int {
+			if raw == lower {
+				return 2
+			}
+			if stripped == lower {
+				return 1
+			}
+			return 0
+		}
+		ra, rb := rank(a, sa, la), rank(b, sb, lb)
+		if ra != rb {
+			return ra - rb
+		}
+		return strings.Compare(b, a)
+	})
+
+	for i, k := range keys {
+		v := m[k]
 		key := stripPatchURNPrefix(k)
 		lower := strings.ToLower(key)
 		if readOnlyAttrs[lower] || strings.HasPrefix(lower, "meta.") {
 			return NewScimError(400, "mutability", "Attribute '"+k+"' is read-only")
+		}
+		if lower == "password" && i+1 < len(keys) && strings.EqualFold(stripPatchURNPrefix(keys[i+1]), "password") {
+			if _, err := parsePasswordValue(v); err != nil {
+				return err
+			}
+			continue
 		}
 		if lower == "name" {
 			if err := setNameAttribute(user, v); err != nil {

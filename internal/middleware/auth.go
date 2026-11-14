@@ -19,6 +19,24 @@ type contextKey string
 
 const WorkspaceIDKey contextKey = "workspaceID"
 
+type authenticatedWorkspaceIDKey struct{}
+
+// WithAuthenticatedWorkspaceID returns a derived context carrying the verified
+// workspace UUID after successful authentication.
+func WithAuthenticatedWorkspaceID(ctx context.Context, id uuid.UUID) context.Context {
+	return context.WithValue(ctx, authenticatedWorkspaceIDKey{}, id)
+}
+
+// AuthenticatedWorkspaceID returns the verified workspace UUID set by BearerTokenAuth.
+// It returns false for unauthenticated requests (including anonymous discovery calls).
+func AuthenticatedWorkspaceID(ctx context.Context) (uuid.UUID, bool) {
+	if ctx == nil {
+		return uuid.Nil, false
+	}
+	id, ok := ctx.Value(authenticatedWorkspaceIDKey{}).(uuid.UUID)
+	return id, ok && id != uuid.Nil
+}
+
 type tokenFinder interface {
 	FindByTokenHashNotRevoked(ctx context.Context, tokenHash string) (*model.WorkspaceToken, error)
 }
@@ -95,6 +113,7 @@ func BearerTokenAuth(tokenRepo tokenFinder, workspaceRepo workspaceFinder) func(
 
 			markAuthenticatedPrincipal(r, workspaceRepo, workspaceID)
 			MarkAuthentication(r, AuthenticationOK)
+			r = r.WithContext(WithAuthenticatedWorkspaceID(r.Context(), workspaceID))
 			next.ServeHTTP(w, r)
 		})
 	}

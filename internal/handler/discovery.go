@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -182,11 +183,9 @@ func (h *DiscoveryHandler) RootSearch(w http.ResponseWriter, r *http.Request) {
 
 	var body map[string]any
 	if r.Method == http.MethodPost {
-		if err := readJSON(r, &body); err != nil {
-			if err != io.EOF {
-				scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
-				return
-			}
+		if err := readJSON(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
+			writeReadJSONError(w, err)
+			return
 		}
 	}
 

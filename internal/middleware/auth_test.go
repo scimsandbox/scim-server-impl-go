@@ -145,6 +145,10 @@ func TestBearerTokenAuth_MarksAuthenticationOKForValidToken(t *testing.T) {
 			return &model.Workspace{ID: id, CreatedByUsername: &userEmail}, nil
 		},
 	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotWS, ok := AuthenticatedWorkspaceID(r.Context())
+		if !ok || gotWS != workspaceID {
+			t.Errorf("AuthenticatedWorkspaceID = (%v, %v), want (%v, true)", gotWS, ok, workspaceID)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	handler.ServeHTTP(rw, req)
@@ -272,6 +276,29 @@ func TestBearerTokenAuth_AnonymousServiceProviderConfig(t *testing.T) {
 	mw.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusUnauthorized {
 		t.Fatalf("invalid token GET /ServiceProviderConfig = %d, want 401", rec3.Code)
+	}
+
+	// 4. Verify anonymous GET /ServiceProviderConfig does NOT set AuthenticatedWorkspaceID in context
+	var anonAuthWSSeen bool
+	mwCheckCtx := BearerTokenAuth(tokenRepo, wsRepo)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, anonAuthWSSeen = AuthenticatedWorkspaceID(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+	req4 := httptest.NewRequest(http.MethodGet, "/ws/"+existingWS.String()+"/scim/v2/ServiceProviderConfig", nil)
+	req4 = req4.WithContext(context.WithValue(req4.Context(), WorkspaceIDKey, existingWS))
+	mwCheckCtx.ServeHTTP(httptest.NewRecorder(), req4)
+	if anonAuthWSSeen {
+		t.Fatal("anonymous ServiceProviderConfig must not populate AuthenticatedWorkspaceID")
+	}
+
+	if _, ok := AuthenticatedWorkspaceID(nil); ok { //nolint:staticcheck // testing nil context safety
+		t.Fatal("AuthenticatedWorkspaceID(nil) = true, want false")
+	}
+	if _, ok := AuthenticatedWorkspaceID(context.Background()); ok {
+		t.Fatal("AuthenticatedWorkspaceID(background) = true, want false")
+	}
+	if _, ok := AuthenticatedWorkspaceID(WithAuthenticatedWorkspaceID(context.Background(), uuid.Nil)); ok {
+		t.Fatal("AuthenticatedWorkspaceID(uuid.Nil) = true, want false")
 	}
 }
 

@@ -1,7 +1,7 @@
 # SCIM Sandbox - Server Impl Go
 
 > [!WARNING]
-> **Data Privacy / PII**: This application is built as a sandbox. It stores SCIM request and response payloads in the database without redaction for debugging purposes. Treat it as a local or development sandbox service, not a hardened production deployment.
+> **Data Privacy / PII**: This application is built as a sandbox. While `password`, `Authorization`, and inline `Bearer` credential values are surgically redacted before persistence, all other SCIM request and response payload fields (including user PII) are stored verbatim in the database for debugging purposes. Treat it as a local or development sandbox service, not a hardened production deployment.
 
 This repository contains the standalone Go SCIM 2.0 service implementation
 for the SCIM Sandbox project. It provides the server-side SCIM API,
@@ -193,6 +193,15 @@ Useful environment overrides:
 - `GO_SERVER_BASE_URL`
 - `GO_CURSOR_SECRET`
 - `GO_MANAGEMENT_PORT`
+- `GO_RATE_LIMIT_ENABLED`
+- `GO_RATE_LIMIT_REQUESTS_PER_SECOND`
+- `GO_RATE_LIMIT_BURST`
+- `GO_RATE_LIMIT_PER_IP_REQUESTS_PER_SECOND`
+- `GO_RATE_LIMIT_PER_IP_BURST`
+- `GO_RATE_LIMIT_PER_WORKSPACE_REQUESTS_PER_SECOND`
+- `GO_RATE_LIMIT_PER_WORKSPACE_BURST`
+- `GO_RATE_LIMIT_TRUSTED_PROXIES`
+- `GO_RATE_LIMIT_WAIT_TIMEOUT`
 - `GO_DATASOURCE_URL`
 - `GO_DATASOURCE_USERNAME`
 - `GO_DATASOURCE_PASSWORD`
@@ -228,6 +237,25 @@ ordered by `created_at DESC, id DESC`) and prunes excess records hourly (`1h`) i
 safe batches of `5000` rows. An initial cleanup cycle runs on startup. Disabling
 `GO_CLEANUP_ENABLED` acts as a master switch to disable all cleanup tasks, or request log
 pruning can be individually toggled via `GO_CLEANUP_REQUEST_LOGS_ENABLED`.
+
+### Rate Limiting
+
+When `rate_limit.enabled` (`GO_RATE_LIMIT_ENABLED`) is `true`, API traffic is
+enforced across three tiers, returning RFC 7644 `429 Too Many Requests`
+(`scimType: "tooMany"`, `Retry-After: 1`) when exceeded:
+
+1. **Pre-auth per-client-IP** (`per_ip_requests_per_second`, `per_ip_burst`):
+   evaluated before authentication so abusive single-source floods cannot reach
+   database token lookups or consume global capacity. When the immediate peer
+   is loopback, private, link-local, or matches `trusted_proxies`
+   (`GO_RATE_LIMIT_TRUSTED_PROXIES`, comma-separated IPs/CIDRs), `CF-Connecting-IP`
+   (or the rightmost `X-Forwarded-For` hop) is used as the client IP; headers
+   from untrusted public peers are ignored.
+2. **Pre-auth server-wide global cap** (`requests_per_second`, `burst`): bounds
+   aggregate admitted request concurrency across all clients and workspaces.
+3. **Post-auth per-workspace** (`per_workspace_requests_per_second`,
+   `per_workspace_burst`): evaluated only after `BearerTokenAuth` verifies the
+   workspace token so unauthenticated callers cannot exhaust a tenant's bucket.
 
 ### Token Expiration
 

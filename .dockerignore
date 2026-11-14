@@ -31,7 +31,9 @@ trivy-image.sarif
 *.swp
 *~
 
-# Local SOPS / age artifacts
+# Local SOPS / age & secret config artifacts
+config/app-secrets.yaml
+config/*secret*
 *.agekey
 *.decrypted.yaml
 *.decrypted.yml

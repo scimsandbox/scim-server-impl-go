@@ -9,8 +9,16 @@ management:
   port: 9090
 rate_limit:
   enabled: true
+  # Server-wide global cap across all clients and workspaces
   requests_per_second: 1000
-  wait_timeout: 60s
+  burst: 100
+  # Pre-auth per-client-IP limit (protects DB auth lookups from unauthenticated floods)
+  per_ip_requests_per_second: 250
+  per_ip_burst: 50
+  # Post-auth per-workspace limit (isolates authenticated tenants)
+  per_workspace_requests_per_second: 250
+  per_workspace_burst: 50
+  wait_timeout: 0s
 storage:
   dsn: "jdbc:postgresql://localhost:5432/scimplayground"
   username: "scim_playground"

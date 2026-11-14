@@ -2,6 +2,8 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -866,6 +868,252 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "cleanup.request_logs.max_count") {
 			t.Fatalf("loadConfig() error = %q, want request logs max_count validation message", err.Error())
+		}
+	})
+
+	t.Run("loads cleanly without app-secrets.yaml and applies HTTP server timeout defaults", func(t *testing.T) {
+		t.Parallel()
+
+		configDir := t.TempDir()
+		// Write ONLY app-conf.yaml (no app-secrets.yaml on disk) and omit server timeout fields to verify safe fallback defaults.
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		config := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"rate_limit:",
+			"  enabled: true",
+			"  requests_per_second: 500",
+			"  burst: 50",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfg, err := loadConfig(func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_DATASOURCE_URL":
+				return "postgres://env_user:env_pass@db.internal:5432/scim", true
+			case "GO_CURSOR_SECRET":
+				return "env-provided-cursor-secret-at-least-32-chars", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("loadConfig() without app-secrets.yaml failed: %v", err)
+		}
+		if cfg.RateLimit.Burst != 50 {
+			t.Fatalf("cfg.RateLimit.Burst = %d, want 50", cfg.RateLimit.Burst)
+		}
+		if cfg.Server.ReadTimeout != defaultServerReadTimeout {
+			t.Fatalf("ReadTimeout = %v, want %v", cfg.Server.ReadTimeout, defaultServerReadTimeout)
+		}
+		if cfg.Server.ReadHeaderTimeout != defaultServerReadHeaderTimeout {
+			t.Fatalf("ReadHeaderTimeout = %v, want %v", cfg.Server.ReadHeaderTimeout, defaultServerReadHeaderTimeout)
+		}
+		if cfg.Server.WriteTimeout != defaultServerWriteTimeout {
+			t.Fatalf("WriteTimeout = %v, want %v", cfg.Server.WriteTimeout, defaultServerWriteTimeout)
+		}
+		if cfg.Server.IdleTimeout != defaultServerIdleTimeout {
+			t.Fatalf("IdleTimeout = %v, want %v", cfg.Server.IdleTimeout, defaultServerIdleTimeout)
+		}
+		if cfg.Server.ShutdownTimeout != defaultServerShutdownTimeout {
+			t.Fatalf("ShutdownTimeout = %v, want %v", cfg.Server.ShutdownTimeout, defaultServerShutdownTimeout)
+		}
+	})
+
+	t.Run("preserves explicit 0s HTTP server timeouts in YAML and environment overrides", func(t *testing.T) {
+		t.Parallel()
+
+		configDir := t.TempDir()
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		yamlZero := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"  read_timeout: 0s",
+			"  read_header_timeout: 0s",
+			"  write_timeout: 0s",
+			"  idle_timeout: 0s",
+			"  shutdown_timeout: 0s",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlZero), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfgYAMLZero, err := loadConfig(func(key string) (string, bool) {
+			if key == "GO_CONFIG_DIR" {
+				return configDir, true
+			}
+			return "", false
+		})
+		if err != nil {
+			t.Fatalf("loadConfig(YAML 0s) error = %v", err)
+		}
+		if cfgYAMLZero.Server.ReadTimeout != 0 ||
+			cfgYAMLZero.Server.ReadHeaderTimeout != 0 ||
+			cfgYAMLZero.Server.WriteTimeout != 0 ||
+			cfgYAMLZero.Server.IdleTimeout != 0 ||
+			cfgYAMLZero.Server.ShutdownTimeout != 0 {
+			t.Fatalf("expected all YAML 0s server timeouts to remain 0, got %+v", cfgYAMLZero.Server)
+		}
+
+		yamlNonZero := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"  read_timeout: 20s",
+			"  read_header_timeout: 12s",
+			"  write_timeout: 45s",
+			"  idle_timeout: 90s",
+			"  shutdown_timeout: 25s",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlNonZero), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfgEnvZero, err := loadConfig(func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_SERVER_READ_TIMEOUT",
+				"GO_SERVER_READ_HEADER_TIMEOUT",
+				"GO_SERVER_WRITE_TIMEOUT",
+				"GO_SERVER_IDLE_TIMEOUT",
+				"GO_SERVER_SHUTDOWN_TIMEOUT":
+				return "0s", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("loadConfig(env 0s) error = %v", err)
+		}
+		if cfgEnvZero.Server.ReadTimeout != 0 ||
+			cfgEnvZero.Server.ReadHeaderTimeout != 0 ||
+			cfgEnvZero.Server.WriteTimeout != 0 ||
+			cfgEnvZero.Server.IdleTimeout != 0 ||
+			cfgEnvZero.Server.ShutdownTimeout != 0 {
+			t.Fatalf("expected all env 0s server timeouts to remain 0, got %+v", cfgEnvZero.Server)
+		}
+
+		// Verify shutdownContext does not immediately expire when ShutdownTimeout == 0.
+		noTimeoutCtx, noTimeoutCancel := shutdownContext(context.Background(), 0)
+		defer noTimeoutCancel()
+		if _, hasDeadline := noTimeoutCtx.Deadline(); hasDeadline {
+			t.Fatal("expected no deadline on shutdownContext when timeout == 0")
+		}
+		if err := noTimeoutCtx.Err(); err != nil {
+			t.Fatalf("expected non-expired context when timeout == 0, got %v", err)
+		}
+
+		withTimeoutCtx, withTimeoutCancel := shutdownContext(context.Background(), 5*time.Second)
+		defer withTimeoutCancel()
+		if _, hasDeadline := withTimeoutCtx.Deadline(); !hasDeadline {
+			t.Fatal("expected deadline on shutdownContext when timeout > 0")
+		}
+	})
+
+	t.Run("rejects negative server timeouts and negative rate limit burst", func(t *testing.T) {
+		t.Parallel()
+
+		baseValid := func() Config {
+			return Config{
+				Cleanup: CleanupConfig{
+					RequestLogs: CleanupRequestLogsConfig{Interval: time.Hour, MaxCount: 100},
+					AsyncEvents: CleanupAsyncEventsConfig{Interval: time.Hour, MaxCount: 100, StalePendingAfter: time.Minute},
+				},
+			}
+		}
+
+		cases := []struct {
+			name    string
+			mutate  func(*Config)
+			wantMsg string
+		}{
+			{"negative ReadTimeout", func(c *Config) { c.Server.ReadTimeout = -time.Second }, "server.read_timeout"},
+			{"negative ReadHeaderTimeout", func(c *Config) { c.Server.ReadHeaderTimeout = -time.Second }, "server.read_header_timeout"},
+			{"negative WriteTimeout", func(c *Config) { c.Server.WriteTimeout = -time.Second }, "server.write_timeout"},
+			{"negative IdleTimeout", func(c *Config) { c.Server.IdleTimeout = -time.Second }, "server.idle_timeout"},
+			{"negative ShutdownTimeout", func(c *Config) { c.Server.ShutdownTimeout = -time.Second }, "server.shutdown_timeout"},
+			{"negative RateLimit.Burst", func(c *Config) { c.RateLimit.Burst = -1 }, "rate_limit.burst"},
+			{"negative RateLimit.PerIPRequestsPerSecond", func(c *Config) { c.RateLimit.PerIPRequestsPerSecond = -0.5 }, "rate_limit.per_ip_requests_per_second"},
+			{"negative RateLimit.PerIPBurst", func(c *Config) { c.RateLimit.PerIPBurst = -1 }, "rate_limit.per_ip_burst"},
+			{"negative RateLimit.PerWorkspaceRequestsPerSecond", func(c *Config) { c.RateLimit.PerWorkspaceRequestsPerSecond = -1 }, "rate_limit.per_workspace_requests_per_second"},
+			{"negative RateLimit.PerWorkspaceBurst", func(c *Config) { c.RateLimit.PerWorkspaceBurst = -2 }, "rate_limit.per_workspace_burst"},
+			{"invalid RateLimit.TrustedProxies IP", func(c *Config) { c.RateLimit.TrustedProxies = "not-an-ip" }, "rate_limit.trusted_proxies"},
+			{"invalid RateLimit.TrustedProxies CIDR", func(c *Config) { c.RateLimit.TrustedProxies = "10.0.0.0/99" }, "rate_limit.trusted_proxies"},
+			{"NaN RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = true; c.RateLimit.RequestsPerSecond = math.NaN() }, "rate_limit.requests_per_second"},
+			{"Inf RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = true; c.RateLimit.RequestsPerSecond = math.Inf(1) }, "rate_limit.requests_per_second"},
+			{"negative disabled RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = false; c.RateLimit.RequestsPerSecond = -1 }, "rate_limit.requests_per_second"},
+			{"NaN RateLimit.PerIPRequestsPerSecond", func(c *Config) { c.RateLimit.PerIPRequestsPerSecond = math.NaN() }, "rate_limit.per_ip_requests_per_second"},
+			{"Inf RateLimit.PerIPRequestsPerSecond", func(c *Config) { c.RateLimit.PerIPRequestsPerSecond = math.Inf(1) }, "rate_limit.per_ip_requests_per_second"},
+			{"NaN RateLimit.PerWorkspaceRequestsPerSecond", func(c *Config) { c.RateLimit.PerWorkspaceRequestsPerSecond = math.NaN() }, "rate_limit.per_workspace_requests_per_second"},
+			{"Inf RateLimit.PerWorkspaceRequestsPerSecond", func(c *Config) { c.RateLimit.PerWorkspaceRequestsPerSecond = math.Inf(-1) }, "rate_limit.per_workspace_requests_per_second"},
+		}
+
+		for _, tc := range cases {
+			cfg := baseValid()
+			tc.mutate(&cfg)
+			err := validateConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("%s: validateConfig() = %v, want error containing %q", tc.name, err, tc.wantMsg)
+			}
+		}
+	})
+
+	t.Run("loads 3-tier rate limit settings from YAML and env overrides", func(t *testing.T) {
+		t.Parallel()
+
+		configDir := t.TempDir()
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		yamlText := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"rate_limit:",
+			"  enabled: true",
+			"  requests_per_second: 1000",
+			"  burst: 100",
+			"  per_ip_requests_per_second: 250",
+			"  per_ip_burst: 50",
+			"  per_workspace_requests_per_second: 250",
+			"  per_workspace_burst: 50",
+			"  trusted_proxies: \"10.0.0.0/8, 127.0.0.1\"",
+			"  wait_timeout: 0s",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlText), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfg, err := loadConfig(func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_RATE_LIMIT_PER_IP_REQUESTS_PER_SECOND":
+				return "120.5", true
+			case "GO_RATE_LIMIT_PER_IP_BURST":
+				return "30", true
+			case "GO_RATE_LIMIT_PER_WORKSPACE_REQUESTS_PER_SECOND":
+				return "300", true
+			case "GO_RATE_LIMIT_PER_WORKSPACE_BURST":
+				return "60", true
+			case "GO_RATE_LIMIT_TRUSTED_PROXIES":
+				return "172.16.0.0/12, ::1", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("loadConfig() error = %v", err)
+		}
+		if cfg.RateLimit.PerIPRequestsPerSecond != 120.5 || cfg.RateLimit.PerIPBurst != 30 {
+			t.Fatalf("PerIP = (%v, %d), want (120.5, 30)", cfg.RateLimit.PerIPRequestsPerSecond, cfg.RateLimit.PerIPBurst)
+		}
+		if cfg.RateLimit.PerWorkspaceRequestsPerSecond != 300 || cfg.RateLimit.PerWorkspaceBurst != 60 {
+			t.Fatalf("PerWorkspace = (%v, %d), want (300, 60)", cfg.RateLimit.PerWorkspaceRequestsPerSecond, cfg.RateLimit.PerWorkspaceBurst)
+		}
+		if cfg.RateLimit.TrustedProxies != "172.16.0.0/12, ::1" {
+			t.Fatalf("TrustedProxies = %q, want %q", cfg.RateLimit.TrustedProxies, "172.16.0.0/12, ::1")
 		}
 	})
 }

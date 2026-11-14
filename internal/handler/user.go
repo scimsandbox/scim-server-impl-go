@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -222,8 +223,8 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var input map[string]any
-	if err := readJSON(r, &input); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &input); err != nil {
+		writeReadJSONError(w, err)
 		return
 	}
 
@@ -231,6 +232,10 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	userName = scim.NormalizeNFC(userName)
 	if userName == "" {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", "userName is required"))
+		return
+	}
+	if err := scim.ValidatePasswordInput(input); err != nil {
+		scim.WriteErrorFromAny(w, err)
 		return
 	}
 
@@ -424,8 +429,12 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var input map[string]any
-	if err := readJSON(r, &input); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &input); err != nil {
+		writeReadJSONError(w, err)
+		return
+	}
+	if err := scim.ValidatePasswordInput(input); err != nil {
+		scim.WriteErrorFromAny(w, err)
 		return
 	}
 
@@ -489,8 +498,8 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var patchReq map[string]any
-	if err := readJSON(r, &patchReq); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &patchReq); err != nil {
+		writeReadJSONError(w, err)
 		return
 	}
 
@@ -615,8 +624,8 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 func (h *UserHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	// POST /.search: parse JSON body and inject into query params for ListUsers
 	var body map[string]any
-	if err := readJSON(r, &body); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
+		writeReadJSONError(w, err)
 		return
 	}
 

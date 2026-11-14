@@ -2,16 +2,24 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
+	"time"
 
+	"github.com/scimsandbox/scim-server-impl-go/internal/httpapi"
 	"github.com/scimsandbox/scim-server-impl-go/internal/service"
 )
 
 const (
-	defaultManagementPort = 9090
-	minCursorSecretLength = 32
-	pgScheme              = "postgres://"
+	defaultManagementPort          = 9090
+	defaultServerReadTimeout       = 15 * time.Second
+	defaultServerReadHeaderTimeout = 10 * time.Second
+	defaultServerWriteTimeout      = 30 * time.Second
+	defaultServerIdleTimeout       = 60 * time.Second
+	defaultServerShutdownTimeout   = 30 * time.Second
+	minCursorSecretLength          = 32
+	pgScheme                       = "postgres://"
 )
 
 func normalizeDSN(rawDSN string) string {
@@ -135,6 +143,18 @@ func printableConfig(cfg Config) Config {
 	return masked
 }
 
+func defaultConfig() Config {
+	return Config{
+		Server: ServerConfig{
+			ReadTimeout:       defaultServerReadTimeout,
+			ReadHeaderTimeout: defaultServerReadHeaderTimeout,
+			WriteTimeout:      defaultServerWriteTimeout,
+			IdleTimeout:       defaultServerIdleTimeout,
+			ShutdownTimeout:   defaultServerShutdownTimeout,
+		},
+	}
+}
+
 func applyConfigDefaults(cfg *Config) {
 	cfg.Server.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.Server.BaseURL), "/")
 	if cfg.Cleanup.RequestLogs.Enabled == nil {
@@ -169,8 +189,47 @@ func validateConfig(cfg Config) error {
 	if s := strings.TrimSpace(cfg.Server.CursorSecret); s != "" && len(s) < minCursorSecretLength {
 		return fmt.Errorf("server.cursor_secret must be at least %d characters long", minCursorSecretLength)
 	}
+	if cfg.Server.ReadTimeout < 0 {
+		return fmt.Errorf("server.read_timeout must be greater than or equal to 0")
+	}
+	if cfg.Server.ReadHeaderTimeout < 0 {
+		return fmt.Errorf("server.read_header_timeout must be greater than or equal to 0")
+	}
+	if cfg.Server.WriteTimeout < 0 {
+		return fmt.Errorf("server.write_timeout must be greater than or equal to 0")
+	}
+	if cfg.Server.IdleTimeout < 0 {
+		return fmt.Errorf("server.idle_timeout must be greater than or equal to 0")
+	}
+	if cfg.Server.ShutdownTimeout < 0 {
+		return fmt.Errorf("server.shutdown_timeout must be greater than or equal to 0")
+	}
+	if math.IsNaN(cfg.RateLimit.RequestsPerSecond) || math.IsInf(cfg.RateLimit.RequestsPerSecond, 0) {
+		return fmt.Errorf("rate_limit.requests_per_second must be a finite number")
+	}
 	if cfg.RateLimit.Enabled && cfg.RateLimit.RequestsPerSecond <= 0 {
 		return fmt.Errorf("rate_limit.requests_per_second must be greater than 0 when rate limiting is enabled")
+	}
+	if !cfg.RateLimit.Enabled && cfg.RateLimit.RequestsPerSecond < 0 {
+		return fmt.Errorf("rate_limit.requests_per_second must be greater than or equal to 0")
+	}
+	if cfg.RateLimit.Burst < 0 {
+		return fmt.Errorf("rate_limit.burst must be greater than or equal to 0")
+	}
+	if math.IsNaN(cfg.RateLimit.PerIPRequestsPerSecond) || math.IsInf(cfg.RateLimit.PerIPRequestsPerSecond, 0) || cfg.RateLimit.PerIPRequestsPerSecond < 0 {
+		return fmt.Errorf("rate_limit.per_ip_requests_per_second must be a finite number greater than or equal to 0")
+	}
+	if cfg.RateLimit.PerIPBurst < 0 {
+		return fmt.Errorf("rate_limit.per_ip_burst must be greater than or equal to 0")
+	}
+	if math.IsNaN(cfg.RateLimit.PerWorkspaceRequestsPerSecond) || math.IsInf(cfg.RateLimit.PerWorkspaceRequestsPerSecond, 0) || cfg.RateLimit.PerWorkspaceRequestsPerSecond < 0 {
+		return fmt.Errorf("rate_limit.per_workspace_requests_per_second must be a finite number greater than or equal to 0")
+	}
+	if cfg.RateLimit.PerWorkspaceBurst < 0 {
+		return fmt.Errorf("rate_limit.per_workspace_burst must be greater than or equal to 0")
+	}
+	if _, err := httpapi.ParseTrustedProxies(cfg.RateLimit.TrustedProxies); err != nil {
+		return fmt.Errorf("rate_limit.trusted_proxies: %w", err)
 	}
 	if cfg.RateLimit.WaitTimeout < 0 {
 		return fmt.Errorf("rate_limit.wait_timeout must be greater than or equal to 0")

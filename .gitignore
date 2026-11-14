@@ -22,7 +22,9 @@ coverage.out
 *.swp
 *~
 
-# SOPS / age artifacts
+# SOPS / age & secret config artifacts
+config/app-secrets.yaml
+config/*secret*
 *.agekey
 *.decrypted.yaml
 *.decrypted.yml

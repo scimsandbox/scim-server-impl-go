@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -14,7 +15,10 @@ import (
 	"github.com/scimsandbox/scim-server-impl-go/internal/scim"
 )
 
-const ScimContentType = "application/scim+json"
+const (
+	ScimContentType     = "application/scim+json"
+	MaxRequestBodyBytes = int64(1 << 20) // 1 MiB (1,048,576 bytes)
+)
 
 func resolveWorkspaceID(r *http.Request) (uuid.UUID, error) {
 	wsID := r.Context().Value(middleware.WorkspaceIDKey)
@@ -86,8 +90,30 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func readJSON(r *http.Request, v any) error {
+func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	return readJSONWithLimit(w, r, MaxRequestBodyBytes, v)
+}
+
+func readJSONWithLimit(w http.ResponseWriter, r *http.Request, limit int64, v any) error {
+	if r.ContentLength > limit {
+		return &http.MaxBytesError{Limit: limit}
+	}
+	body := r.Body
+	if body == nil {
+		body = http.NoBody
+	}
+	r.Body = http.MaxBytesReader(w, body, limit)
 	return json.NewDecoder(r.Body).Decode(v)
+}
+
+func writeReadJSONError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		scim.WriteScimError(w, scim.NewScimError(http.StatusRequestEntityTooLarge, "",
+			fmt.Sprintf("Request body exceeds maximum allowed size (%d bytes)", maxBytesErr.Limit)))
+		return
+	}
+	scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
 }
 
 type projectionSpec struct {

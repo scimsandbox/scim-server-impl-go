@@ -447,11 +447,11 @@ func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
 	} else {
 		user.Active = true
 	}
-	if v, ok := input["password"]; ok {
-		rawPw, err := parseRawStringPtr(v, "password")
-		if err != nil {
-			return err
-		}
+	rawPw, hasPw, err := extractAndValidatePassword(input)
+	if err != nil {
+		return err
+	}
+	if hasPw {
 		pw, err := HashPassword(rawPw)
 		if err != nil {
 			return err

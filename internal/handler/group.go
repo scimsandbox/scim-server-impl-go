@@ -179,8 +179,8 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var input map[string]any
-	if err := readJSON(r, &input); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &input); err != nil {
+		writeReadJSONError(w, err)
 		return
 	}
 
@@ -458,8 +458,8 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input map[string]any
-	if err := readJSON(r, &input); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &input); err != nil {
+		writeReadJSONError(w, err)
 		return
 	}
 
@@ -642,8 +642,8 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var patchReq map[string]any
-	if err := readJSON(r, &patchReq); err != nil {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &patchReq); err != nil {
+		writeReadJSONError(w, err)
 		return
 	}
 
@@ -872,8 +872,8 @@ func (h *GroupHandler) executeDeleteGroup(ctx context.Context, wsID, groupID uui
 func (h *GroupHandler) SearchGroups(w http.ResponseWriter, r *http.Request) {
 	// POST /.search: parse JSON body and inject into query params for ListGroups
 	var body map[string]any
-	if err := readJSON(r, &body); err != nil && err != io.EOF {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid JSON"))
+	if err := readJSON(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
+		writeReadJSONError(w, err)
 		return
 	}
 
@@ -1033,6 +1033,10 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 	if err != nil {
 		return &scim.ScimError{Status: 400, ScimType: "invalidValue",
 			Detail: "Invalid member value (must be UUID): " + memberValue}
+	}
+	if memberUUID == groupID {
+		return &scim.ScimError{Status: 400, ScimType: "invalidValue",
+			Detail: "Group cannot include itself as a member"}
 	}
 
 	explicitType := ""
@@ -1593,6 +1597,9 @@ func (h *GroupHandler) applyMemberSubAttrAdd(
 	targetUUID, err := uuid.Parse(targetValue)
 	if targetValue == "" || err != nil {
 		return &scim.ScimError{Status: 400, ScimType: "noTarget", Detail: "No matching member found for path: " + path}
+	}
+	if group != nil && group.ID != uuid.Nil && targetUUID == group.ID {
+		return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "A group cannot be a member of itself"}
 	}
 
 	matchIdx := -1

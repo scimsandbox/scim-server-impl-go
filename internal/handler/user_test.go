@@ -294,6 +294,96 @@ func TestUserHandler_CreateUser_PasswordOver72UTF8BytesReturns400InvalidValue(t 
 	}
 }
 
+func TestUserHandler_ReplaceUser_InvalidPasswordReturns400BeforeAsyncDispatch(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+	userID := uuid.New()
+
+	invalidPayloads := []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "over 72 ASCII bytes",
+			body: map[string]any{
+				"schemas":  []string{scim.UserSchemaURN},
+				"userName": "alice@example.com",
+				"password": strings.Repeat("x", 73),
+			},
+		},
+		{
+			name: "empty password",
+			body: map[string]any{
+				"schemas":  []string{scim.UserSchemaURN},
+				"userName": "alice@example.com",
+				"password": "",
+			},
+		},
+		{
+			name: "non-string password",
+			body: map[string]any{
+				"schemas":  []string{scim.UserSchemaURN},
+				"userName": "alice@example.com",
+				"password": 12345,
+			},
+		},
+		{
+			name: "mixed valid password and invalid Password sibling",
+			body: map[string]any{
+				"schemas":  []string{scim.UserSchemaURN},
+				"userName": "alice@example.com",
+				"password": "ValidPassword!1",
+				"Password": 12345,
+			},
+		},
+	}
+
+	for _, tc := range invalidPayloads {
+		for _, asyncMode := range []bool{false, true} {
+			mode := "sync"
+			if asyncMode {
+				mode = "respond-async"
+			}
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				asyncRepo := newMockAsyncEventRepo()
+				uh := NewUserHandler(nil, nil, nil, asyncRepo)
+
+				rawBody, _ := json.Marshal(tc.body)
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPut, "/Users/"+userID.String(), strings.NewReader(string(rawBody)))
+				if asyncMode {
+					req.Header.Set("Prefer", "respond-async")
+				}
+				ctx := context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID)
+				rctx := chi.NewRouteContext()
+				rctx.URLParams.Add("workspaceId", wsID.String())
+				rctx.URLParams.Add("id", userID.String())
+				req = req.WithContext(context.WithValue(ctx, chi.RouteCtxKey, rctx))
+
+				uh.ReplaceUser(rec, req)
+
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400 (not 202 Accepted); body=%s", rec.Code, rec.Body.String())
+				}
+				var resp map[string]any
+				if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("invalid JSON: %v", err)
+				}
+				if resp["status"] != "400" || resp["scimType"] != "invalidValue" {
+					t.Fatalf("got status=%v scimType=%v, want 400 invalidValue", resp["status"], resp["scimType"])
+				}
+				asyncRepo.mu.Lock()
+				eventCount := len(asyncRepo.events)
+				asyncRepo.mu.Unlock()
+				if eventCount != 0 {
+					t.Fatalf("expected 0 async events queued for invalid password, got %d", eventCount)
+				}
+			})
+		}
+	}
+}
+
 func TestUserHandler_OversizedAndDeepFilter_Returns400InvalidFilter(t *testing.T) {
 	t.Parallel()
 
@@ -337,5 +427,44 @@ func TestUserHandler_OversizedAndDeepFilter_Returns400InvalidFilter(t *testing.T
 	uh.CreateUser(badJSONRec, badJSONReq)
 	if badJSONRec.Code != http.StatusBadRequest || !strings.Contains(badJSONRec.Body.String(), "invalidSyntax") {
 		t.Fatalf("malformed JSON got status=%d body=%s, want 400 invalidSyntax", badJSONRec.Code, badJSONRec.Body.String())
+	}
+}
+
+func TestUserHandler_SearchUsers_EmptyBodyAllowed(t *testing.T) {
+	t.Parallel()
+
+	uh := &UserHandler{}
+	wsID := uuid.New()
+
+	for _, tc := range []struct {
+		name string
+		body io.Reader
+	}{
+		{"nil body", nil},
+		{"empty reader", strings.NewReader("")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Without workspace in context, an empty POST /Users/.search body must NOT fail
+			// with 400 invalidSyntax; it must delegate cleanly to ListUsers (returning 404 Workspace not found).
+			rec := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodPost, "/Users/.search", tc.body)
+			uh.SearchUsers(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s (no workspace): status = %d, want 404 (not 400 invalidSyntax); body=%s", tc.name, rec.Code, rec.Body.String())
+			}
+
+			// With workspace in context and a query filter error, empty body proceeds into ListUsers filter parsing.
+			recFilter := httptest.NewRecorder()
+			var bodyReader io.Reader
+			if tc.body != nil {
+				bodyReader = strings.NewReader("")
+			}
+			reqFilter, _ := http.NewRequest(http.MethodPost, "/Users/.search?filter=userName+unknownOp+%22x%22", bodyReader)
+			reqFilter = reqFilter.WithContext(context.WithValue(reqFilter.Context(), middleware.WorkspaceIDKey, wsID))
+			uh.SearchUsers(recFilter, reqFilter)
+			if recFilter.Code != http.StatusBadRequest || !strings.Contains(recFilter.Body.String(), "invalidFilter") {
+				t.Fatalf("%s (with filter): status = %d, body = %s, want 400 invalidFilter from ListUsers", tc.name, recFilter.Code, recFilter.Body.String())
+			}
+		})
 	}
 }

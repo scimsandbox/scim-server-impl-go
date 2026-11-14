@@ -31,7 +31,7 @@ var (
 	// Matches JSON-like "authorization" header/token fields and Bearer token strings.
 	authJSONStringRe    = regexp.MustCompile(`(?i)("\s*authorization\s*"\s*:\s*)"(?:\\.|[^"\\])*"`)
 	authJSONTruncatedRe = regexp.MustCompile(`(?i)("\s*authorization\s*"\s*:\s*)"(?:\\.|[^"\\])*$`)
-	bearerTokenRe       = regexp.MustCompile(`(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+`)
+	bearerTokenRe       = regexp.MustCompile(`(?i)\b(Bearer(?:\s|\\[tnr])+)[A-Za-z0-9._~+/=-]+`)
 	// Matches malformed/non-JSON PATCH fragments where "path":"password" precedes or follows "value":"..."
 	// within the same JSON object (allowing intervening fields such as "op":"replace" and truncated trailing values).
 	patchPathThenValueRe          = regexp.MustCompile(`(?is)("path"\s*:\s*"\s*(?:urn:ietf:params:scim:schemas:core:2\.0:User:)?password\s*"[^{}]*?"value"\s*:\s*)"(?:\\.|[^"\\])*"`)
@@ -156,7 +156,10 @@ func RedactSensitiveBody(raw string) string {
 		return raw
 	}
 	lowerRaw := strings.ToLower(raw)
-	if !strings.Contains(lowerRaw, "password") && !strings.Contains(lowerRaw, "authorization") && !strings.Contains(lowerRaw, "bearer ") {
+	if !strings.Contains(lowerRaw, "password") &&
+		!strings.Contains(lowerRaw, "authorization") &&
+		!strings.Contains(lowerRaw, "bearer") &&
+		!strings.Contains(lowerRaw, `\u`) {
 		return raw
 	}
 
@@ -241,6 +244,12 @@ func redactValue(v any) (any, bool) {
 		}
 		return out, changed
 
+	case string:
+		if strings.Contains(strings.ToLower(val), "bearer") && bearerTokenRe.MatchString(val) {
+			return bearerTokenRe.ReplaceAllString(val, "${1}"+redactedValue), true
+		}
+		return val, false
+
 	default:
 		return v, false
 	}
@@ -260,22 +269,87 @@ func redactRegexFallback(s string) string {
 	if s == "" {
 		return s
 	}
-	lower := strings.ToLower(s)
+	norm := decodeASCIIUnicodeEscapes(s)
+	lower := strings.ToLower(norm)
+	if !strings.Contains(lower, "password") && !strings.Contains(lower, "authorization") && !strings.Contains(lower, "bearer") {
+		return s
+	}
+	redacted := norm
 	if strings.Contains(lower, "password") {
-		s = passwordJSONStringRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
-		s = patchPathThenValueRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
-		s = patchValueThenPathRe.ReplaceAllString(s, `${1}"[REDACTED]"${2}`)
-		s = patchPathThenValueTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
-		s = passwordJSONTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+		redacted = passwordJSONStringRe.ReplaceAllString(redacted, `${1}"[REDACTED]"`)
+		redacted = patchPathThenValueRe.ReplaceAllString(redacted, `${1}"[REDACTED]"`)
+		redacted = patchValueThenPathRe.ReplaceAllString(redacted, `${1}"[REDACTED]"${2}`)
+		redacted = patchPathThenValueTruncatedRe.ReplaceAllString(redacted, `${1}"[REDACTED]"`)
+		redacted = passwordJSONTruncatedRe.ReplaceAllString(redacted, `${1}"[REDACTED]"`)
 	}
 	if strings.Contains(lower, "authorization") {
-		s = authJSONStringRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
-		s = authJSONTruncatedRe.ReplaceAllString(s, `${1}"[REDACTED]"`)
+		redacted = authJSONStringRe.ReplaceAllString(redacted, `${1}"[REDACTED]"`)
+		redacted = authJSONTruncatedRe.ReplaceAllString(redacted, `${1}"[REDACTED]"`)
 	}
-	if strings.Contains(lower, "bearer ") {
-		s = bearerTokenRe.ReplaceAllString(s, `${1}[REDACTED]`)
+	if strings.Contains(lower, "bearer") {
+		redacted = bearerTokenRe.ReplaceAllString(redacted, `${1}[REDACTED]`)
 	}
-	return s
+	if redacted == norm {
+		return s
+	}
+	return redacted
+}
+
+// decodeASCIIUnicodeEscapes normalizes JSON \u00XX ASCII escapes (excluding '"' and '\'
+// so quote boundaries stay intact) to allow regex fallback redaction on malformed/truncated payloads.
+func decodeASCIIUnicodeEscapes(s string) string {
+	if !strings.Contains(s, `\u`) && !strings.Contains(s, `\U`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] == '\\' {
+			b.WriteString(`\\`)
+			i++
+			continue
+		}
+		if i+6 <= len(s) && s[i] == '\\' && (s[i+1] == 'u' || s[i+1] == 'U') && s[i+2] == '0' && s[i+3] == '0' {
+			hi, okHi := hexNibble(s[i+4])
+			lo, okLo := hexNibble(s[i+5])
+			if okHi && okLo {
+				ch := (hi << 4) | lo
+				switch {
+				case ch == '\t':
+					b.WriteString(`\t`)
+					i += 5
+					continue
+				case ch == '\n':
+					b.WriteString(`\n`)
+					i += 5
+					continue
+				case ch == '\r':
+					b.WriteString(`\r`)
+					i += 5
+					continue
+				case ch >= 0x20 && ch <= 0x7e && ch != '"' && ch != '\\':
+					b.WriteByte(ch)
+					i += 5
+					continue
+				}
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 func truncate(s string, max int) string {

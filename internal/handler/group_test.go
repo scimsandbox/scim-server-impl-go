@@ -382,3 +382,82 @@ func TestGroupMemberVersionAgnosticRefHelpers_RFC7643_2_4(t *testing.T) {
 		t.Fatalf("expected 0 members remaining, got %+v", group.Members)
 	}
 }
+
+func TestResolveMemberID_CanonicalizesUUIDAndHandlesEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	u := uuid.New()
+	upper := strings.ToUpper(u.String())
+
+	if got := resolveMemberID(nil); got != "" {
+		t.Fatalf("resolveMemberID(nil) = %q, want empty", got)
+	}
+	if got := resolveMemberID(map[string]any{}); got != "" {
+		t.Fatalf("resolveMemberID({}) = %q, want empty", got)
+	}
+	if got := resolveMemberID(map[string]any{"value": "  " + upper + "  "}); got != u.String() {
+		t.Fatalf("resolveMemberID(uppercase value) = %q, want %q", got, u.String())
+	}
+	if got := resolveMemberID(map[string]any{"$ref": "https://example.com/scim/v2/Users/" + upper}); got != u.String() {
+		t.Fatalf("resolveMemberID(uppercase $ref) = %q, want %q", got, u.String())
+	}
+	if got := resolveMemberID(map[string]any{"value": "  not-a-uuid  "}); got != "not-a-uuid" {
+		t.Fatalf("resolveMemberID(non-UUID) = %q, want %q", got, "not-a-uuid")
+	}
+}
+
+func TestAddMemberTx_RejectsSelfMembershipAndInvalidMemberIDs(t *testing.T) {
+	t.Parallel()
+
+	gh := &GroupHandler{}
+	wsID := uuid.New()
+	groupID := uuid.New()
+	upperGroupID := strings.ToUpper(groupID.String())
+
+	selfCases := []struct {
+		name      string
+		memberMap map[string]any
+	}{
+		{
+			name:      "self-membership via lowercase value",
+			memberMap: map[string]any{"value": groupID.String()},
+		},
+		{
+			name:      "self-membership via uppercase value",
+			memberMap: map[string]any{"value": upperGroupID},
+		},
+		{
+			name:      "self-membership via relative $ref",
+			memberMap: map[string]any{"$ref": "/Groups/" + groupID.String()},
+		},
+		{
+			name:      "self-membership via absolute uppercase $ref",
+			memberMap: map[string]any{"$ref": "https://example.com/scim/v2/Groups/" + upperGroupID},
+		},
+	}
+
+	for _, tc := range selfCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := gh.addMemberTx(context.Background(), nil, groupID, wsID, tc.memberMap)
+			scimErr, ok := err.(*scim.ScimError)
+			if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidValue" {
+				t.Fatalf("%s: got %T %v, want 400 invalidValue", tc.name, err, err)
+			}
+			if !strings.Contains(scimErr.Detail, "itself") {
+				t.Fatalf("%s: detail = %q, want self-membership message", tc.name, scimErr.Detail)
+			}
+		})
+	}
+
+	for _, invalid := range []map[string]any{
+		{},
+		{"value": "not-a-uuid"},
+		{"value": uuid.New().String(), "$ref": "/Groups/" + uuid.New().String()},
+	} {
+		err := gh.addMemberTx(context.Background(), nil, groupID, wsID, invalid)
+		scimErr, ok := err.(*scim.ScimError)
+		if !ok || scimErr.Status != http.StatusBadRequest || scimErr.ScimType != "invalidValue" {
+			t.Fatalf("addMemberTx(%v) = %T %v, want 400 invalidValue", invalid, err, err)
+		}
+	}
+}

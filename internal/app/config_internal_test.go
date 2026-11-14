@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -919,6 +920,96 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 		}
 		if cfg.Server.ShutdownTimeout != defaultServerShutdownTimeout {
 			t.Fatalf("ShutdownTimeout = %v, want %v", cfg.Server.ShutdownTimeout, defaultServerShutdownTimeout)
+		}
+	})
+
+	t.Run("preserves explicit 0s HTTP server timeouts in YAML and environment overrides", func(t *testing.T) {
+		t.Parallel()
+
+		configDir := t.TempDir()
+		configPath := filepath.Join(configDir, "app-conf.yaml")
+		yamlZero := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"  read_timeout: 0s",
+			"  read_header_timeout: 0s",
+			"  write_timeout: 0s",
+			"  idle_timeout: 0s",
+			"  shutdown_timeout: 0s",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlZero), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfgYAMLZero, err := loadConfig(func(key string) (string, bool) {
+			if key == "GO_CONFIG_DIR" {
+				return configDir, true
+			}
+			return "", false
+		})
+		if err != nil {
+			t.Fatalf("loadConfig(YAML 0s) error = %v", err)
+		}
+		if cfgYAMLZero.Server.ReadTimeout != 0 ||
+			cfgYAMLZero.Server.ReadHeaderTimeout != 0 ||
+			cfgYAMLZero.Server.WriteTimeout != 0 ||
+			cfgYAMLZero.Server.IdleTimeout != 0 ||
+			cfgYAMLZero.Server.ShutdownTimeout != 0 {
+			t.Fatalf("expected all YAML 0s server timeouts to remain 0, got %+v", cfgYAMLZero.Server)
+		}
+
+		yamlNonZero := strings.Join([]string{
+			"server:",
+			"  port: 8080",
+			"  read_timeout: 20s",
+			"  read_header_timeout: 12s",
+			"  write_timeout: 45s",
+			"  idle_timeout: 90s",
+			"  shutdown_timeout: 25s",
+		}, "\n") + "\n"
+		if err := os.WriteFile(configPath, []byte(yamlNonZero), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", configPath, err)
+		}
+
+		cfgEnvZero, err := loadConfig(func(key string) (string, bool) {
+			switch key {
+			case "GO_CONFIG_DIR":
+				return configDir, true
+			case "GO_SERVER_READ_TIMEOUT",
+				"GO_SERVER_READ_HEADER_TIMEOUT",
+				"GO_SERVER_WRITE_TIMEOUT",
+				"GO_SERVER_IDLE_TIMEOUT",
+				"GO_SERVER_SHUTDOWN_TIMEOUT":
+				return "0s", true
+			default:
+				return "", false
+			}
+		})
+		if err != nil {
+			t.Fatalf("loadConfig(env 0s) error = %v", err)
+		}
+		if cfgEnvZero.Server.ReadTimeout != 0 ||
+			cfgEnvZero.Server.ReadHeaderTimeout != 0 ||
+			cfgEnvZero.Server.WriteTimeout != 0 ||
+			cfgEnvZero.Server.IdleTimeout != 0 ||
+			cfgEnvZero.Server.ShutdownTimeout != 0 {
+			t.Fatalf("expected all env 0s server timeouts to remain 0, got %+v", cfgEnvZero.Server)
+		}
+
+		// Verify shutdownContext does not immediately expire when ShutdownTimeout == 0.
+		noTimeoutCtx, noTimeoutCancel := shutdownContext(context.Background(), 0)
+		defer noTimeoutCancel()
+		if _, hasDeadline := noTimeoutCtx.Deadline(); hasDeadline {
+			t.Fatal("expected no deadline on shutdownContext when timeout == 0")
+		}
+		if err := noTimeoutCtx.Err(); err != nil {
+			t.Fatalf("expected non-expired context when timeout == 0, got %v", err)
+		}
+
+		withTimeoutCtx, withTimeoutCancel := shutdownContext(context.Background(), 5*time.Second)
+		defer withTimeoutCancel()
+		if _, hasDeadline := withTimeoutCtx.Deadline(); !hasDeadline {
+			t.Fatal("expected deadline on shutdownContext when timeout > 0")
 		}
 	})
 

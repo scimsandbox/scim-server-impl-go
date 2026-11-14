@@ -356,7 +356,7 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	cancelServer()
 	cleanupWg.Wait()
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	ctx, cancel := shutdownContext(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
 
 	shutdownError := shutdownServers(ctx, managementServer, apiServer)
@@ -368,6 +368,13 @@ func serve(stderr io.Writer, lookupEnv LookupEnvFunc) error {
 	}
 
 	return shutdownError
+}
+
+func shutdownContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 func shutdownServers(ctx context.Context, servers ...*http.Server) error {

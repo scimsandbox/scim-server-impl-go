@@ -1034,6 +1034,10 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 		return &scim.ScimError{Status: 400, ScimType: "invalidValue",
 			Detail: "Invalid member value (must be UUID): " + memberValue}
 	}
+	if memberUUID == groupID {
+		return &scim.ScimError{Status: 400, ScimType: "invalidValue",
+			Detail: "Group cannot include itself as a member"}
+	}
 
 	explicitType := ""
 	if rawT, exists := memberMap["type"]; exists && rawT != nil {

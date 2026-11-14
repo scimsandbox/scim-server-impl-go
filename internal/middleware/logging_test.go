@@ -353,4 +353,217 @@ func TestRequestResponseLogging_NeverLogsAuthHeaderAndRedactsAuthorizationInBody
 	if strings.Contains(truncAuth, "cut-off-secret") || !strings.Contains(truncAuth, "[REDACTED]") {
 		t.Fatalf("expected truncated Authorization value to be redacted, got: %s", truncAuth)
 	}
+
+	// Verify Bearer tokens separated by tabs/newlines in both valid JSON and malformed/raw bodies.
+	whitespaceCases := []struct {
+		name   string
+		body   string
+		secret string
+	}{
+		{
+			name:   "valid JSON with escaped tab Bearer\\tsecret",
+			body:   `{"note":"Bearer\ttab-secret-jwt-111"}`,
+			secret: "tab-secret-jwt-111",
+		},
+		{
+			name:   "valid JSON with escaped newline Bearer\\nsecret",
+			body:   `{"note":"Bearer\nnewline-secret-jwt-222","list":["Bearer\r\ncrlf-secret-jwt-333"]}`,
+			secret: "newline-secret-jwt-222",
+		},
+		{
+			name:   "raw body with literal tab Bearer\tsecret",
+			body:   "upstream_auth=Bearer\traw-tab-secret-444",
+			secret: "raw-tab-secret-444",
+		},
+		{
+			name:   "raw body with literal newline Bearer\nsecret",
+			body:   "upstream_auth=Bearer\nraw-newline-secret-555",
+			secret: "raw-newline-secret-555",
+		},
+		{
+			name:   "truncated malformed JSON with escaped tab Bearer\\tsecret",
+			body:   `{"note":"Bearer\ttruncated-tab-secret-666`,
+			secret: "truncated-tab-secret-666",
+		},
+	}
+	for _, tc := range whitespaceCases {
+		t.Run(tc.name, func(t *testing.T) {
+			redacted := RedactSensitiveBody(tc.body)
+			if strings.Contains(redacted, tc.secret) || !strings.Contains(redacted, "[REDACTED]") {
+				t.Fatalf("%s: expected secret %q redacted, got: %s", tc.name, tc.secret, redacted)
+			}
+
+			subStore := &stubRequestLogCreator{}
+			subMW := RequestResponseLogging(subStore)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				w.WriteHeader(http.StatusOK)
+			}))
+			subReq := httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", bytes.NewBufferString(tc.body))
+			subMW.ServeHTTP(httptest.NewRecorder(), subReq)
+			if len(subStore.logs) != 1 || subStore.logs[0].RequestBody == nil {
+				t.Fatalf("%s: expected saved request log", tc.name)
+			}
+			if strings.Contains(*subStore.logs[0].RequestBody, tc.secret) {
+				t.Fatalf("%s: secret %q leaked into ScimRequestLog: %s", tc.name, tc.secret, *subStore.logs[0].RequestBody)
+			}
+		})
+	}
+
+	// Non-token "bearer" strings without trailing token must remain untouched.
+	nonSecret := RedactSensitiveBody(`{"role":"cupbearer","scheme":"Bearer"}`)
+	if strings.Contains(nonSecret, "[REDACTED]") {
+		t.Fatalf("unexpected redaction of non-secret bearer word: %s", nonSecret)
+	}
+}
+
+func TestRedactSensitiveBody_UnicodeEscapedKeysAndValues(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+
+	cases := []struct {
+		name   string
+		body   string
+		secret string
+	}{
+		{
+			name:   "valid JSON \\u0070assword key",
+			body:   `{"userName":"alice","\u0070assword":"SuperSecret!1"}`,
+			secret: "SuperSecret!1",
+		},
+		{
+			name:   "valid JSON uppercase hex \\u0050\\u0041SSWORD key",
+			body:   `{"userName":"alice","\u0050\u0041SSWORD":"UpperEscapedSecret!2"}`,
+			secret: "UpperEscapedSecret!2",
+		},
+		{
+			name:   "valid JSON \\u0041uthorization key",
+			body:   `{"userName":"alice","\u0041uthorization":"CustomToken my-secret-jwt-1"}`,
+			secret: "my-secret-jwt-1",
+		},
+		{
+			name:   "valid JSON PATCH \\u0070assword path",
+			body:   `{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"replace","path":"\u0070assword","value":"PatchEscapedSecret!3"}]}`,
+			secret: "PatchEscapedSecret!3",
+		},
+		{
+			name:   "valid JSON \\u0042earer string value",
+			body:   `{"note":"\u0042earer my-secret-jwt-4"}`,
+			secret: "my-secret-jwt-4",
+		},
+		{
+			name:   "truncated malformed JSON \\u0070assword",
+			body:   `{"userName":"cut","\u0070assword":"SecretCutMidStream!5`,
+			secret: "SecretCutMidStream!5",
+		},
+		{
+			name:   "truncated malformed PATCH \\u0070assword path",
+			body:   `{"Operations":[{"op":"replace","path":"\u0070assword","value":"PatchCutSecret!6`,
+			secret: "PatchCutSecret!6",
+		},
+		{
+			name:   "truncated malformed \\u0041uthorization with uppercase hex",
+			body:   `{"\u0041uthori\u007Aation":"SecretAuthCut!7`,
+			secret: "SecretAuthCut!7",
+		},
+		{
+			name:   "truncated malformed \\u0042earer with \\u0009, \\u000a, and \\u000d escapes",
+			body:   `{"a":"\u0042earer\u0009TabCutSecret!8","b":"\u0042earer\u000aLfCut!9","c":"\u0042earer\u000DCrCut!10`,
+			secret: "TabCutSecret!8",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			redacted := RedactSensitiveBody(tc.body)
+			if strings.Contains(redacted, tc.secret) {
+				t.Fatalf("%s: secret %q leaked in RedactSensitiveBody output: %s", tc.name, tc.secret, redacted)
+			}
+			if !strings.Contains(redacted, "[REDACTED]") {
+				t.Fatalf("%s: expected [REDACTED] in output: %s", tc.name, redacted)
+			}
+
+			logStore := &stubRequestLogCreator{}
+			mw := RequestResponseLogging(logStore)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				w.WriteHeader(http.StatusOK)
+			}))
+			req := httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", bytes.NewBufferString(tc.body))
+			mw.ServeHTTP(httptest.NewRecorder(), req)
+			if len(logStore.logs) != 1 || logStore.logs[0].RequestBody == nil {
+				t.Fatalf("%s: expected saved ScimRequestLog entry", tc.name)
+			}
+			if strings.Contains(*logStore.logs[0].RequestBody, tc.secret) {
+				t.Fatalf("%s: secret %q leaked into ScimRequestLog: %s", tc.name, tc.secret, *logStore.logs[0].RequestBody)
+			}
+		})
+	}
+
+	// Benign payloads with valid/invalid/non-ASCII \u escapes and escaped quotes must not be corrupted or over-redacted.
+	benign := `{"displayName":"\u0041lvarez \u017f","quote":"\u0022keep\u005c","note":"reset \u0070assword instructions"}`
+	if got := RedactSensitiveBody(benign); got != benign {
+		t.Fatalf("expected benign Unicode-escaped JSON preserved unchanged, got: %s", got)
+	}
+	malformedBenign := `{"displayName":"\u00ZZ\u001f`
+	if got := RedactSensitiveBody(malformedBenign); got != malformedBenign {
+		t.Fatalf("expected malformed benign payload preserved unchanged, got: %s", got)
+	}
+
+	// Escaped literal backslashes (\\u00XX) are NOT \uXXXX escapes and must remain valid JSON.
+	for _, literalBackslashJSON := range []string{
+		`{"note":"\\u0042earer example123"}`,
+		`{"\\u0070assword":"keep-me"}`,
+	} {
+		got := RedactSensitiveBody(literalBackslashJSON)
+		if got != literalBackslashJSON {
+			t.Fatalf("RedactSensitiveBody(%s) = %s, want unchanged", literalBackslashJSON, got)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+			t.Fatalf("expected valid JSON for %s, got unmarshal error: %v", got, err)
+		}
+	}
+
+	// Escaped literal "\\u0070assword" alongside a real Bearer token must redact the token
+	// while keeping "\\u0070assword":"keep-me" intact and syntactically valid JSON.
+	mixedEscapedBackslash := `{"\\u0070assword":"keep-me","token":"Bearer secret-jwt-11"}`
+	gotMixed := RedactSensitiveBody(mixedEscapedBackslash)
+	if strings.Contains(gotMixed, "secret-jwt-11") {
+		t.Fatalf("secret-jwt-11 leaked in %s", gotMixed)
+	}
+	var parsedMixed map[string]any
+	if err := json.Unmarshal([]byte(gotMixed), &parsedMixed); err != nil {
+		t.Fatalf("expected valid JSON after redacting mixed escaped-backslash payload, got err=%v (%s)", err, gotMixed)
+	}
+	if parsedMixed[`\u0070assword`] != "keep-me" || parsedMixed["token"] != "Bearer [REDACTED]" {
+		t.Fatalf("unexpected decoded map after redaction: %#v", parsedMixed)
+	}
+
+	// Truncated mixed payload with "\\u0070assword" + Bearer token also keeps "\\u0070assword":"keep-me".
+	truncMixed := `{"\\u0070assword":"keep-me","token":"Bearer secret-jwt-11`
+	gotTruncMixed := RedactSensitiveBody(truncMixed)
+	if strings.Contains(gotTruncMixed, "secret-jwt-11") || !strings.Contains(gotTruncMixed, `"\\u0070assword":"keep-me"`) {
+		t.Fatalf("unexpected truncated mixed output: %s", gotTruncMixed)
+	}
+
+	// Odd backslash count ("\\\u0042earer ..."): escaped backslash + real \u0042 ('B') escape
+	// must redact the secret in both valid and truncated JSON while keeping valid JSON valid.
+	oddBackslashValid := `{"note":"\\\u0042earer secret-jwt-11"}`
+	gotOddValid := RedactSensitiveBody(oddBackslashValid)
+	if strings.Contains(gotOddValid, "secret-jwt-11") {
+		t.Fatalf("secret-jwt-11 leaked in odd-backslash valid JSON: %s", gotOddValid)
+	}
+	var parsedOdd map[string]any
+	if err := json.Unmarshal([]byte(gotOddValid), &parsedOdd); err != nil {
+		t.Fatalf("expected valid JSON for odd-backslash payload, got err=%v (%s)", err, gotOddValid)
+	}
+	if parsedOdd["note"] != `\Bearer [REDACTED]` {
+		t.Fatalf("parsedOdd[note] = %q, want %q", parsedOdd["note"], `\Bearer [REDACTED]`)
+	}
+
+	oddBackslashTrunc := `{"note":"\\\u0042earer secret-jwt-11`
+	gotOddTrunc := RedactSensitiveBody(oddBackslashTrunc)
+	if strings.Contains(gotOddTrunc, "secret-jwt-11") || !strings.Contains(gotOddTrunc, `\\Bearer [REDACTED]`) {
+		t.Fatalf("unexpected odd-backslash truncated output: %s", gotOddTrunc)
+	}
 }

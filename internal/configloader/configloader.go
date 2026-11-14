@@ -17,22 +17,31 @@ type LoadOptions struct {
 
 func Load[T any](options LoadOptions) (T, error) {
 	var cfg T
+	return LoadWithDefaults(cfg, options)
+}
+
+func LoadWithDefaults[T any](defaults T, options LoadOptions) (T, error) {
+	cfg := defaults
 
 	typ := reflect.TypeOf(cfg)
 	if typ == nil || typ.Kind() != reflect.Struct {
-		return cfg, errors.New("config type must be a struct")
+		var zero T
+		return zero, errors.New("config type must be a struct")
 	}
 	if len(options.Files) == 0 {
-		return cfg, errors.New("at least one config file is required")
+		var zero T
+		return zero, errors.New("at least one config file is required")
 	}
 
 	for _, path := range options.Files {
 		contents, err := os.ReadFile(path)
 		if err != nil {
-			return cfg, fmt.Errorf("read %s: %w", path, err)
+			var zero T
+			return zero, fmt.Errorf("read %s: %w", path, err)
 		}
 		if err := decodeMinimalYAML(contents, &cfg); err != nil {
-			return cfg, fmt.Errorf("load %s: %w", path, err)
+			var zero T
+			return zero, fmt.Errorf("load %s: %w", path, err)
 		}
 	}
 
@@ -41,7 +50,8 @@ func Load[T any](options LoadOptions) (T, error) {
 		lookupEnv = os.LookupEnv
 	}
 	if err := applyEnvOverrides(reflect.ValueOf(&cfg), options.EnvPrefix, lookupEnv); err != nil {
-		return cfg, err
+		var zero T
+		return zero, err
 	}
 
 	return cfg, nil

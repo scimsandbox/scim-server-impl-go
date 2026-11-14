@@ -34,6 +34,10 @@ func (s stubLimiter) Wait(ctx context.Context) error {
 	return nil
 }
 
+func (s stubLimiter) LimiterFor(*http.Request) requestLimiter {
+	return s
+}
+
 func TestStatusCapture_DefaultsToOK(t *testing.T) {
 	t.Parallel()
 
@@ -251,6 +255,42 @@ func TestThrottlingMiddleware_CanceledRequestDoesNotWriteCapacityError(t *testin
 	}
 }
 
+func TestThrottlingMiddleware_RequestCanceledDuringWaitDoesNotWriteCapacityError(t *testing.T) {
+	t.Parallel()
+
+	enteredWait := make(chan struct{})
+	calledNext := false
+	handler := throttlingMiddleware(stubLimiter{wait: func(ctx context.Context) error {
+		close(enteredWait)
+		<-ctx.Done()
+		return ctx.Err()
+	}}, 5*time.Second, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calledNext = true
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		<-enteredWait
+		cancel()
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil).WithContext(ctx)
+	rw := httptest.NewRecorder()
+	handler.ServeHTTP(rw, req)
+
+	if calledNext {
+		t.Fatal("next handler was called despite request cancellation during Wait")
+	}
+	if rw.Body.Len() != 0 {
+		t.Fatalf("response body = %q, want empty body when client cancels during Wait", rw.Body.String())
+	}
+	if rw.Header().Get("Retry-After") != "" {
+		t.Fatalf("Retry-After = %q, want empty", rw.Header().Get("Retry-After"))
+	}
+}
+
 func TestNew_WithRateLimit_DelaysSubsequentRequests(t *testing.T) {
 	var buf bytes.Buffer
 	logger := logging.NewLogger(logging.Config{Writer: &buf, Level: logging.InfoLevel})
@@ -350,7 +390,7 @@ func TestNew_RecordsMetricsForThrottledRequests(t *testing.T) {
 	}
 }
 
-func TestThrottlingMiddleware_FailFast429BurstAndManagementBypass(t *testing.T) {
+func TestThrottlingMiddleware_PerWorkspaceIsolationAndNoManagementBypass(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
@@ -365,36 +405,162 @@ func TestThrottlingMiddleware_FailFast429BurstAndManagementBypass(t *testing.T) 
 		RateLimit: RateLimitConfig{Enabled: true, RequestsPerSecond: 1, Burst: 3, WaitTimeout: 0},
 	})
 
-	// First 3 requests within burst=3 succeed immediately.
-	for i := 0; i < 3; i++ {
+	wsAPaths := []string{
+		"/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Users",
+		"/ws/123E4567-E89B-12D3-A456-426614174000/scim/v2/Users",
+		"/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Groups",
+	}
+	// First 3 requests for Workspace A (including uppercase UUID normalization) succeed within burst=3.
+	for i, p := range wsAPaths {
 		rw := httptest.NewRecorder()
-		handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Users", nil))
+		handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, p, nil))
 		if rw.Code != http.StatusOK {
-			t.Fatalf("burst request %d status = %d, want 200", i+1, rw.Code)
+			t.Fatalf("workspace A burst request %d status = %d, want 200", i+1, rw.Code)
 		}
 	}
 
-	// 4th request fails fast (WaitTimeout=0) with 429 SCIM Error and Retry-After: 1 without parking.
+	// 4th request to Workspace A fails fast (WaitTimeout=0) with 429 SCIM Error and Retry-After: 1.
 	start := time.Now()
 	rw := httptest.NewRecorder()
-	handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/ws/123e4567-e89b-12d3-a456-426614174000/scim/v2/Users", nil))
+	handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, wsAPaths[0], nil))
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("fail-fast 429 took %v, expected immediate response", elapsed)
 	}
 	if rw.Code != http.StatusTooManyRequests {
-		t.Fatalf("4th request status = %d, want 429", rw.Code)
+		t.Fatalf("workspace A 4th request status = %d, want 429", rw.Code)
 	}
 	if got := rw.Header().Get("Retry-After"); got != "1" {
 		t.Fatalf("Retry-After = %q, want 1", got)
 	}
 
-	// Management endpoints (/actuator/health and /metrics) are never throttled even when bucket is exhausted.
-	for _, mgmtPath := range []string{"/actuator/health", "/actuator/health/readiness", "/metrics"} {
-		mgmtRec := httptest.NewRecorder()
-		handler.ServeHTTP(mgmtRec, httptest.NewRequest(http.MethodGet, mgmtPath, nil))
-		if mgmtRec.Code != http.StatusOK {
-			t.Fatalf("management path %s status = %d, want 200", mgmtPath, mgmtRec.Code)
+	// Workspace B has its own independent bucket and still gets 200 OK while Workspace A is throttled.
+	wsBPath := "/ws/223e4567-e89b-12d3-a456-426614174001/scim/v2/Users"
+	for i := 0; i < 3; i++ {
+		wsBRec := httptest.NewRecorder()
+		handler.ServeHTTP(wsBRec, httptest.NewRequest(http.MethodGet, wsBPath, nil))
+		if wsBRec.Code != http.StatusOK {
+			t.Fatalf("workspace B request %d status = %d, want 200", i+1, wsBRec.Code)
 		}
+	}
+
+	// /actuator/* and /metrics on the API router do NOT bypass rate limiting; they fall back to client IP.
+	nonWsPaths := []string{"/actuator/health", "/actuator/health/readiness", "/metrics"}
+	for i, p := range nonWsPaths {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.RemoteAddr = "192.0.2.10:4000"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("non-workspace request %d (%s) status = %d, want 200", i+1, p, rec.Code)
+		}
+	}
+	throttledMgmtReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	throttledMgmtReq.RemoteAddr = "192.0.2.10:5000" // Same client IP, different ephemeral port
+	throttledMgmtRec := httptest.NewRecorder()
+	handler.ServeHTTP(throttledMgmtRec, throttledMgmtReq)
+	if throttledMgmtRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("4th non-workspace request (/metrics) status = %d, want 429", throttledMgmtRec.Code)
+	}
+
+	// Another client IP on a non-workspace or invalid-UUID path is isolated and still succeeds.
+	otherIPReq := httptest.NewRequest(http.MethodGet, "/ws/not-a-valid-uuid/scim/v2/Users", nil)
+	otherIPReq.RemoteAddr = "198.51.100.25:9999"
+	otherIPRec := httptest.NewRecorder()
+	handler.ServeHTTP(otherIPRec, otherIPReq)
+	if otherIPRec.Code != http.StatusOK {
+		t.Fatalf("other client IP status = %d, want 200", otherIPRec.Code)
+	}
+}
+
+func TestKeyedLimiterStore_KeyExtractionTTLEvictionAndCapacityCap(t *testing.T) {
+	t.Parallel()
+
+	if got := extractRateLimitKey(nil); got != "global" {
+		t.Fatalf("extractRateLimitKey(nil) = %q, want global", got)
+	}
+
+	emptyAddrReq := httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil)
+	emptyAddrReq.RemoteAddr = "   "
+	if got := extractRateLimitKey(emptyAddrReq); got != "global" {
+		t.Fatalf("extractRateLimitKey(empty RemoteAddr) = %q, want global", got)
+	}
+
+	rawAddrReq := httptest.NewRequest(http.MethodGet, "/ws/invalid-ws/scim/v2/Users", nil)
+	rawAddrReq.RemoteAddr = "203.0.113.7"
+	if got := extractRateLimitKey(rawAddrReq); got != "ip:203.0.113.7" {
+		t.Fatalf("extractRateLimitKey(raw IP) = %q, want ip:203.0.113.7", got)
+	}
+
+	ipv6Req := httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil)
+	ipv6Req.RemoteAddr = "[2001:db8::1]:44321"
+	if got := extractRateLimitKey(ipv6Req); got != "ip:2001:db8::1" {
+		t.Fatalf("extractRateLimitKey(IPv6) = %q, want ip:2001:db8::1", got)
+	}
+
+	wsReq := httptest.NewRequest(http.MethodGet, "/ws/ABCDEF01-2345-6789-ABCD-EF0123456789/scim/v2/Users", nil)
+	if got := extractRateLimitKey(wsReq); got != "ws:abcdef01-2345-6789-abcd-ef0123456789" {
+		t.Fatalf("extractRateLimitKey(ws) = %q, want canonical lowercase ws key", got)
+	}
+
+	// Verify TTL expiration and hard maxEntries capacity eviction.
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	store := newKeyedLimiterStoreWithOptions(1, 1, 3, 5*time.Minute, time.Minute, func() time.Time {
+		return now
+	})
+
+	reqForIP := func(ip string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil)
+		r.RemoteAddr = ip + ":1234"
+		return r
+	}
+
+	lim1 := store.LimiterFor(reqForIP("10.0.0.1"))
+	if !lim1.Allow() || lim1.Allow() {
+		t.Fatal("expected burst=1 bucket for 10.0.0.1 to allow first call and reject second")
+	}
+	now = now.Add(10 * time.Second)
+	_ = store.LimiterFor(reqForIP("10.0.0.2"))
+	now = now.Add(10 * time.Second)
+	_ = store.LimiterFor(reqForIP("10.0.0.3"))
+
+	if len(store.entries) != 3 {
+		t.Fatalf("len(entries) = %d, want 3", len(store.entries))
+	}
+
+	// Touch 10.0.0.1 so 10.0.0.2 becomes the oldest entry.
+	now = now.Add(10 * time.Second)
+	if got := store.LimiterFor(reqForIP("10.0.0.1")); got != lim1 {
+		t.Fatal("expected existing non-expired limiter for 10.0.0.1")
+	}
+
+	// Inserting 10.0.0.4 at capacity=3 must evict oldest (ip:10.0.0.2) and keep size <= 3.
+	now = now.Add(10 * time.Second)
+	_ = store.LimiterFor(reqForIP("10.0.0.4"))
+	if len(store.entries) != 3 {
+		t.Fatalf("len(entries) after capacity eviction = %d, want 3", len(store.entries))
+	}
+	if _, exists := store.entries["ip:10.0.0.2"]; exists {
+		t.Fatal("expected oldest entry ip:10.0.0.2 to be evicted")
+	}
+
+	// Advance past TTL for ip:10.0.0.3 (seen at +20s; at +5m25s it is >5m old, while 10.0.0.1 at +30s & 10.0.0.4 at +40s are <5m old).
+	now = time.Date(2026, 11, 13, 12, 5, 25, 0, time.UTC)
+	_ = store.LimiterFor(reqForIP("10.0.0.5"))
+	if len(store.entries) != 3 {
+		t.Fatalf("len(entries) after expired sweep = %d, want 3", len(store.entries))
+	}
+	if _, exists := store.entries["ip:10.0.0.3"]; exists {
+		t.Fatal("expected expired entry ip:10.0.0.3 to be swept before evicting active entries")
+	}
+	if _, exists := store.entries["ip:10.0.0.1"]; !exists {
+		t.Fatal("expected active entry ip:10.0.0.1 to remain in store")
+	}
+
+	// Advance past TTL without triggering sweepPeriod (< 1m since lastSweep), then access an expired key directly.
+	now = now.Add(30 * time.Second) // 12:05:55 -> ip:10.0.0.1 (lastSeen 12:00:30) is expired (>5m), sweepPeriod (1m from 12:05:25) not reached
+	lim1Fresh := store.LimiterFor(reqForIP("10.0.0.1"))
+	if lim1Fresh == lim1 {
+		t.Fatal("expected direct lookup of expired entry to allocate a fresh limiter")
 	}
 }
 

@@ -71,13 +71,6 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate content length before reading body
-	if r.ContentLength > maxBulkPayloadBytes {
-		scim.WriteScimError(w, scim.NewScimError(http.StatusRequestEntityTooLarge, "",
-			fmt.Sprintf("Bulk request exceeds maxPayloadSize (%d bytes)", maxBulkPayloadBytes)))
-		return
-	}
-
 	var body map[string]any
 	if err := readJSONWithLimit(w, r, maxBulkPayloadBytes, &body); err != nil {
 		var maxBytesErr *http.MaxBytesError

@@ -141,23 +141,20 @@ func printableConfig(cfg Config) Config {
 	return masked
 }
 
+func defaultConfig() Config {
+	return Config{
+		Server: ServerConfig{
+			ReadTimeout:       defaultServerReadTimeout,
+			ReadHeaderTimeout: defaultServerReadHeaderTimeout,
+			WriteTimeout:      defaultServerWriteTimeout,
+			IdleTimeout:       defaultServerIdleTimeout,
+			ShutdownTimeout:   defaultServerShutdownTimeout,
+		},
+	}
+}
+
 func applyConfigDefaults(cfg *Config) {
 	cfg.Server.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.Server.BaseURL), "/")
-	if cfg.Server.ReadTimeout == 0 {
-		cfg.Server.ReadTimeout = defaultServerReadTimeout
-	}
-	if cfg.Server.ReadHeaderTimeout == 0 {
-		cfg.Server.ReadHeaderTimeout = defaultServerReadHeaderTimeout
-	}
-	if cfg.Server.WriteTimeout == 0 {
-		cfg.Server.WriteTimeout = defaultServerWriteTimeout
-	}
-	if cfg.Server.IdleTimeout == 0 {
-		cfg.Server.IdleTimeout = defaultServerIdleTimeout
-	}
-	if cfg.Server.ShutdownTimeout == 0 {
-		cfg.Server.ShutdownTimeout = defaultServerShutdownTimeout
-	}
 	if cfg.Cleanup.RequestLogs.Enabled == nil {
 		defaultEnabled := true
 		cfg.Cleanup.RequestLogs.Enabled = &defaultEnabled

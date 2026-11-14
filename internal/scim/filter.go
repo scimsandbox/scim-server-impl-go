@@ -158,7 +158,7 @@ func parseEntityFilter(filter string, startParam int, entityType string, crossRe
 	if len(filter) > MaxFilterLength {
 		return nil, NewScimError(400, "invalidFilter", fmt.Sprintf("Invalid filter: filter length exceeds maximum of %d bytes", MaxFilterLength))
 	}
-	tokens, err := tokenizeLimited(filter, MaxFilterTokens)
+	tokens, err := tokenize(filter)
 	if err != nil {
 		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
 	}
@@ -281,18 +281,11 @@ type token struct {
 
 var tokenRegex = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|[()]|[^\s()]+`)
 
-func tokenizeLimited(filter string, maxTokens int) ([]token, error) {
+func tokenize(filter string) ([]token, error) {
 	filter = NormalizeNFC(filter)
-	if maxTokens > 0 && len(filter) > MaxFilterLength {
-		return nil, fmt.Errorf("filter length exceeds maximum of %d bytes", MaxFilterLength)
-	}
-	limit := -1
-	if maxTokens > 0 {
-		limit = maxTokens + 1
-	}
-	matches := tokenRegex.FindAllString(filter, limit)
-	if maxTokens > 0 && len(matches) > maxTokens {
-		return nil, fmt.Errorf("filter exceeds maximum token count (%d)", maxTokens)
+	matches := tokenRegex.FindAllString(filter, MaxFilterTokens+1)
+	if len(matches) > MaxFilterTokens {
+		return nil, fmt.Errorf("filter exceeds maximum token count (%d)", MaxFilterTokens)
 	}
 	tokens := make([]token, 0, len(matches))
 	for _, m := range matches {

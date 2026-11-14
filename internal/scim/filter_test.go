@@ -842,17 +842,22 @@ func TestParseFilter_LengthTokenAndDepthLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("NFC-expanding filter exceeding MaxFilterLength after normalization returns 400 invalidFilter", func(t *testing.T) {
-		// U+0F73 (3 UTF-8 bytes) canonically decomposes to U+0F71 + U+0F72 (6 UTF-8 bytes) under NFC.
-		// 900 runes = 2700 raw bytes (< 4096), expanding to 5400 bytes (> 4096) after NormalizeNFC.
-		nfcExpanding := `userName eq "` + strings.Repeat("\u0F73", 900) + `"`
-		if len(nfcExpanding) >= MaxFilterLength {
-			t.Fatalf("pre-NFC input length %d must be < %d", len(nfcExpanding), MaxFilterLength)
+	t.Run("filter at exact MaxFilterLength succeeds while MaxFilterLength+1 fails", func(t *testing.T) {
+		prefix := `userName eq "`
+		suffix := `"`
+		exact := prefix + strings.Repeat("a", MaxFilterLength-len(prefix)-len(suffix)) + suffix
+		if len(exact) != MaxFilterLength {
+			t.Fatalf("len(exact) = %d, want %d", len(exact), MaxFilterLength)
 		}
-		_, err := ParseUserFilter(nfcExpanding, 1)
+		if _, err := ParseUserFilter(exact, 1); err != nil {
+			t.Fatalf("expected filter at exact MaxFilterLength to succeed, got: %v", err)
+		}
+
+		overByOne := prefix + strings.Repeat("a", MaxFilterLength+1-len(prefix)-len(suffix)) + suffix
+		_, err := ParseUserFilter(overByOne, 1)
 		scimErr, ok := err.(*ScimError)
 		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
-			t.Fatalf("expected 400 invalidFilter after NFC expansion, got %T: %v", err, err)
+			t.Fatalf("expected 400 invalidFilter for MaxFilterLength+1, got %T: %v", err, err)
 		}
 	})
 

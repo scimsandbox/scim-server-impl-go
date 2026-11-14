@@ -28,7 +28,7 @@ func New(handler http.Handler, config Config) http.Handler {
 	wrapped := handler
 	if config.RateLimit.Enabled {
 		wrapped = throttlingMiddleware(
-			newRequestLimiter(config.RateLimit.RequestsPerSecond, config.RateLimit.Burst),
+			newKeyedLimiterStore(config.RateLimit.RequestsPerSecond, config.RateLimit.Burst),
 			resolveRateLimitWaitTimeout(config.RateLimit.WaitTimeout),
 			wrapped,
 		)

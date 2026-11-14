@@ -31,7 +31,7 @@ func loadConfig(lookupEnv LookupEnvFunc) (Config, error) {
 
 	files := resolveConfigFiles(configDir)
 
-	cfg, err := configloader.Load[Config](configloader.LoadOptions{
+	cfg, err := configloader.LoadWithDefaults(defaultConfig(), configloader.LoadOptions{
 		Files:     files,
 		EnvPrefix: "GO_",
 		LookupEnv: configloader.LookupEnvFunc(lookupEnv),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -432,6 +433,10 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 		writeReadJSONError(w, err)
 		return
 	}
+	if err := scim.ValidatePasswordInput(input); err != nil {
+		scim.WriteErrorFromAny(w, err)
+		return
+	}
 
 	baseURL := buildBaseURL(r)
 	ifMatch := r.Header.Get("If-Match")
@@ -619,7 +624,7 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 func (h *UserHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	// POST /.search: parse JSON body and inject into query params for ListUsers
 	var body map[string]any
-	if err := readJSON(w, r, &body); err != nil {
+	if err := readJSON(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
 		writeReadJSONError(w, err)
 		return
 	}

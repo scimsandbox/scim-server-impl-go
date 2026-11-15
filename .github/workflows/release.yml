@@ -203,7 +203,8 @@ jobs:
               go build -trimpath -ldflags='-s -w' -o "$package_dir/scim-server-impl-go" ./cmd/server
 
             cp LICENSE README.md CONTRIBUTING.md SECURITY.md VERSION "$package_dir/"
-            cp -R config "$package_dir/"
+            mkdir -p "$package_dir/config"
+            cp config/app-conf.yaml "$package_dir/config/app-conf.yaml"
 
             tar -czf "dist/scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-${arch}.tar.gz" \
               -C dist "scim-server-impl-go-${{ steps.version.outputs.release_version }}-linux-${arch}"

@@ -77,7 +77,13 @@ func UserToScimResponse(user *model.ScimUser, baseURL string, groups []map[strin
 }
 
 func ApplyFromScimInput(user *model.ScimUser, input map[string]any) error {
-	if err := applySimpleAttributes(user, input); err != nil {
+	rawPw, hasPw, err := extractAndValidatePassword(input)
+	if err != nil {
+		return err
+	}
+	input = NormalizeUserInput(input)
+
+	if err := applySimpleAttributes(user, input, rawPw, hasPw); err != nil {
 		return err
 	}
 	if err := applyNameAttribute(user, input); err != nil {
@@ -357,7 +363,7 @@ func putCollection(m map[string]any, key string, items []map[string]any) {
 	}
 }
 
-func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
+func applySimpleAttributes(user *model.ScimUser, input map[string]any, rawPw *string, hasPw bool) error {
 	if rawUN, ok := input["userName"]; ok && rawUN != nil {
 		s, err := parseStrictStringPtr(rawUN, "userName")
 		if err != nil {
@@ -447,11 +453,7 @@ func applySimpleAttributes(user *model.ScimUser, input map[string]any) error {
 	} else {
 		user.Active = true
 	}
-	if v, ok := input["password"]; ok {
-		rawPw, err := parseRawStringPtr(v, "password")
-		if err != nil {
-			return err
-		}
+	if hasPw {
 		pw, err := HashPassword(rawPw)
 		if err != nil {
 			return err
@@ -518,11 +520,16 @@ func applyNameAttribute(user *model.ScimUser, input map[string]any) error {
 func applyEnterpriseExtension(user *model.ScimUser, input map[string]any) error {
 	var extRaw any
 	found := false
-	for k, val := range input {
-		if strings.EqualFold(k, EnterpriseSchemaURN) {
-			extRaw = val
-			found = true
-			break
+	if v, ok := input[EnterpriseSchemaURN]; ok {
+		extRaw = v
+		found = true
+	} else {
+		for k, val := range input {
+			if asciiEqualFold(k, EnterpriseSchemaURN) {
+				extRaw = val
+				found = true
+				break
+			}
 		}
 	}
 	if !found || extRaw == nil {
@@ -532,6 +539,7 @@ func applyEnterpriseExtension(user *model.ScimUser, input map[string]any) error 
 	if !ok {
 		return NewScimError(400, "invalidValue", "Enterprise extension must be an object")
 	}
+	ext = NormalizeEnterpriseMap(ext)
 	if v, ok := ext["employeeNumber"]; ok {
 		s, err := parseStrictStringPtr(v, "employeeNumber")
 		if err != nil {
@@ -620,6 +628,7 @@ func applyEnterpriseManager(user *model.ScimUser, mgrRaw any) error {
 		user.EnterpriseManagerValue = &normStr
 		user.EnterpriseManagerDisplay = nil
 	case map[string]any:
+		mgr = NormalizeManagerMap(mgr)
 		var parsedVal *string
 		valProvided := false
 		if v, ok := mgr["value"]; ok {
@@ -670,11 +679,15 @@ func extractMapSlice(v any, attrName string) ([]map[string]any, error) {
 			if !ok {
 				return nil, NewScimError(400, "invalidValue", fmt.Sprintf("Elements of '%s' must be JSON objects", attrName))
 			}
-			res = append(res, m)
+			res = append(res, NormalizeMultiValuedItemMap(m))
 		}
 		return res, nil
 	case []map[string]any:
-		return raw, nil
+		res := make([]map[string]any, len(raw))
+		for i, m := range raw {
+			res[i] = NormalizeMultiValuedItemMap(m)
+		}
+		return res, nil
 	default:
 		return nil, NewScimError(400, "invalidValue", fmt.Sprintf("Attribute '%s' must be an array", attrName))
 	}

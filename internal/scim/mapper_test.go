@@ -205,14 +205,18 @@ func TestHashPassword(t *testing.T) {
 		}
 	}
 
-	// Nil / empty stays nil / empty
+	// Nil stays nil; empty string is rejected as invalidValue (400)
 	if res, err := HashPassword(nil); err != nil || res != nil {
 		t.Fatalf("nil password should return nil, nil")
 	}
 	empty := ""
 	resEmpty, err := HashPassword(&empty)
-	if err != nil || resEmpty == nil || *resEmpty != "" {
-		t.Fatalf("empty password should remain empty")
+	if err == nil || resEmpty != nil {
+		t.Fatalf("expected 400 invalidValue error for empty password, got %v", resEmpty)
+	}
+	var emptyScimErr *ScimError
+	if !errors.As(err, &emptyScimErr) || emptyScimErr.Status != 400 || emptyScimErr.ScimType != "invalidValue" {
+		t.Fatalf("expected 400 invalidValue ScimError for empty password, got %v", err)
 	}
 
 	// Password exceeding 72 bytes must return error

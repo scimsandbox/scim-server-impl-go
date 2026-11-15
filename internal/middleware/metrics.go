@@ -103,7 +103,7 @@ func resolveThrottledOutcome(state string, rc *statusCapture) string {
 		return state
 	}
 
-	if rc.statusCode == http.StatusServiceUnavailable && rc.Header().Get("Retry-After") != "" {
+	if (rc.statusCode == http.StatusTooManyRequests || rc.statusCode == http.StatusServiceUnavailable) && rc.Header().Get("Retry-After") != "" {
 		return ThrottledYes
 	}
 

@@ -774,4 +774,142 @@ func TestBuildJSONAttributeFilter_JsonbArrayElementsAndSpecialChars(t *testing.T
 	}
 }
 
+func TestParseFilter_LengthTokenAndDepthLimits(t *testing.T) {
+	t.Run("oversized filter string returns 400 invalidFilter", func(t *testing.T) {
+		oversized := `userName eq "` + strings.Repeat("a", MaxFilterLength) + `"`
+		for _, fn := range []func(string, int) (*FilterResult, error){ParseUserFilter, ParseGroupFilter} {
+			_, err := fn(oversized, 1)
+			if err == nil {
+				t.Fatal("expected error for filter exceeding MaxFilterLength")
+			}
+			scimErr, ok := err.(*ScimError)
+			if !ok {
+				t.Fatalf("expected *ScimError, got %T: %v", err, err)
+			}
+			if scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+				t.Fatalf("expected 400 invalidFilter, got status=%d scimType=%q detail=%q", scimErr.Status, scimErr.ScimType, scimErr.Detail)
+			}
+		}
+	})
+
+	t.Run("excessive token count returns 400 invalidFilter", func(t *testing.T) {
+		clauses := make([]string, 70) // 70 * 3 + 69 = 279 tokens > MaxFilterTokens (200)
+		for i := range clauses {
+			clauses[i] = `userName eq "a"`
+		}
+		tooManyTokens := strings.Join(clauses, " or ")
+		_, err := ParseUserFilter(tooManyTokens, 1)
+		if err == nil {
+			t.Fatal("expected error for filter exceeding MaxFilterTokens")
+		}
+		scimErr, ok := err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("deeply nested parentheses or NOT expressions return 400 invalidFilter", func(t *testing.T) {
+		deepParens := strings.Repeat("(", MaxFilterDepth+2) + `userName eq "alice"` + strings.Repeat(")", MaxFilterDepth+2)
+		_, err := ParseUserFilter(deepParens, 1)
+		if err == nil {
+			t.Fatal("expected error for deeply nested parentheses")
+		}
+		scimErr, ok := err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter, got %T: %v", err, err)
+		}
+
+		deepNot := strings.Repeat("not (", MaxFilterDepth+1) + `userName eq "alice"` + strings.Repeat(")", MaxFilterDepth+1)
+		_, err = ParseUserFilter(deepNot, 1)
+		if err == nil {
+			t.Fatal("expected error for deeply nested NOT expression")
+		}
+		scimErr, ok = err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter, got %T: %v", err, err)
+		}
+
+		// Nesting at MaxFilterDepth is still accepted
+		okParens := strings.Repeat("(", MaxFilterDepth) + `userName eq "alice"` + strings.Repeat(")", MaxFilterDepth)
+		if _, err := ParseUserFilter(okParens, 1); err != nil {
+			t.Fatalf("expected nesting at MaxFilterDepth (%d) to succeed, got: %v", MaxFilterDepth, err)
+		}
+
+		// Unparenthesized NOT atom expression succeeds at normal depth
+		notAtom, err := ParseUserFilter(`not userName eq "alice"`, 1)
+		if err != nil || notAtom == nil || !strings.HasPrefix(notAtom.SQL, "NOT (") {
+			t.Fatalf("expected unparenthesized NOT atom to succeed, got res=%v err=%v", notAtom, err)
+		}
+	})
+
+	t.Run("filter at exact MaxFilterLength succeeds while MaxFilterLength+1 fails", func(t *testing.T) {
+		prefix := `userName eq "`
+		suffix := `"`
+		exact := prefix + strings.Repeat("a", MaxFilterLength-len(prefix)-len(suffix)) + suffix
+		if len(exact) != MaxFilterLength {
+			t.Fatalf("len(exact) = %d, want %d", len(exact), MaxFilterLength)
+		}
+		if _, err := ParseUserFilter(exact, 1); err != nil {
+			t.Fatalf("expected filter at exact MaxFilterLength to succeed, got: %v", err)
+		}
+
+		overByOne := prefix + strings.Repeat("a", MaxFilterLength+1-len(prefix)-len(suffix)) + suffix
+		_, err := ParseUserFilter(overByOne, 1)
+		scimErr, ok := err.(*ScimError)
+		if !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidFilter" {
+			t.Fatalf("expected 400 invalidFilter for MaxFilterLength+1, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("LIKE operators omit literal ESCAPE clause for standard_conforming_strings=off compatibility while escaping wildcards in bind args", func(t *testing.T) {
+		userCases := []struct {
+			filter  string
+			wantArg string
+		}{
+			{`schemas co "core"`, `%core%`},
+			{`schemas sw "urn:"`, `urn:%`},
+			{`schemas ew ":User"`, `%:User`},
+			{`externalId co "ext_1%2\3"`, `%ext\_1\%2\\3%`},
+			{`externalId sw "ext_%"`, `ext\_\%%`},
+			{`externalId ew "_1\"`, `%\_1\\`},
+			{`emails.value co "a_b%c\@example.com"`, `%a\_b\%c\\@example.com%`},
+			{`emails.value sw "alice_@"`, `alice\_@%`},
+			{`emails.value ew "%_\"`, `%\%\_\\`},
+		}
+		for _, tc := range userCases {
+			res, err := ParseUserFilter(tc.filter, 1)
+			if err != nil || res == nil {
+				t.Fatalf("ParseUserFilter(%q) error = %v", tc.filter, err)
+			}
+			if !strings.Contains(res.SQL, "LIKE") || strings.Contains(res.SQL, "ESCAPE") {
+				t.Fatalf("ParseUserFilter(%q) SQL = %q, want LIKE without ESCAPE clause", tc.filter, res.SQL)
+			}
+			if len(res.Args) == 0 || res.Args[0] != tc.wantArg {
+				t.Fatalf("ParseUserFilter(%q) Args[0] = %v, want %q", tc.filter, res.Args, tc.wantArg)
+			}
+		}
+
+		groupCases := []struct {
+			filter  string
+			wantArg string
+		}{
+			{`members.display co "adm_1%\"`, `%adm\_1\%\\%`},
+			{`members.display sw "adm_"`, `adm\_%`},
+			{`members.display ew "%min"`, `%\%min`},
+		}
+		for _, tc := range groupCases {
+			res, err := ParseGroupFilter(tc.filter, 1)
+			if err != nil || res == nil {
+				t.Fatalf("ParseGroupFilter(%q) error = %v", tc.filter, err)
+			}
+			if !strings.Contains(res.SQL, "LIKE") || strings.Contains(res.SQL, "ESCAPE") {
+				t.Fatalf("ParseGroupFilter(%q) SQL = %q, want LIKE without ESCAPE clause", tc.filter, res.SQL)
+			}
+			if len(res.Args) != 1 || res.Args[0] != tc.wantArg {
+				t.Fatalf("ParseGroupFilter(%q) Args = %v, want [%q]", tc.filter, res.Args, tc.wantArg)
+			}
+		}
+	})
+}
+
 

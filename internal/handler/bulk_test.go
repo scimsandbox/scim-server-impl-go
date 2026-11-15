@@ -542,22 +542,29 @@ func TestBulk_MissingDataLocationAndTopologicalOrder(t *testing.T) {
 	})
 }
 
-func TestBulk_MaxBytesReader_ChunkedBodyExceedingLimitReturns413(t *testing.T) {
+func TestBulk_MaxBytesReader_ChunkedAndKnownContentLengthExceedingLimitReturn413(t *testing.T) {
 	bh := &BulkHandler{}
 	wsID := uuid.New()
 
 	oversized := `{"schemas":["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],"Operations":[{"data":"` +
 		strings.Repeat("x", maxBulkPayloadBytes+1024) + `"}]}`
 
-	req := httptest.NewRequest(http.MethodPost, "/Bulk", bytes.NewBufferString(oversized))
-	req.ContentLength = -1 // Simulate chunked transfer encoding with unknown Content-Length
-	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+	for _, chunked := range []bool{false, true} {
+		req := httptest.NewRequest(http.MethodPost, "/Bulk", bytes.NewBufferString(oversized))
+		if chunked {
+			req.ContentLength = -1 // Simulate chunked transfer encoding with unknown Content-Length
+		}
+		req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
 
-	rec := httptest.NewRecorder()
-	bh.ProcessBulk(rec, req)
+		rec := httptest.NewRecorder()
+		bh.ProcessBulk(rec, req)
 
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413 Request Entity Too Large", rec.Code)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("chunked=%v: status = %d, want 413 Request Entity Too Large", chunked, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "Bulk request exceeds maxPayloadSize (1048576 bytes)") {
+			t.Fatalf("chunked=%v: unexpected 413 detail: %s", chunked, rec.Body.String())
+		}
 	}
 }
 

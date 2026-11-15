@@ -331,3 +331,109 @@ func TestDeleteGroup(t *testing.T) {
 		t.Fatalf("get after delete: expected 404, got %d", resp.StatusCode)
 	}
 }
+
+func TestV5GroupConstraintsRejectSelfMembershipAndCaseVariantDuplicates(t *testing.T) {
+	env := setupTestEnv(t)
+
+	wsID := uuid.New()
+	token := generateToken()
+	seedWorkspaceAndToken(t, env.ctx, wsID, token)
+
+	uResp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Users"), token, `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+		"userName": "v5member@example.com",
+		"active": true
+	}`)
+	uBody := readBody(t, uResp)
+	if uResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create user: expected 201, got %d: %s", uResp.StatusCode, uBody)
+	}
+	var createdUser map[string]any
+	_ = json.Unmarshal([]byte(uBody), &createdUser)
+	userID := createdUser["id"].(string)
+
+	// 1. Create group with case-variant duplicate member UUIDs -> deduplicated cleanly (201, not 500 unique_violation)
+	gResp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Groups"), token, `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+		"displayName": "V5 Self Ref Group",
+		"members": [
+			{"value": "`+strings.ToLower(userID)+`", "type": "User"},
+			{"value": "`+strings.ToUpper(userID)+`", "type": "User"}
+		]
+	}`)
+	gBody := readBody(t, gResp)
+	if gResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create group with case-variant duplicate UUIDs: expected 201, got %d: %s", gResp.StatusCode, gBody)
+	}
+	var createdGroup map[string]any
+	_ = json.Unmarshal([]byte(gBody), &createdGroup)
+	groupID := createdGroup["id"].(string)
+
+	// 2. PUT self-membership -> 400 invalidValue (not 500 check_violation)
+	resp := doRequest(t, http.MethodPut, scimURL(env.server.URL, wsID, "/Groups/"+groupID), token, `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+		"displayName": "V5 Self Ref Group",
+		"members": [{"value": "`+groupID+`", "type": "Group"}]
+	}`)
+	respBody := readBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(respBody, `"invalidValue"`) {
+		t.Fatalf("expected 400 invalidValue on PUT self-membership, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	// 3. PATCH add self-membership -> 400 invalidValue
+	resp = doRequest(t, http.MethodPatch, scimURL(env.server.URL, wsID, "/Groups/"+groupID), token, `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+		"Operations": [{"op": "add", "path": "members", "value": [{"value": "`+groupID+`"}]}]
+	}`)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(respBody, `"invalidValue"`) {
+		t.Fatalf("expected 400 invalidValue on PATCH self-membership, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	// 4. Bulk POST self-ref and Bulk PATCH self-ref -> per-op 400 invalidValue
+	bulkResp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Bulk"), token, `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+		"Operations": [
+			{
+				"method": "POST",
+				"path": "/Groups",
+				"bulkId": "selfBulk",
+				"data": {
+					"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+					"displayName": "Bulk Self Group",
+					"members": [{"value": "bulkId:selfBulk"}]
+				}
+			},
+			{
+				"method": "POST",
+				"path": "/Groups",
+				"bulkId": "validBulk",
+				"data": {
+					"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+					"displayName": "Bulk Valid Then Self Patch"
+				}
+			},
+			{
+				"method": "PATCH",
+				"path": "/Groups/bulkId:validBulk",
+				"data": {
+					"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+					"Operations": [{"op": "add", "path": "members", "value": [{"value": "bulkId:validBulk"}]}]
+				}
+			}
+		]
+	}`)
+	bulkBody := readBody(t, bulkResp)
+	if bulkResp.StatusCode != http.StatusOK {
+		t.Fatalf("bulk: expected 200 envelope, got %d: %s", bulkResp.StatusCode, bulkBody)
+	}
+	var parsedBulk map[string]any
+	_ = json.Unmarshal([]byte(bulkBody), &parsedBulk)
+	ops, _ := parsedBulk["Operations"].([]any)
+	if len(ops) != 3 {
+		t.Fatalf("expected 3 bulk operation results, got %d: %s", len(ops), bulkBody)
+	}
+	if ops[0].(map[string]any)["status"] != "400" || ops[2].(map[string]any)["status"] != "400" {
+		t.Fatalf("expected 400 for both bulk self-membership ops, got: %s", bulkBody)
+	}
+}

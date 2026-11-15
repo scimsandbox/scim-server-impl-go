@@ -3,6 +3,8 @@ package httpapi
 import (
 	"container/list"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/logging"
 	"github.com/scimsandbox/scim-server-impl-go/internal/messages"
 	"github.com/scimsandbox/scim-server-impl-go/internal/middleware"
@@ -38,16 +41,8 @@ const (
 
 type statusCapture struct {
 	http.ResponseWriter
-	statusCode int
-}
-
-type requestLimiter interface {
-	Allow() bool
-	Wait(context.Context) error
-}
-
-type limiterProvider interface {
-	LimiterFor(*http.Request) requestLimiter
+	statusCode  int
+	wroteHeader bool
 }
 
 type limiterEntry struct {
@@ -73,8 +68,28 @@ type keyedLimiterStore struct {
 }
 
 func (s *statusCapture) WriteHeader(code int) {
-	s.statusCode = code
+	if !s.wroteHeader {
+		s.statusCode = code
+		s.wroteHeader = true
+	}
 	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusCapture) Write(b []byte) (int, error) {
+	if !s.wroteHeader {
+		s.wroteHeader = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusCapture) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusCapture) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
 }
 
 func sanitizeRateLimit(requestsPerSecond float64) rate.Limit {
@@ -134,7 +149,7 @@ func resolveSubRateLimit(globalRPS float64, globalBurst int, subRPS float64, sub
 }
 
 // ParseTrustedProxies parses a comma-separated list of IP addresses or CIDR ranges.
-// An empty string returns nil, meaning default loopback/private/link-local peers are trusted.
+// An empty string returns nil, meaning no proxy peers are trusted (fail closed).
 func ParseTrustedProxies(raw string) ([]netip.Prefix, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
@@ -174,19 +189,16 @@ func ParseTrustedProxies(raw string) ([]netip.Prefix, error) {
 }
 
 func isTrustedProxyPeer(peerAddr netip.Addr, trustedProxies []netip.Prefix) bool {
-	if !peerAddr.IsValid() {
+	if !peerAddr.IsValid() || len(trustedProxies) == 0 {
 		return false
 	}
 	peerAddr = peerAddr.Unmap()
-	if len(trustedProxies) > 0 {
-		for _, pfx := range trustedProxies {
-			if pfx.Contains(peerAddr) {
-				return true
-			}
+	for _, pfx := range trustedProxies {
+		if pfx.Contains(peerAddr) {
+			return true
 		}
-		return false
 	}
-	return peerAddr.IsLoopback() || peerAddr.IsPrivate() || peerAddr.IsLinkLocalUnicast()
+	return false
 }
 
 func parseHeaderAddr(raw string) (netip.Addr, bool) {
@@ -202,7 +214,19 @@ func parseHeaderAddr(raw string) (netip.Addr, bool) {
 	return addr.Unmap(), true
 }
 
-func extractClientIPKey(r *http.Request, trustedProxies []netip.Prefix) string {
+func formatClientAddrKey(addr netip.Addr) string {
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return "ip:" + addr.String()
+	}
+	if addr.Is6() {
+		pfx, _ := addr.Prefix(64)
+		return "ip:" + pfx.String()
+	}
+	return "ip:" + addr.String()
+}
+
+func extractClientIPKey(r *http.Request, trustedProxies, trustedCloudflareProxies []netip.Prefix) string {
 	if r == nil {
 		return "global"
 	}
@@ -221,28 +245,248 @@ func extractClientIPKey(r *http.Request, trustedProxies []netip.Prefix) string {
 		return "ip:" + rawHost
 	}
 
-	if isTrustedProxyPeer(peerAddr, trustedProxies) {
+	cfTrusted := isTrustedProxyPeer(peerAddr, trustedCloudflareProxies)
+	if cfTrusted {
 		cfValues := r.Header.Values("CF-Connecting-IP")
 		if len(cfValues) == 1 && !strings.Contains(cfValues[0], ",") {
 			if cfAddr, valid := parseHeaderAddr(cfValues[0]); valid {
-				return "ip:" + cfAddr.String()
-			}
-		}
-
-		xffValues := r.Header.Values("X-Forwarded-For")
-		if len(xffValues) > 0 {
-			lastHeader := xffValues[len(xffValues)-1]
-			lastHop := lastHeader
-			if idx := strings.LastIndexByte(lastHeader, ','); idx >= 0 {
-				lastHop = lastHeader[idx+1:]
-			}
-			if xffAddr, valid := parseHeaderAddr(lastHop); valid {
-				return "ip:" + xffAddr.String()
+				return formatClientAddrKey(cfAddr)
 			}
 		}
 	}
 
-	return "ip:" + peerAddr.String()
+	if cfTrusted || isTrustedProxyPeer(peerAddr, trustedProxies) {
+		xffValues := r.Header.Values("X-Forwarded-For")
+		if len(xffValues) > 0 {
+			var lastValidTrusted netip.Addr
+			for hIdx := len(xffValues) - 1; hIdx >= 0; hIdx-- {
+				hdr := xffValues[hIdx]
+				for {
+					commaIdx := strings.LastIndexByte(hdr, ',')
+					var hop string
+					if commaIdx >= 0 {
+						hop = hdr[commaIdx+1:]
+						hdr = hdr[:commaIdx]
+					} else {
+						hop = hdr
+					}
+
+					hopAddr, valid := parseHeaderAddr(hop)
+					if !valid {
+						if lastValidTrusted.IsValid() {
+							return formatClientAddrKey(lastValidTrusted)
+						}
+						return formatClientAddrKey(peerAddr)
+					}
+
+					if !isTrustedProxyPeer(hopAddr, trustedProxies) && !isTrustedProxyPeer(hopAddr, trustedCloudflareProxies) {
+						return formatClientAddrKey(hopAddr)
+					}
+
+					lastValidTrusted = hopAddr
+					if commaIdx < 0 {
+						break
+					}
+				}
+			}
+			if lastValidTrusted.IsValid() {
+				return formatClientAddrKey(lastValidTrusted)
+			}
+		}
+	}
+
+	return formatClientAddrKey(peerAddr)
+}
+
+func extractSCIMWorkspaceUUID(urlPath string) (string, bool) {
+	const (
+		wsPrefix = "/ws/"
+		scimSeg  = "/scim/v2"
+	)
+	if !strings.HasPrefix(urlPath, wsPrefix) {
+		return "", false
+	}
+	rest := urlPath[len(wsPrefix):]
+	slashIdx := strings.IndexByte(rest, '/')
+	if slashIdx <= 0 {
+		return "", false
+	}
+	seg := rest[:slashIdx]
+	tail := rest[slashIdx:]
+	if tail != scimSeg && !strings.HasPrefix(tail, scimSeg+"/") {
+		return "", false
+	}
+	parsed, err := uuid.Parse(seg)
+	if err != nil || parsed == uuid.Nil {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
+func extractBearerToken(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return "", false
+	}
+	rawToken := strings.TrimPrefix(authHeader, "Bearer ")
+	if strings.TrimSpace(rawToken) == "" {
+		return "", false
+	}
+	return rawToken, true
+}
+
+type verifiedBearerKey struct {
+	ipKey     string
+	wsID      string
+	tokenHash [32]byte
+}
+
+type verifiedBearerEntry struct {
+	key      verifiedBearerKey
+	lastSeen time.Time
+}
+
+type verifiedBearerShard struct {
+	mu         sync.Mutex
+	entries    map[verifiedBearerKey]*list.Element
+	lru        *list.List
+	maxEntries int
+}
+
+type verifiedBearerCache struct {
+	shards    []verifiedBearerShard
+	shardMask uint32
+	ttl       time.Duration
+}
+
+func newVerifiedBearerCache(maxEntries int, ttl time.Duration) *verifiedBearerCache {
+	if maxEntries <= 0 {
+		maxEntries = defaultMaxRateLimitBuckets
+	}
+	numShards := 1
+	if maxEntries >= defaultRateLimitShards {
+		numShards = defaultRateLimitShards
+	}
+	shards := make([]verifiedBearerShard, numShards)
+	baseCap := maxEntries / numShards
+	rem := maxEntries % numShards
+	for i := range shards {
+		shardCap := baseCap
+		if i < rem {
+			shardCap++
+		}
+		shards[i] = verifiedBearerShard{
+			entries:    make(map[verifiedBearerKey]*list.Element),
+			lru:        list.New(),
+			maxEntries: shardCap,
+		}
+	}
+	return &verifiedBearerCache{
+		shards:    shards,
+		shardMask: uint32(numShards - 1),
+		ttl:       ttl,
+	}
+}
+
+func (c *verifiedBearerCache) shardFor(key verifiedBearerKey) *verifiedBearerShard {
+	if len(c.shards) == 1 {
+		return &c.shards[0]
+	}
+	h := binary.LittleEndian.Uint32(key.tokenHash[:4]) ^ fnv32a(key.ipKey) ^ fnv32a(key.wsID)
+	return &c.shards[h&c.shardMask]
+}
+
+func (sh *verifiedBearerShard) removeElementLocked(elem *list.Element) {
+	entry := sh.lru.Remove(elem).(*verifiedBearerEntry)
+	delete(sh.entries, entry.key)
+}
+
+func (sh *verifiedBearerShard) evictExpiredFrontLocked(now time.Time, ttl time.Duration) {
+	for i := 0; i < maxExpiredEvictPerAccess; i++ {
+		front := sh.lru.Front()
+		if front == nil {
+			break
+		}
+		fe := front.Value.(*verifiedBearerEntry)
+		if now.Sub(fe.lastSeen) < ttl {
+			break
+		}
+		sh.removeElementLocked(front)
+	}
+}
+
+func (c *verifiedBearerCache) Contains(key verifiedBearerKey, now time.Time) bool {
+	sh := c.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	sh.evictExpiredFrontLocked(now, c.ttl)
+
+	elem, ok := sh.entries[key]
+	if !ok {
+		return false
+	}
+	entry := elem.Value.(*verifiedBearerEntry)
+	if now.Sub(entry.lastSeen) >= c.ttl {
+		sh.removeElementLocked(elem)
+		return false
+	}
+	entry.lastSeen = now
+	sh.lru.MoveToBack(elem)
+	return true
+}
+
+func (c *verifiedBearerCache) Put(key verifiedBearerKey, now time.Time) {
+	sh := c.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	sh.evictExpiredFrontLocked(now, c.ttl)
+
+	if elem, ok := sh.entries[key]; ok {
+		entry := elem.Value.(*verifiedBearerEntry)
+		entry.lastSeen = now
+		sh.lru.MoveToBack(elem)
+		return
+	}
+	if len(sh.entries) >= sh.maxEntries {
+		if front := sh.lru.Front(); front != nil {
+			sh.removeElementLocked(front)
+		}
+	}
+	elem := sh.lru.PushBack(&verifiedBearerEntry{
+		key:      key,
+		lastSeen: now,
+	})
+	sh.entries[key] = elem
+}
+
+func (c *verifiedBearerCache) Delete(key verifiedBearerKey) {
+	sh := c.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	if elem, ok := sh.entries[key]; ok {
+		sh.removeElementLocked(elem)
+	}
+}
+
+type preAuthVerifyCallbackKey struct{}
+
+type preAuthVerifyHook struct {
+	onAuthenticated func(authWSID uuid.UUID)
+}
+
+func notifyPreAuthTokenVerified(ctx context.Context, authWSID uuid.UUID) {
+	if authWSID == uuid.Nil {
+		return
+	}
+	if hook, ok := ctx.Value(preAuthVerifyCallbackKey{}).(preAuthVerifyHook); ok && hook.onAuthenticated != nil {
+		hook.onAuthenticated(authWSID)
+	}
 }
 
 func newKeyedLimiterStore(requestsPerSecond float64, burst int) *keyedLimiterStore {
@@ -264,6 +508,9 @@ func newKeyedLimiterStoreWithOptions(
 ) *keyedLimiterStore {
 	if maxEntries <= 0 {
 		maxEntries = defaultMaxRateLimitBuckets
+	}
+	if nowFn == nil {
+		nowFn = time.Now
 	}
 
 	numShards := 1
@@ -321,11 +568,7 @@ func (sh *limiterShard) removeElementLocked(elem *list.Element) {
 	delete(sh.entries, entry.key)
 }
 
-func (s *keyedLimiterStore) LimiterFor(r *http.Request) requestLimiter {
-	return s.LimiterForKey(extractClientIPKey(r, nil))
-}
-
-func (s *keyedLimiterStore) LimiterForKey(key string) requestLimiter {
+func (s *keyedLimiterStore) LimiterForKey(key string) *rate.Limiter {
 	shard := s.shardFor(key)
 
 	shard.mu.Lock()
@@ -406,57 +649,119 @@ func writeRateLimitExceeded(w http.ResponseWriter, r *http.Request) {
 	scim.WriteScimError(w, scim.NewScimError(http.StatusTooManyRequests, rateLimitScimType, rateLimitCapacityDetail))
 }
 
+type limiterReservation struct {
+	res   *rate.Reservation
+	actAt time.Time
+}
+
 func acquireLimiters(
 	r *http.Request,
+	nowFn func() time.Time,
 	waitTimeout time.Duration,
 	waitSem chan struct{},
-	limiters ...requestLimiter,
+	limiters ...*rate.Limiter,
+) (allowed bool, canceled bool) {
+	return acquireLimitersWithHook(r, nowFn, waitTimeout, waitSem, nil, limiters...)
+}
+
+func acquireLimitersWithHook(
+	r *http.Request,
+	nowFn func() time.Time,
+	waitTimeout time.Duration,
+	waitSem chan struct{},
+	onWaitStart func(),
+	limiters ...*rate.Limiter,
 ) (allowed bool, canceled bool) {
 	if r.Context().Err() != nil {
 		return false, true
 	}
-
-	firstBlocked := -1
-	for i, lim := range limiters {
-		if !lim.Allow() {
-			firstBlocked = i
-			break
-		}
-	}
-	if firstBlocked == -1 {
+	if len(limiters) == 0 {
 		return true, false
 	}
 
-	if waitTimeout <= 0 {
+	now := nowFn()
+	var stackRes [2]limiterReservation
+	reservations := stackRes[:0]
+
+	allOK := true
+	var maxDelay time.Duration
+	for _, lim := range limiters {
+		res := lim.ReserveN(now, 1)
+		if !res.OK() {
+			reservations = append(reservations, limiterReservation{res: res})
+			allOK = false
+			continue
+		}
+		d := res.DelayFrom(now)
+		reservations = append(reservations, limiterReservation{
+			res:   res,
+			actAt: now.Add(d),
+		})
+		if d > maxDelay {
+			maxDelay = d
+		}
+	}
+
+	cancelAll := func(cancelTime time.Time) {
+		for _, lr := range reservations {
+			if !lr.res.OK() {
+				continue
+			}
+			at := cancelTime
+			if lr.actAt.Before(cancelTime) {
+				at = lr.actAt
+			}
+			lr.res.CancelAt(at)
+		}
+	}
+
+	if !allOK || (waitTimeout <= 0 && maxDelay > 0) || (waitTimeout > 0 && maxDelay > waitTimeout) {
+		cancelAll(now)
 		return false, false
+	}
+
+	if maxDelay <= 0 {
+		return true, false
 	}
 
 	select {
 	case waitSem <- struct{}{}:
 		defer func() { <-waitSem }()
 	default:
+		cancelAll(now)
 		return false, false
 	}
 
-	waitCtx, cancel := context.WithTimeout(r.Context(), waitTimeout)
-	defer cancel()
+	timer := time.NewTimer(maxDelay)
+	defer timer.Stop()
 
-	for i := firstBlocked; i < len(limiters); i++ {
-		if i > firstBlocked && limiters[i].Allow() {
-			continue
-		}
-		if err := limiters[i].Wait(waitCtx); err != nil {
-			if r.Context().Err() != nil {
-				return false, true
-			}
-			return false, false
-		}
+	if onWaitStart != nil {
+		onWaitStart()
 	}
 
-	return true, false
+	select {
+	case <-r.Context().Done():
+		cancelAll(nowFn())
+		return false, true
+	case <-timer.C:
+		return true, false
+	}
 }
 
-func preAuthThrottlingMiddleware(cfg RateLimitConfig, next http.Handler) http.Handler {
+func newPreAuthThrottlingMiddleware(cfg RateLimitConfig, next http.Handler, nowFn func() time.Time) http.Handler {
+	return newPreAuthThrottlingMiddlewareWithHooks(cfg, next, nowFn, nil)
+}
+
+func newPreAuthThrottlingMiddlewareWithHooks(
+	cfg RateLimitConfig,
+	next http.Handler,
+	nowFn func() time.Time,
+	onWaitStart func(),
+) http.Handler {
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+
 	globalBurst := resolveRateLimitBurst(cfg.RequestsPerSecond, cfg.Burst)
 	globalLimiter := rate.NewLimiter(sanitizeRateLimit(cfg.RequestsPerSecond), globalBurst)
 
@@ -466,8 +771,24 @@ func preAuthThrottlingMiddleware(cfg RateLimitConfig, next http.Handler) http.Ha
 		cfg.PerIPRequestsPerSecond,
 		cfg.PerIPBurst,
 	)
-	ipStore := newKeyedLimiterStore(ipRPS, ipBurst)
+	unauthIPStore := newKeyedLimiterStoreWithOptions(
+		ipRPS,
+		ipBurst,
+		defaultMaxRateLimitBuckets,
+		defaultRateLimitBucketTTL,
+		nowFn,
+	)
+	verifiedIPWSStore := newKeyedLimiterStoreWithOptions(
+		ipRPS,
+		ipBurst,
+		defaultMaxRateLimitBuckets,
+		defaultRateLimitBucketTTL,
+		nowFn,
+	)
+	verifiedCache := newVerifiedBearerCache(defaultMaxRateLimitBuckets, defaultRateLimitBucketTTL)
+
 	trustedProxies, _ := ParseTrustedProxies(cfg.TrustedProxies)
+	trustedCloudflareProxies, _ := ParseTrustedProxies(cfg.TrustedCloudflareProxies)
 	waitTimeout := resolveRateLimitWaitTimeout(cfg.WaitTimeout)
 
 	var waitSem chan struct{}
@@ -477,29 +798,59 @@ func preAuthThrottlingMiddleware(cfg RateLimitConfig, next http.Handler) http.Ha
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		middleware.MarkThrottled(r, middleware.ThrottledNo)
-		ipLimiter := ipStore.LimiterForKey(extractClientIPKey(r, trustedProxies))
-		allowed, canceled := acquireLimiters(r, waitTimeout, waitSem, ipLimiter, globalLimiter)
-		if canceled {
+		ipKey := extractClientIPKey(r, trustedProxies, trustedCloudflareProxies)
+
+		urlWS, hasWS := extractSCIMWorkspaceUUID(r.URL.Path)
+		bearerToken, hasBearer := extractBearerToken(r)
+		if hasWS && hasBearer {
+			vKey := verifiedBearerKey{
+				ipKey:     ipKey,
+				wsID:      urlWS,
+				tokenHash: sha256.Sum256([]byte(bearerToken)),
+			}
+			if verifiedCache.Contains(vKey, nowFn()) {
+				ipwsLim := verifiedIPWSStore.LimiterForKey(ipKey + "|ws:" + urlWS)
+				allowed, canceled := acquireLimitersWithHook(r, nowFn, waitTimeout, waitSem, onWaitStart, ipwsLim, globalLimiter)
+				if canceled {
+					return
+				}
+				if !allowed {
+					writeRateLimitExceeded(w, r)
+					return
+				}
+
+				rec := &statusCapture{ResponseWriter: w, statusCode: http.StatusOK}
+				next.ServeHTTP(rec, r)
+				if rec.statusCode == http.StatusUnauthorized || rec.statusCode == http.StatusForbidden {
+					verifiedCache.Delete(vKey)
+				}
+				return
+			}
+
+			unauthLim := unauthIPStore.LimiterForKey(ipKey)
+			allowed, canceled := acquireLimitersWithHook(r, nowFn, waitTimeout, waitSem, onWaitStart, unauthLim, globalLimiter)
+			if canceled {
+				return
+			}
+			if !allowed {
+				writeRateLimitExceeded(w, r)
+				return
+			}
+
+			hook := preAuthVerifyHook{
+				onAuthenticated: func(authWSID uuid.UUID) {
+					if authWSID != uuid.Nil && authWSID.String() == urlWS {
+						verifiedCache.Put(vKey, nowFn())
+					}
+				},
+			}
+			r = r.WithContext(context.WithValue(r.Context(), preAuthVerifyCallbackKey{}, hook))
+			next.ServeHTTP(w, r)
 			return
 		}
-		if !allowed {
-			writeRateLimitExceeded(w, r)
-			return
-		}
 
-		next.ServeHTTP(w, r)
-	})
-}
-
-func throttlingMiddleware(provider limiterProvider, waitTimeout time.Duration, next http.Handler) http.Handler {
-	var waitSem chan struct{}
-	if waitTimeout > 0 {
-		waitSem = make(chan struct{}, maxConcurrentRateLimitWaits)
-	}
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		middleware.MarkThrottled(r, middleware.ThrottledNo)
-		allowed, canceled := acquireLimiters(r, waitTimeout, waitSem, provider.LimiterFor(r))
+		unauthLim := unauthIPStore.LimiterForKey(ipKey)
+		allowed, canceled := acquireLimitersWithHook(r, nowFn, waitTimeout, waitSem, onWaitStart, unauthLim, globalLimiter)
 		if canceled {
 			return
 		}

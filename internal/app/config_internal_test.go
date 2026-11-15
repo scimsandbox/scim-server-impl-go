@@ -1043,6 +1043,8 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			{"negative RateLimit.PerWorkspaceBurst", func(c *Config) { c.RateLimit.PerWorkspaceBurst = -2 }, "rate_limit.per_workspace_burst"},
 			{"invalid RateLimit.TrustedProxies IP", func(c *Config) { c.RateLimit.TrustedProxies = "not-an-ip" }, "rate_limit.trusted_proxies"},
 			{"invalid RateLimit.TrustedProxies CIDR", func(c *Config) { c.RateLimit.TrustedProxies = "10.0.0.0/99" }, "rate_limit.trusted_proxies"},
+			{"invalid RateLimit.TrustedCloudflareProxies IP", func(c *Config) { c.RateLimit.TrustedCloudflareProxies = "bad-cf-ip" }, "rate_limit.trusted_cloudflare_proxies"},
+			{"invalid RateLimit.TrustedCloudflareProxies CIDR", func(c *Config) { c.RateLimit.TrustedCloudflareProxies = "173.245.48.0/99" }, "rate_limit.trusted_cloudflare_proxies"},
 			{"NaN RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = true; c.RateLimit.RequestsPerSecond = math.NaN() }, "rate_limit.requests_per_second"},
 			{"Inf RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = true; c.RateLimit.RequestsPerSecond = math.Inf(1) }, "rate_limit.requests_per_second"},
 			{"negative disabled RateLimit.RequestsPerSecond", func(c *Config) { c.RateLimit.Enabled = false; c.RateLimit.RequestsPerSecond = -1 }, "rate_limit.requests_per_second"},
@@ -1079,6 +1081,7 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 			"  per_workspace_requests_per_second: 250",
 			"  per_workspace_burst: 50",
 			"  trusted_proxies: \"10.0.0.0/8, 127.0.0.1\"",
+			"  trusted_cloudflare_proxies: \"173.245.48.0/20\"",
 			"  wait_timeout: 0s",
 		}, "\n") + "\n"
 		if err := os.WriteFile(configPath, []byte(yamlText), 0o644); err != nil {
@@ -1099,6 +1102,8 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 				return "60", true
 			case "GO_RATE_LIMIT_TRUSTED_PROXIES":
 				return "172.16.0.0/12, ::1", true
+			case "GO_RATE_LIMIT_TRUSTED_CLOUDFLARE_PROXIES":
+				return "103.21.244.0/22, 2400:cb00::/32", true
 			default:
 				return "", false
 			}
@@ -1114,6 +1119,9 @@ func TestCleanupRequestLogsConfig(t *testing.T) {
 		}
 		if cfg.RateLimit.TrustedProxies != "172.16.0.0/12, ::1" {
 			t.Fatalf("TrustedProxies = %q, want %q", cfg.RateLimit.TrustedProxies, "172.16.0.0/12, ::1")
+		}
+		if cfg.RateLimit.TrustedCloudflareProxies != "103.21.244.0/22, 2400:cb00::/32" {
+			t.Fatalf("TrustedCloudflareProxies = %q, want %q", cfg.RateLimit.TrustedCloudflareProxies, "103.21.244.0/22, 2400:cb00::/32")
 		}
 	})
 }

@@ -468,3 +468,167 @@ func TestUserHandler_SearchUsers_EmptyBodyAllowed(t *testing.T) {
 		})
 	}
 }
+
+func TestUserHandler_PatchUser_InvalidPasswordReturns400BeforeAsyncDispatch(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+	userID := uuid.New()
+
+	invalidPatchPayloads := []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "empty password",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "replace", "path": "password", "value": ""}},
+			},
+		},
+		{
+			name: "whitespace-only password",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "replace", "path": "password", "value": "   "}},
+			},
+		},
+		{
+			name: "over-72-byte password",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "replace", "path": "password", "value": strings.Repeat("p", 100)}},
+			},
+		},
+		{
+			name: "non-string password",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "replace", "path": "password", "value": 123}},
+			},
+		},
+		{
+			name: "null password value",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "replace", "path": "password", "value": nil}},
+			},
+		},
+		{
+			name: "missing password value",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "replace", "path": "password"}},
+			},
+		},
+		{
+			name: "URN-qualified password path",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "replace", "path": scim.UserSchemaURN + ":password", "value": ""}},
+			},
+		},
+		{
+			name: "pathless add with non-string password",
+			body: map[string]any{
+				"schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"Operations": []any{map[string]any{"op": "add", "value": map[string]any{"password": 123}}},
+			},
+		},
+		{
+			name: "uppercase OP/VALUE and core-URN Password",
+			body: map[string]any{
+				"Schemas":    []string{"urn:ietf:params:scim:api:messages:2.0:PatchOp"},
+				"operations": []any{map[string]any{"OP": "ADD", "VALUE": map[string]any{scim.UserSchemaURN + ":Password": ""}}},
+			},
+		},
+	}
+
+	for _, tc := range invalidPatchPayloads {
+		for _, asyncMode := range []bool{false, true} {
+			mode := "sync"
+			if asyncMode {
+				mode = "respond-async"
+			}
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				asyncRepo := newMockAsyncEventRepo()
+				uh := NewUserHandler(nil, nil, nil, asyncRepo)
+
+				rawBody, _ := json.Marshal(tc.body)
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPatch, "/Users/"+userID.String(), strings.NewReader(string(rawBody)))
+				if asyncMode {
+					req.Header.Set("Prefer", "respond-async")
+				}
+				ctx := context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID)
+				rctx := chi.NewRouteContext()
+				rctx.URLParams.Add("workspaceId", wsID.String())
+				rctx.URLParams.Add("id", userID.String())
+				req = req.WithContext(context.WithValue(ctx, chi.RouteCtxKey, rctx))
+
+				uh.PatchUser(rec, req)
+
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400 (not 202 Accepted); body=%s", rec.Code, rec.Body.String())
+				}
+				var resp map[string]any
+				if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("invalid JSON: %v", err)
+				}
+				if resp["status"] != "400" || resp["scimType"] != "invalidValue" {
+					t.Fatalf("got status=%v scimType=%v, want 400 invalidValue", resp["status"], resp["scimType"])
+				}
+				asyncRepo.mu.Lock()
+				eventCount := len(asyncRepo.events)
+				asyncRepo.mu.Unlock()
+				if eventCount != 0 {
+					t.Fatalf("expected 0 async events queued for invalid password PATCH, got %d", eventCount)
+				}
+			})
+		}
+	}
+}
+
+func TestUserHandler_NormalizedCreateUserKeysAndAsyncValidation(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+
+	// CreateUser with PascalCase UserName/Password/DisplayName passes synchronous validation
+	// (reaching userRepo==nil 500 rather than failing with 400 "userName is required").
+	for _, body := range []map[string]any{
+		{"UserName": "bob", "Password": "Valid!1", "DisplayName": "Bob"},
+		{scim.UserSchemaURN + ":userName": "bob", scim.UserSchemaURN + ":password": "Valid!1"},
+	} {
+		uh := NewUserHandler(nil, nil, nil)
+		rawBody, _ := json.Marshal(body)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/Users", strings.NewReader(string(rawBody)))
+		req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+		uh.CreateUser(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("CreateUser(%v) status = %d, want 500 (past 400 input validation); body=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	// CreateUser with invalid URN-prefixed password rejects synchronously with 400 before respond-async.
+	asyncRepo := newMockAsyncEventRepo()
+	uh := NewUserHandler(nil, nil, nil, asyncRepo)
+	rawInvalid, _ := json.Marshal(map[string]any{
+		"UserName":                       "bob",
+		scim.UserSchemaURN + ":password": "",
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/Users", strings.NewReader(string(rawInvalid)))
+	req.Header.Set("Prefer", "respond-async")
+	req = req.WithContext(context.WithValue(req.Context(), middleware.WorkspaceIDKey, wsID))
+	uh.CreateUser(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("CreateUser(invalid URN password + respond-async) status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	asyncRepo.mu.Lock()
+	defer asyncRepo.mu.Unlock()
+	if len(asyncRepo.events) != 0 {
+		t.Fatalf("expected 0 async events queued, got %d", len(asyncRepo.events))
+	}
+}

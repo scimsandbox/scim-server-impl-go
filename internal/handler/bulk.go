@@ -128,7 +128,7 @@ func (h *BulkHandler) ProcessBulk(w http.ResponseWriter, r *http.Request) {
 		rawMethod, _ := opMap["method"].(string)
 		bid, _ := opMap["bulkId"].(string)
 		bid = strings.TrimSpace(bid)
-		if strings.EqualFold(rawMethod, "POST") && bid != "" {
+		if scim.ASCIIEqualFold(rawMethod, "POST") && bid != "" {
 			if _, exists := producerByBulkID[bid]; !exists {
 				producerByBulkID[bid] = i
 			}
@@ -291,7 +291,7 @@ func computeBulkExecutionOrder(ops []map[string]any, producerByBulkID map[string
 
 		if rawPath, ok := op["path"].(string); ok {
 			if segs, err := normalizeBulkPath(rawPath); err == nil && len(segs) >= 2 {
-				normPath := strings.ToLower(segs[0]) + "/" + segs[1]
+				normPath := scim.ASCIILower(segs[0]) + "/" + segs[1]
 				if prevIdx, exists := lastOpForResource[normPath]; exists {
 					addEdge(prevIdx, i)
 				}
@@ -327,7 +327,7 @@ func computeBulkExecutionOrder(ops []map[string]any, producerByBulkID map[string
 			return false
 		}
 		m, _ := ops[idx]["method"].(string)
-		return strings.EqualFold(strings.TrimSpace(m), "POST")
+		return scim.ASCIIEqualFold(strings.TrimSpace(m), "POST")
 	}
 
 	scheduled := make([]bool, n)
@@ -512,9 +512,9 @@ func computeBulkTargetLocation(baseURL, method, resolvedPath string) string {
 	}
 	if segments, err := normalizeBulkPath(resolvedPath); err == nil && len(segments) > 0 {
 		seg0 := segments[0]
-		if strings.EqualFold(seg0, "Users") {
+		if scim.ASCIIEqualFold(seg0, "Users") {
 			seg0 = "Users"
-		} else if strings.EqualFold(seg0, "Groups") {
+		} else if scim.ASCIIEqualFold(seg0, "Groups") {
 			seg0 = "Groups"
 		}
 		rest := append([]string{seg0}, segments[1:]...)
@@ -625,9 +625,10 @@ func (h *BulkHandler) handleBulkPost(
 }
 
 func extractDeferredGroupMembers(data map[string]any, producerByBulkID map[string]int, selfBulkID string) (map[string]any, []map[string]any) {
-	rawMembers, ok := data["members"].([]any)
+	normData := scim.NormalizeGroupInput(data)
+	rawMembers, ok := normData["members"].([]any)
 	if !ok || len(rawMembers) == 0 {
-		return data, nil
+		return normData, nil
 	}
 	immediate := make([]any, 0, len(rawMembers))
 	var deferred []map[string]any
@@ -647,10 +648,10 @@ func extractDeferredGroupMembers(data map[string]any, producerByBulkID map[strin
 		immediate = append(immediate, m)
 	}
 	if len(deferred) == 0 {
-		return data, nil
+		return normData, nil
 	}
-	cloned := make(map[string]any, len(data))
-	for k, v := range data {
+	cloned := make(map[string]any, len(normData))
+	for k, v := range normData {
 		cloned[k] = v
 	}
 	cloned["members"] = immediate
@@ -658,17 +659,8 @@ func extractDeferredGroupMembers(data map[string]any, producerByBulkID map[strin
 }
 
 func extractDeferredUserManager(data map[string]any, producerByBulkID map[string]int, selfBulkID string) (map[string]any, any, bool) {
-	var entKey string
-	var entMap map[string]any
-	for k, v := range data {
-		if strings.EqualFold(k, scim.EnterpriseSchemaURN) {
-			if m, ok := v.(map[string]any); ok {
-				entKey = k
-				entMap = m
-			}
-			break
-		}
-	}
+	normData := scim.NormalizeUserInput(data)
+	entMap, _ := normData[scim.EnterpriseSchemaURN].(map[string]any)
 	if entMap == nil {
 		return data, nil, false
 	}
@@ -694,17 +686,21 @@ func extractDeferredUserManager(data map[string]any, producerByBulkID map[string
 		return data, nil, false
 	}
 
-	clonedData := make(map[string]any, len(data))
-	for k, v := range data {
+	// Preserve raw password keys on cloned data if any duplicate variants exist so ValidatePasswordInput sees them.
+	if err := scim.ValidatePasswordInput(data); err != nil {
+		return data, nil, false
+	}
+	clonedData := make(map[string]any, len(normData))
+	for k, v := range normData {
 		clonedData[k] = v
 	}
 	clonedEnt := make(map[string]any, len(entMap))
 	for k, v := range entMap {
-		if !strings.EqualFold(k, "manager") {
+		if !scim.ASCIIEqualFold(k, "manager") {
 			clonedEnt[k] = v
 		}
 	}
-	clonedData[entKey] = clonedEnt
+	clonedData[scim.EnterpriseSchemaURN] = clonedEnt
 	return clonedData, rawMgr, true
 }
 
@@ -890,6 +886,7 @@ func (h *BulkHandler) handleBulkPatch(r *http.Request, result map[string]any, ra
 		return
 	}
 
+	data = scim.NormalizePatchRequest(data)
 	ops, _ := data["Operations"].([]any)
 	if len(ops) == 0 {
 		setBulkError(result, scim.NewScimError(http.StatusBadRequest, "invalidValue", "PATCH Operations is required"))
@@ -902,7 +899,7 @@ func (h *BulkHandler) handleBulkPatch(r *http.Request, result map[string]any, ra
 			setBulkError(result, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid PATCH operation"))
 			return
 		}
-		operations = append(operations, m)
+		operations = append(operations, scim.NormalizePatchOperation(m))
 	}
 
 	switch target.resourceType {
@@ -1058,9 +1055,9 @@ func parseBulkTarget(rawPath string, isItemRequired bool) (*bulkPathTarget, erro
 	}
 
 	var rType bulkResourceType
-	if strings.EqualFold(segments[0], "Users") {
+	if scim.ASCIIEqualFold(segments[0], "Users") {
 		rType = bulkResourceUsers
-	} else if strings.EqualFold(segments[0], "Groups") {
+	} else if scim.ASCIIEqualFold(segments[0], "Groups") {
 		rType = bulkResourceGroups
 	} else {
 		return nil, &scim.ScimError{

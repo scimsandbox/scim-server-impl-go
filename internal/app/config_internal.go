@@ -231,6 +231,9 @@ func validateConfig(cfg Config) error {
 	if _, err := httpapi.ParseTrustedProxies(cfg.RateLimit.TrustedProxies); err != nil {
 		return fmt.Errorf("rate_limit.trusted_proxies: %w", err)
 	}
+	if _, err := httpapi.ParseTrustedProxies(cfg.RateLimit.TrustedCloudflareProxies); err != nil {
+		return fmt.Errorf("rate_limit.trusted_cloudflare_proxies: %w", err)
+	}
 	if cfg.RateLimit.WaitTimeout < 0 {
 		return fmt.Errorf("rate_limit.wait_timeout must be greater than or equal to 0")
 	}

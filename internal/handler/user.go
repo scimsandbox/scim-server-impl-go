@@ -51,6 +51,11 @@ func (h *UserHandler) executeCreateUser(ctx context.Context, wsID uuid.UUID, bas
 		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
 	}
 
+	if err := scim.ValidatePasswordInput(body); err != nil {
+		return nil, err
+	}
+	body = scim.NormalizeUserInput(body)
+
 	userName, _ := body["userName"].(string)
 	userName = scim.NormalizeNFC(userName)
 	if userName == "" {
@@ -103,6 +108,11 @@ func (h *UserHandler) executeReplaceUser(ctx context.Context, wsID, userID uuid.
 	if !checkETagMatch(ifMatch, user.Version) {
 		return nil, scim.NewScimError(http.StatusPreconditionFailed, "", "ETag mismatch")
 	}
+
+	if err := scim.ValidatePasswordInput(body); err != nil {
+		return nil, err
+	}
+	body = scim.NormalizeUserInput(body)
 
 	newUserName, _ := body["userName"].(string)
 	newUserName = scim.NormalizeNFC(newUserName)
@@ -228,14 +238,16 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := scim.ValidatePasswordInput(input); err != nil {
+		scim.WriteErrorFromAny(w, err)
+		return
+	}
+	input = scim.NormalizeUserInput(input)
+
 	userName, _ := input["userName"].(string)
 	userName = scim.NormalizeNFC(userName)
 	if userName == "" {
 		scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidValue", "userName is required"))
-		return
-	}
-	if err := scim.ValidatePasswordInput(input); err != nil {
-		scim.WriteErrorFromAny(w, err)
 		return
 	}
 
@@ -437,6 +449,7 @@ func (h *UserHandler) ReplaceUser(w http.ResponseWriter, r *http.Request) {
 		scim.WriteErrorFromAny(w, err)
 		return
 	}
+	input = scim.NormalizeUserInput(input)
 
 	baseURL := buildBaseURL(r)
 	ifMatch := r.Header.Get("If-Match")
@@ -502,12 +515,13 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		writeReadJSONError(w, err)
 		return
 	}
+	patchReq = scim.NormalizePatchRequest(patchReq)
 
 	// Validate PatchOp schema
 	schemas, _ := patchReq["schemas"].([]any)
 	validSchema := false
 	for _, s := range schemas {
-		if s == "urn:ietf:params:scim:api:messages:2.0:PatchOp" {
+		if str, ok := s.(string); ok && strings.EqualFold(str, "urn:ietf:params:scim:api:messages:2.0:PatchOp") {
 			validSchema = true
 			break
 		}
@@ -526,9 +540,17 @@ func (h *UserHandler) PatchUser(w http.ResponseWriter, r *http.Request) {
 
 	operations := make([]map[string]any, 0, len(ops))
 	for _, op := range ops {
-		if m, ok := op.(map[string]any); ok {
-			operations = append(operations, m)
+		m, ok := op.(map[string]any)
+		if !ok {
+			scim.WriteScimError(w, scim.NewScimError(http.StatusBadRequest, "invalidSyntax", "Invalid PATCH operation"))
+			return
 		}
+		operations = append(operations, scim.NormalizePatchOperation(m))
+	}
+
+	if err := scim.ValidatePatchOperationsPasswords(operations); err != nil {
+		scim.WriteErrorFromAny(w, err)
+		return
 	}
 
 	baseURL := buildBaseURL(r)

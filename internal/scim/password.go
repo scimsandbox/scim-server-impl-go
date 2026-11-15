@@ -2,6 +2,7 @@ package scim
 
 import (
 	"slices"
+	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -28,7 +29,7 @@ func isASCIIPasswordAttr(k string) bool {
 }
 
 func validatePassword(val string) error {
-	if val == "" {
+	if strings.TrimSpace(val) == "" {
 		return NewScimError(400, "invalidValue", "password cannot be empty")
 	}
 	if len(val) > MaxBcryptPasswordBytes {
@@ -50,42 +51,113 @@ func parsePasswordValue(v any) (*string, error) {
 	return rawPw, nil
 }
 
-// extractAndValidatePassword validates every top-level ASCII case-insensitive "password"
-// entry in input (RFC 7643 §2.1 ASCII attribute names, rejecting URN-qualified keys and
-// non-ASCII Unicode fold equivalents such as U+017F) and deterministically selects the
-// winning value: exact "password" first, otherwise the lexically smallest matching key.
-func extractAndValidatePassword(input map[string]any) (*string, bool, error) {
-	var keyBuf [2]string
-	keys := keyBuf[:0]
-	for k := range input {
-		if isASCIIPasswordAttr(k) {
-			keys = append(keys, k)
-		}
-	}
-	if len(keys) == 0 {
+// extractAndValidatePasswordOpts validates every password-bearing entry in input
+// (top-level exact/case-variant "password", flat core-User-URN-prefixed ":password",
+// and nested core-User-URN object "password" entries, using ASCII-only case folding)
+// and deterministically selects the winning value:
+// exact "password" > unprefixed case variant > core-URN-prefixed > nested core-URN object,
+// tie-broken lexicographically.
+func extractAndValidatePasswordOpts(input map[string]any, rejectNil bool) (*string, bool, error) {
+	if len(input) == 0 {
 		return nil, false, nil
 	}
-	if len(keys) > 1 {
-		slices.Sort(keys)
+
+	outerKeys := make([]string, 0, len(input))
+	for k := range input {
+		outerKeys = append(outerKeys, k)
+	}
+	slices.Sort(outerKeys)
+
+	var candidates []normCandidate
+	for _, outerKey := range outerKeys {
+		val := input[outerKey]
+		if isASCIIPasswordAttr(outerKey) {
+			tier := 2
+			if outerKey == passwordAttrName {
+				tier = 3
+			}
+			candidates = append(candidates, normCandidate{
+				groupKey:  passwordAttrName,
+				targetKey: passwordAttrName,
+				tier:      tier,
+				outerKey:  outerKey,
+				val:       val,
+			})
+			continue
+		}
+		if suffix, ok := StripCoreUserURNPrefix(outerKey); ok && isASCIIPasswordAttr(suffix) {
+			candidates = append(candidates, normCandidate{
+				groupKey:  passwordAttrName,
+				targetKey: passwordAttrName,
+				tier:      1,
+				outerKey:  outerKey,
+				val:       val,
+			})
+			continue
+		}
+		if asciiEqualFold(outerKey, UserSchemaURN) {
+			if subMap, ok := val.(map[string]any); ok {
+				innerKeys := make([]string, 0, len(subMap))
+				for ik := range subMap {
+					if isASCIIPasswordAttr(ik) {
+						innerKeys = append(innerKeys, ik)
+					}
+				}
+				slices.Sort(innerKeys)
+				for _, innerKey := range innerKeys {
+					subTier := 0
+					if innerKey == passwordAttrName {
+						subTier = 1
+					}
+					candidates = append(candidates, normCandidate{
+						groupKey:  passwordAttrName,
+						targetKey: passwordAttrName,
+						tier:      0,
+						subTier:   subTier,
+						outerKey:  outerKey,
+						innerKey:  innerKey,
+						val:       subMap[innerKey],
+					})
+				}
+			}
+		}
 	}
 
-	var chosenKey string
-	var chosenPw *string
-	for _, k := range keys {
-		parsed, err := parsePasswordValue(input[k])
+	if len(candidates) == 0 {
+		return nil, false, nil
+	}
+
+	var winner normCandidate
+	var winnerPw *string
+	hasWinner := false
+	for _, cand := range candidates {
+		if rejectNil && cand.val == nil {
+			return nil, false, NewInvalidValue("password cannot be empty")
+		}
+		parsed, err := parsePasswordValue(cand.val)
 		if err != nil {
 			return nil, false, err
 		}
-		if chosenKey == "" || k == passwordAttrName {
-			chosenKey = k
-			chosenPw = parsed
+		if !hasWinner || candBetter(cand, winner) {
+			winner = cand
+			winnerPw = parsed
+			hasWinner = true
 		}
 	}
-	return chosenPw, true, nil
+	return winnerPw, true, nil
+}
+
+func extractAndValidatePassword(input map[string]any) (*string, bool, error) {
+	return extractAndValidatePasswordOpts(input, false)
+}
+
+func validatePatchValueMapPasswords(input map[string]any) error {
+	_, _, err := extractAndValidatePasswordOpts(input, true)
+	return err
 }
 
 // HashPassword hashes a raw plaintext password using bcrypt if non-nil.
-// Empty strings, passwords exceeding 72 UTF-8 bytes, or bcrypt failures return
+// Empty/whitespace strings, passwords exceeding 72 UTF-8 bytes, or bcrypt failures return
 // HTTP 400 invalidValue so invalid or plaintext credentials are never stored.
 func HashPassword(raw *string) (*string, error) {
 	if raw == nil {
@@ -102,8 +174,9 @@ func HashPassword(raw *string) (*string, error) {
 	return &h, nil
 }
 
-// ValidatePasswordInput validates all top-level ASCII case-insensitive password attributes
-// present in a SCIM User payload without mutating the payload, rejecting non-string, empty,
+// ValidatePasswordInput validates all password-bearing attributes present in a SCIM User
+// payload (plain ASCII case variants, flat core-User-URN-prefixed keys, and nested core-User-URN
+// object entries) without mutating the payload, rejecting non-string, empty/whitespace,
 // or >72-byte UTF-8 values with 400 invalidValue.
 func ValidatePasswordInput(input map[string]any) error {
 	_, _, err := extractAndValidatePassword(input)

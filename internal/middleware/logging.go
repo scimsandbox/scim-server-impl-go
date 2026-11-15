@@ -140,8 +140,8 @@ func RequestResponseLogging(logRepo requestLogCreator) func(http.Handler) http.H
 				}
 			}
 
-			reqBodyStr := finalizeLoggedBody(string(reqBody), reqTruncated)
-			respBodyStr := finalizeLoggedBody(rc.body.String(), rc.truncated)
+			reqBodyStr := finalizeLoggedBody(string(reqBody), reqTruncated, false)
+			respBodyStr := finalizeLoggedBody(rc.body.String(), rc.truncated, true)
 
 			log := &model.ScimRequestLog{
 				ID:           uuid.New(),
@@ -165,15 +165,65 @@ func RequestResponseLogging(logRepo requestLogCreator) func(http.Handler) http.H
 	}
 }
 
-func finalizeLoggedBody(raw string, captureTruncated bool) string {
-	redacted := RedactSensitiveBody(raw)
-	if len(redacted) > maxBodyLog {
-		return redacted[:maxBodyLog] + "...[truncated]"
+func finalizeLoggedBody(raw string, captureTruncated bool, isResponse bool) string {
+	if raw == "" {
+		return ""
 	}
 	if captureTruncated {
-		return redacted + "...[truncated]"
+		raw = trimIncompleteTrailingUTF8(raw)
 	}
-	return redacted
+
+	var redacted string
+	if isResponse {
+		redacted = redactResponseBody(raw)
+	} else {
+		redacted = RedactSensitiveBody(raw)
+	}
+
+	var out string
+	switch {
+	case len(redacted) > maxBodyLog:
+		out = truncateUTF8(redacted, maxBodyLog) + "...[truncated]"
+	case captureTruncated:
+		out = redacted + "...[truncated]"
+	default:
+		out = redacted
+	}
+
+	if !utf8.ValidString(out) {
+		out = strings.ToValidUTF8(out, "\uFFFD")
+	}
+	return out
+}
+
+func trimIncompleteTrailingUTF8(s string) string {
+	if len(s) == 0 || s[len(s)-1] < utf8.RuneSelf {
+		return s
+	}
+	minIdx := len(s) - utf8.UTFMax
+	if minIdx < 0 {
+		minIdx = 0
+	}
+	for start := len(s) - 1; start >= minIdx; start-- {
+		if utf8.RuneStart(s[start]) {
+			if !utf8.FullRuneInString(s[start:]) {
+				return s[:start]
+			}
+			return s
+		}
+	}
+	return s
+}
+
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return trimIncompleteTrailingUTF8(s[:cut])
 }
 
 type redactSpan struct {
@@ -188,11 +238,11 @@ type byteRange struct {
 }
 
 type decodedJSONString struct {
-	rawStart int
-	rawEnd   int
-	closed   bool
-	decoded  string
-	offsets  []byteRange
+	rawStart   int
+	rawEnd     int
+	closed     bool
+	hasEscapes bool
+	decoded    string
 }
 
 type parsedObjectMember struct {
@@ -200,7 +250,8 @@ type parsedObjectMember struct {
 	valStart   int
 	valEnd     int
 	valIsNull  bool
-	valStr     *decodedJSONString
+	hasValStr  bool
+	valStr     decodedJSONString
 	valSpans   []redactSpan
 }
 
@@ -220,29 +271,117 @@ func RedactSensitiveBody(raw string) string {
 	return applyRedactSpans(raw, spans)
 }
 
+func redactResponseBody(raw string) string {
+	if raw == "" || !hasSensitiveResponseCandidate(raw) {
+		return raw
+	}
+
+	spans := collectSensitiveSpans(raw)
+	if len(spans) == 0 {
+		return raw
+	}
+
+	return applyRedactSpans(raw, spans)
+}
+
+func hasSensitiveResponseCandidate(s string) bool {
+	return containsFoldASCIIAt(s, "password", 4) ||
+		containsFoldASCIIAt(s, "authorization", 7) ||
+		containsFoldASCIIAt(s, "bearer", 0) ||
+		containsUnicodeEscape(s)
+}
+
 func hasSensitiveCandidate(s string) bool {
-	return containsFoldASCII(s, "password") ||
-		containsFoldASCII(s, "authorization") ||
-		containsFoldASCII(s, "bearer") ||
-		containsFoldASCII(s, "operations") ||
-		containsFoldASCII(s, "value") ||
-		strings.IndexByte(s, '\\') >= 0
+	if hasSensitiveResponseCandidate(s) {
+		return true
+	}
+	return containsFoldASCIIAt(s, "operations", 1) &&
+		containsFoldASCIIAt(s, "value", 0) &&
+		hasUnclosedJSONContainer(s)
+}
+
+func containsUnicodeEscape(s string) bool {
+	for i := 0; i < len(s); {
+		idx := strings.IndexByte(s[i:], '\\')
+		if idx < 0 {
+			return false
+		}
+		pos := i + idx
+		if pos+1 < len(s) && (s[pos+1] == 'u' || s[pos+1] == 'U') {
+			return true
+		}
+		i = pos + 1
+	}
+	return false
+}
+
+func hasUnclosedJSONContainer(s string) bool {
+	braceDepth := 0
+	bracketDepth := 0
+	sawContainer := false
+	inString := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			sawContainer = true
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case '[':
+			sawContainer = true
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		}
+	}
+	return inString || (sawContainer && (braceDepth > 0 || bracketDepth > 0))
 }
 
 func containsFoldASCII(s, needleLower string) bool {
+	return containsFoldASCIIAt(s, needleLower, 0)
+}
+
+func containsFoldASCIIAt(s, needleLower string, pivot int) bool {
 	n := len(needleLower)
 	if len(s) < n {
 		return false
 	}
-	first := needleLower[0]
-	limit := len(s) - n
-	for i := 0; i <= limit; i++ {
-		if asciiLower(s[i]) != first {
-			continue
+	lower := needleLower[pivot]
+	upper := lower - ('a' - 'A')
+	window := s[pivot : len(s)-n+pivot+1]
+
+	nextLow := strings.IndexByte(window, lower)
+	nextUp := strings.IndexByte(window, upper)
+
+	for nextLow >= 0 || nextUp >= 0 {
+		var hit int
+		if nextLow >= 0 && (nextUp < 0 || nextLow <= nextUp) {
+			hit = nextLow
+		} else {
+			hit = nextUp
 		}
+
+		candStart := hit // pivot + hit - pivot == hit
 		match := true
-		for j := 1; j < n; j++ {
-			if asciiLower(s[i+j]) != needleLower[j] {
+		for j := 0; j < n; j++ {
+			if asciiLower(s[candStart+j]) != needleLower[j] {
 				match = false
 				break
 			}
@@ -250,8 +389,43 @@ func containsFoldASCII(s, needleLower string) bool {
 		if match {
 			return true
 		}
+
+		advance := hit + 1
+		if nextLow >= 0 && nextLow < advance {
+			if rel := strings.IndexByte(window[advance:], lower); rel >= 0 {
+				nextLow = advance + rel
+			} else {
+				nextLow = -1
+			}
+		}
+		if nextUp >= 0 && nextUp < advance {
+			if rel := strings.IndexByte(window[advance:], upper); rel >= 0 {
+				nextUp = advance + rel
+			} else {
+				nextUp = -1
+			}
+		}
 	}
 	return false
+}
+
+func equalFoldASCII(s, lowerTarget string) bool {
+	if len(s) != len(lowerTarget) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if asciiLower(s[i]) != lowerTarget[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hasSuffixFoldASCII(s, lowerSuffix string) bool {
+	if len(s) < len(lowerSuffix) {
+		return false
+	}
+	return equalFoldASCII(s[len(s)-len(lowerSuffix):], lowerSuffix)
 }
 
 func asciiLower(b byte) byte {
@@ -272,7 +446,7 @@ func collectSensitiveSpans(raw string) []redactSpan {
 
 		switch raw[pos] {
 		case '{', '[':
-			endPos, _, subSpans, _, _ := scanJSONValue(raw, pos, false)
+			endPos, _, subSpans, _, _, _ := scanJSONValue(raw, pos, false)
 			spans = append(spans, subSpans...)
 			pos = endPos
 
@@ -282,7 +456,7 @@ func collectSensitiveSpans(raw string) []redactSpan {
 			if afterKey < len(raw) && raw[afterKey] == ':' && isPasswordKey(qs.decoded) {
 				valStart := skipASCIIWhitespace(raw, afterKey+1)
 				if valStart < len(raw) {
-					valEnd, valIsNull, _, _, ok := scanJSONValue(raw, valStart, false)
+					valEnd, valIsNull, _, _, _, ok := scanJSONValue(raw, valStart, false)
 					if ok {
 						if !valIsNull && valEnd > valStart {
 							spans = append(spans, redactSpan{
@@ -296,7 +470,7 @@ func collectSensitiveSpans(raw string) []redactSpan {
 					}
 				}
 			}
-			spans = append(spans, findBearerSpansInDecodedString(qs)...)
+			spans = append(spans, findBearerSpansInDecodedString(raw, qs)...)
 			pos = qs.rawEnd
 
 		default:
@@ -315,27 +489,27 @@ func scanJSONValue(
 	raw string,
 	pos int,
 	inOperationsArray bool,
-) (endPos int, isNull bool, spans []redactSpan, strVal *decodedJSONString, ok bool) {
+) (endPos int, isNull bool, spans []redactSpan, strVal decodedJSONString, hasStr bool, ok bool) {
 	pos = skipASCIIWhitespace(raw, pos)
 	if pos >= len(raw) {
-		return pos, false, nil, nil, false
+		return pos, false, nil, decodedJSONString{}, false, false
 	}
 
 	switch raw[pos] {
 	case '"':
 		qs := scanQuotedString(raw, pos)
-		return qs.rawEnd, false, findBearerSpansInDecodedString(qs), &qs, true
+		return qs.rawEnd, false, findBearerSpansInDecodedString(raw, qs), qs, true, true
 
 	case '{':
 		endIdx, objSpans := scanJSONObject(raw, pos, inOperationsArray)
-		return endIdx, false, objSpans, nil, true
+		return endIdx, false, objSpans, decodedJSONString{}, false, true
 
 	case '[':
 		endIdx, arrSpans := scanJSONArray(raw, pos, inOperationsArray)
-		return endIdx, false, arrSpans, nil, true
+		return endIdx, false, arrSpans, decodedJSONString{}, false, true
 
 	case '}', ']', ',', ':':
-		return pos, false, nil, nil, false
+		return pos, false, nil, decodedJSONString{}, false, false
 
 	default:
 		endIdx := pos
@@ -343,12 +517,13 @@ func scanJSONValue(
 			endIdx++
 		}
 		prim := raw[pos:endIdx]
-		return endIdx, prim == "null", findBearerSpansInRawText(raw, pos, endIdx), nil, endIdx > pos
+		return endIdx, prim == "null", findBearerSpansInRawText(raw, pos, endIdx), decodedJSONString{}, false, endIdx > pos
 	}
 }
 
 func scanJSONObject(raw string, openBracePos int, inOperationsArray bool) (int, []redactSpan) {
-	var members []parsedObjectMember
+	var memberBuf [16]parsedObjectMember
+	members := memberBuf[:0]
 	var extraSpans []redactSpan
 
 	i := openBracePos + 1
@@ -366,7 +541,7 @@ func scanJSONObject(raw string, openBracePos int, inOperationsArray bool) (int, 
 
 		if raw[i] != '"' {
 			if raw[i] == '{' || raw[i] == '[' {
-				subEnd, _, subSpans, _, _ := scanJSONValue(raw, i, false)
+				subEnd, _, subSpans, _, _, _ := scanJSONValue(raw, i, false)
 				extraSpans = append(extraSpans, subSpans...)
 				i = subEnd
 				continue
@@ -382,7 +557,7 @@ func scanJSONObject(raw string, openBracePos int, inOperationsArray bool) (int, 
 		keyQS := scanQuotedString(raw, i)
 		afterKey := skipASCIIWhitespace(raw, keyQS.rawEnd)
 		if afterKey >= len(raw) || raw[afterKey] != ':' {
-			extraSpans = append(extraSpans, findBearerSpansInDecodedString(keyQS)...)
+			extraSpans = append(extraSpans, findBearerSpansInDecodedString(raw, keyQS)...)
 			i = afterKey
 			continue
 		}
@@ -393,8 +568,8 @@ func scanJSONObject(raw string, openBracePos int, inOperationsArray bool) (int, 
 			break
 		}
 
-		memberIsOpsArray := strings.EqualFold(strings.TrimSpace(keyQS.decoded), "operations") && raw[valStart] == '['
-		valEnd, valIsNull, valSpans, valStr, valOK := scanJSONValue(raw, valStart, memberIsOpsArray)
+		memberIsOpsArray := equalFoldASCII(strings.TrimSpace(keyQS.decoded), "operations") && raw[valStart] == '['
+		valEnd, valIsNull, valSpans, valStr, hasValStr, valOK := scanJSONValue(raw, valStart, memberIsOpsArray)
 		if !valOK {
 			i = valStart
 			continue
@@ -405,6 +580,7 @@ func scanJSONObject(raw string, openBracePos int, inOperationsArray bool) (int, 
 			valStart:   valStart,
 			valEnd:     valEnd,
 			valIsNull:  valIsNull,
+			hasValStr:  hasValStr,
 			valStr:     valStr,
 			valSpans:   valSpans,
 		})
@@ -416,10 +592,10 @@ func scanJSONObject(raw string, openBracePos int, inOperationsArray bool) (int, 
 	hasOpMember := false
 	for idx := range members {
 		trimmedKey := strings.TrimSpace(members[idx].keyDecoded)
-		if strings.EqualFold(trimmedKey, "op") {
+		if equalFoldASCII(trimmedKey, "op") {
 			hasOpMember = true
 		}
-		if strings.EqualFold(trimmedKey, "path") && members[idx].valStr != nil {
+		if equalFoldASCII(trimmedKey, "path") && members[idx].hasValStr {
 			if isPasswordPatchPath(members[idx].valStr.decoded) {
 				isPwPatch = true
 			} else if members[idx].valStr.closed {
@@ -434,7 +610,7 @@ func scanJSONObject(raw string, openBracePos int, inOperationsArray bool) (int, 
 	var spans []redactSpan
 	for idx := range members {
 		m := &members[idx]
-		if isPasswordKey(m.keyDecoded) || (redactPatchValue && strings.EqualFold(strings.TrimSpace(m.keyDecoded), "value")) {
+		if isPasswordKey(m.keyDecoded) || (redactPatchValue && equalFoldASCII(strings.TrimSpace(m.keyDecoded), "value")) {
 			if !m.valIsNull && m.valEnd > m.valStart {
 				spans = append(spans, redactSpan{
 					start:       m.valStart,
@@ -468,7 +644,7 @@ func scanJSONArray(raw string, openBracketPos int, inOperationsArray bool) (int,
 		}
 
 		elemInOps := inOperationsArray && raw[i] == '{'
-		elemEnd, _, elemSpans, _, elemOK := scanJSONValue(raw, i, elemInOps)
+		elemEnd, _, elemSpans, _, _, elemOK := scanJSONValue(raw, i, elemInOps)
 		if !elemOK {
 			i++
 			continue
@@ -480,23 +656,47 @@ func scanJSONArray(raw string, openBracketPos int, inOperationsArray bool) (int,
 }
 
 func scanQuotedString(raw string, quotePos int) decodedJSONString {
-	capHint := len(raw) - quotePos
-	if capHint > 256 {
-		capHint = 256
-	}
-	decoded := make([]byte, 0, capHint)
-	offsets := make([]byteRange, 0, capHint)
-
-	var utf8Buf [utf8.UTFMax]byte
-	appendDecodedRune := func(r rune, rStart, rEnd int) {
-		n := utf8.EncodeRune(utf8Buf[:], r)
-		for k := 0; k < n; k++ {
-			decoded = append(decoded, utf8Buf[k])
-			offsets = append(offsets, byteRange{start: rStart, end: rEnd})
+	start := quotePos + 1
+	for i := start; i < len(raw); i++ {
+		c := raw[i]
+		if c == '"' {
+			return decodedJSONString{
+				rawStart:   quotePos,
+				rawEnd:     i + 1,
+				closed:     true,
+				hasEscapes: false,
+				decoded:    raw[start:i],
+			}
+		}
+		if c == '\\' {
+			return scanEscapedQuotedString(raw, quotePos, i)
 		}
 	}
+	return decodedJSONString{
+		rawStart:   quotePos,
+		rawEnd:     len(raw),
+		closed:     false,
+		hasEscapes: false,
+		decoded:    raw[start:],
+	}
+}
 
-	i := quotePos + 1
+func scanEscapedQuotedString(raw string, quotePos, firstSlashPos int) decodedJSONString {
+	prefixLen := firstSlashPos - (quotePos + 1)
+	capHint := len(raw) - quotePos
+	if capHint > prefixLen+256 {
+		capHint = prefixLen + 256
+	}
+	decoded := make([]byte, prefixLen, capHint)
+	copy(decoded, raw[quotePos+1:firstSlashPos])
+
+	var utf8Buf [utf8.UTFMax]byte
+	appendDecodedRune := func(r rune) {
+		n := utf8.EncodeRune(utf8Buf[:], r)
+		decoded = append(decoded, utf8Buf[:n]...)
+	}
+
+	i := firstSlashPos
 	closed := false
 	for i < len(raw) {
 		c := raw[i]
@@ -507,14 +707,12 @@ func scanQuotedString(raw string, quotePos int) decodedJSONString {
 		}
 		if c != '\\' {
 			decoded = append(decoded, c)
-			offsets = append(offsets, byteRange{start: i, end: i + 1})
 			i++
 			continue
 		}
 
 		if i+1 >= len(raw) {
 			decoded = append(decoded, '\\')
-			offsets = append(offsets, byteRange{start: i, end: i + 1})
 			i++
 			break
 		}
@@ -523,26 +721,88 @@ func scanQuotedString(raw string, quotePos int) decodedJSONString {
 		switch esc {
 		case '\\', '"', '/':
 			decoded = append(decoded, esc)
-			offsets = append(offsets, byteRange{start: i, end: i + 2})
 			i += 2
 		case 'b':
 			decoded = append(decoded, '\b')
-			offsets = append(offsets, byteRange{start: i, end: i + 2})
 			i += 2
 		case 'f':
 			decoded = append(decoded, '\f')
-			offsets = append(offsets, byteRange{start: i, end: i + 2})
 			i += 2
 		case 'n':
 			decoded = append(decoded, '\n')
-			offsets = append(offsets, byteRange{start: i, end: i + 2})
 			i += 2
 		case 'r':
 			decoded = append(decoded, '\r')
-			offsets = append(offsets, byteRange{start: i, end: i + 2})
 			i += 2
 		case 't':
 			decoded = append(decoded, '\t')
+			i += 2
+		case 'u', 'U':
+			if i+6 <= len(raw) {
+				if r1, valid := parseHex4(raw[i+2 : i+6]); valid {
+					if r1 >= 0xD800 && r1 <= 0xDBFF && i+12 <= len(raw) && raw[i+6] == '\\' && (raw[i+7] == 'u' || raw[i+7] == 'U') {
+						if r2, valid2 := parseHex4(raw[i+8 : i+12]); valid2 && r2 >= 0xDC00 && r2 <= 0xDFFF {
+							appendDecodedRune(utf16.DecodeRune(rune(r1), rune(r2)))
+							i += 12
+							continue
+						}
+					}
+					appendDecodedRune(rune(r1))
+					i += 6
+					continue
+				}
+			}
+			decoded = append(decoded, '\\')
+			i++
+		default:
+			decoded = append(decoded, '\\', esc)
+			i += 2
+		}
+	}
+
+	return decodedJSONString{
+		rawStart:   quotePos,
+		rawEnd:     i,
+		closed:     closed,
+		hasEscapes: true,
+		decoded:    string(decoded),
+	}
+}
+
+func buildEscapedStringOffsets(raw string, quotePos int) []byteRange {
+	capHint := len(raw) - quotePos
+	if capHint > 256 {
+		capHint = 256
+	}
+	offsets := make([]byteRange, 0, capHint)
+
+	var utf8Buf [utf8.UTFMax]byte
+	appendRuneOffsets := func(r rune, rStart, rEnd int) {
+		n := utf8.EncodeRune(utf8Buf[:], r)
+		for k := 0; k < n; k++ {
+			offsets = append(offsets, byteRange{start: rStart, end: rEnd})
+		}
+	}
+
+	i := quotePos + 1
+	for i < len(raw) {
+		c := raw[i]
+		if c == '"' {
+			break
+		}
+		if c != '\\' {
+			offsets = append(offsets, byteRange{start: i, end: i + 1})
+			i++
+			continue
+		}
+		if i+1 >= len(raw) {
+			offsets = append(offsets, byteRange{start: i, end: i + 1})
+			break
+		}
+
+		esc := raw[i+1]
+		switch esc {
+		case '\\', '"', '/', 'b', 'f', 'n', 'r', 't':
 			offsets = append(offsets, byteRange{start: i, end: i + 2})
 			i += 2
 		case 'u', 'U':
@@ -550,21 +810,19 @@ func scanQuotedString(raw string, quotePos int) decodedJSONString {
 				if r1, valid := parseHex4(raw[i+2 : i+6]); valid {
 					if r1 >= 0xD800 && r1 <= 0xDBFF && i+12 <= len(raw) && raw[i+6] == '\\' && (raw[i+7] == 'u' || raw[i+7] == 'U') {
 						if r2, valid2 := parseHex4(raw[i+8 : i+12]); valid2 && r2 >= 0xDC00 && r2 <= 0xDFFF {
-							appendDecodedRune(utf16.DecodeRune(rune(r1), rune(r2)), i, i+12)
+							appendRuneOffsets(utf16.DecodeRune(rune(r1), rune(r2)), i, i+12)
 							i += 12
 							continue
 						}
 					}
-					appendDecodedRune(rune(r1), i, i+6)
+					appendRuneOffsets(rune(r1), i, i+6)
 					i += 6
 					continue
 				}
 			}
-			decoded = append(decoded, '\\')
 			offsets = append(offsets, byteRange{start: i, end: i + 1})
 			i++
 		default:
-			decoded = append(decoded, '\\', esc)
 			offsets = append(offsets,
 				byteRange{start: i, end: i + 1},
 				byteRange{start: i + 1, end: i + 2},
@@ -572,22 +830,16 @@ func scanQuotedString(raw string, quotePos int) decodedJSONString {
 			i += 2
 		}
 	}
-
-	return decodedJSONString{
-		rawStart: quotePos,
-		rawEnd:   i,
-		closed:   closed,
-		decoded:  string(decoded),
-		offsets:  offsets,
-	}
+	return offsets
 }
 
-func findBearerSpansInDecodedString(qs decodedJSONString) []redactSpan {
+func findBearerSpansInDecodedString(raw string, qs decodedJSONString) []redactSpan {
 	s := qs.decoded
 	if len(s) < 7 || !containsFoldASCII(s, "bearer") {
 		return nil
 	}
 
+	var offsets []byteRange
 	var spans []redactSpan
 	for i := 0; i+6 < len(s); {
 		if !matchBearerAt(s, i) {
@@ -615,9 +867,20 @@ func findBearerSpansInDecodedString(qs decodedJSONString) []redactSpan {
 		}
 		tokEnd := trimTrailingTokenPunct(s, tokStart, j)
 		if tokEnd > tokStart && isLikelyBearerCredential(s[tokStart:tokEnd]) {
+			var rawTokStart, rawTokEnd int
+			if !qs.hasEscapes {
+				rawTokStart = qs.rawStart + 1 + tokStart
+				rawTokEnd = qs.rawStart + 1 + tokEnd
+			} else {
+				if offsets == nil {
+					offsets = buildEscapedStringOffsets(raw, qs.rawStart)
+				}
+				rawTokStart = offsets[tokStart].start
+				rawTokEnd = offsets[tokEnd-1].end
+			}
 			spans = append(spans, redactSpan{
-				start:       qs.offsets[tokStart].start,
-				end:         qs.offsets[tokEnd-1].end,
+				start:       rawTokStart,
+				end:         rawTokEnd,
 				replacement: redactedValue,
 			})
 			i = j
@@ -779,13 +1042,15 @@ func applyRedactSpans(raw string, spans []redactSpan) string {
 }
 
 func isPasswordKey(key string) bool {
-	lk := strings.ToLower(strings.TrimSpace(key))
-	return lk == "password" || strings.HasSuffix(lk, ":password") || lk == "authorization"
+	tk := strings.TrimSpace(key)
+	return equalFoldASCII(tk, "password") ||
+		hasSuffixFoldASCII(tk, ":password") ||
+		equalFoldASCII(tk, "authorization")
 }
 
 func isPasswordPatchPath(path string) bool {
-	lp := strings.ToLower(strings.TrimSpace(path))
-	return lp == "password" || strings.HasSuffix(lp, ":password")
+	tp := strings.TrimSpace(path)
+	return equalFoldASCII(tp, "password") || hasSuffixFoldASCII(tp, ":password")
 }
 
 func skipASCIIWhitespace(s string, i int) int {

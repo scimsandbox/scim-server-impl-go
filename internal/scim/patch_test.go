@@ -1154,4 +1154,74 @@ func TestEnterpriseManagerVersionAgnosticRefAndConflict_RFC7643_2_4(t *testing.T
 	}
 }
 
+func TestApplyPatchOperations_RejectsNonASCIIUnicodeFoldedAttributeAndPathNames(t *testing.T) {
+	t.Parallel()
+
+	makeSeededUser := func() *model.ScimUser {
+		u := newTestUser()
+		u.Emails = []model.ScimUserEmail{{Value: "alice@example.com", Type: "work"}}
+		u.PhoneNumbers = []model.ScimUserPhoneNumber{{Value: "+15551234567", Type: "work"}}
+		u.Addresses = []model.ScimUserAddress{{StreetAddress: "1 Main St", PostalCode: "78701", Type: "work"}}
+		u.Ims = []model.ScimUserIm{{Value: "alice_im", Type: "aim"}}
+		u.Photos = []model.ScimUserPhoto{{Value: "https://example.com/p.png", Type: "photo"}}
+		u.Entitlements = []model.ScimUserEntitlement{{Value: "ent1", Type: "work"}}
+		u.Roles = []model.ScimUserRole{{Value: "admin", Type: "work"}}
+		u.X509Certificates = []model.ScimUserX509Certificate{{Value: "dGVzdA==", Type: "work"}}
+		return u
+	}
+
+	cases := []struct {
+		name string
+		op   map[string]any
+	}{
+		// remove with Unicode Kelvin U+212A ('K') and Latin Small Letter Long S U+017F ('ſ')
+		{"remove nicKname", map[string]any{"op": "remove", "path": "nic\u212Aname"}},
+		{"remove emailſ", map[string]any{"op": "remove", "path": "email\u017f"}},
+		{"remove uſerName", map[string]any{"op": "remove", "path": "u\u017ferName"}},
+
+		// filtered value paths with non-ASCII collection name
+		{"replace emailſ[type eq work].value", map[string]any{"op": "replace", "path": "email\u017f[type eq \"work\"].value", "value": "x@example.com"}},
+		{"add emailſ[type eq work]", map[string]any{"op": "add", "path": "email\u017f[type eq \"work\"]", "value": map[string]any{"value": "x@example.com"}}},
+		{"remove emailſ[type eq work]", map[string]any{"op": "remove", "path": "email\u017f[type eq \"work\"]"}},
+
+		// filter attribute names with Unicode Kelvin U+212A / Long S U+017F across replace/add/remove
+		{"replace emails[tyKe eq work]", map[string]any{"op": "replace", "path": "emails[ty\u212Ae eq \"work\"]", "value": map[string]any{"display": "Work"}}},
+		{"remove emails[tyKe eq work]", map[string]any{"op": "remove", "path": "emails[ty\u212Ae eq \"work\"]"}},
+		{"add emails[diſplay eq Work].value", map[string]any{"op": "add", "path": "emails[di\u017fplay eq \"Work\"].value", "value": "b@example.com"}},
+		{"replace addresses[poſtalCode eq 78701].locality", map[string]any{"op": "replace", "path": "addresses[po\u017ftalCode eq \"78701\"].locality", "value": "Austin"}},
+
+		// sub-attributes with U+017F ('ſ') across all multi-valued collections (both path suffix and object map keys)
+		{"emails sub-attr diſplay", map[string]any{"op": "replace", "path": `emails[type eq "work"].di` + "\u017f" + `play`, "value": "Work"}},
+		{"emails map key diſplay", map[string]any{"op": "replace", "path": `emails[type eq "work"]`, "value": map[string]any{"di\u017fplay": "Work"}}},
+		{"phoneNumbers sub-attr diſplay", map[string]any{"op": "replace", "path": `phoneNumbers[type eq "work"].di` + "\u017f" + `play`, "value": "Work"}},
+		{"addresses sub-attr streetAddreſſ", map[string]any{"op": "replace", "path": `addresses[type eq "work"].streetAddre` + "\u017f\u017f", "value": "2 Main St"}},
+		{"addresses sub-attr poſtalCode", map[string]any{"op": "replace", "path": `addresses[type eq "work"].po` + "\u017f" + `talCode`, "value": "78702"}},
+		{"addresses map key streetAddreſſ", map[string]any{"op": "replace", "path": `addresses[type eq "work"]`, "value": map[string]any{"streetAddre\u017f\u017f": "2 Main St"}}},
+		{"ims sub-attr diſplay", map[string]any{"op": "replace", "path": `ims[type eq "aim"].di` + "\u017f" + `play`, "value": "IM"}},
+		{"photos sub-attr diſplay", map[string]any{"op": "replace", "path": `photos[type eq "photo"].di` + "\u017f" + `play`, "value": "Pic"}},
+		{"entitlements sub-attr diſplay", map[string]any{"op": "replace", "path": `entitlements[type eq "work"].di` + "\u017f" + `play`, "value": "Ent"}},
+		{"roles sub-attr diſplay", map[string]any{"op": "replace", "path": `roles[type eq "work"].di` + "\u017f" + `play`, "value": "Role"}},
+		{"x509Certificates sub-attr diſplay", map[string]any{"op": "replace", "path": `x509Certificates[type eq "work"].di` + "\u017f" + `play`, "value": "Cert"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ApplyPatchOperations(makeSeededUser(), []map[string]any{tc.op})
+			se, ok := err.(*ScimError)
+			if !ok || se.Status != 400 || se.ScimType != "invalidPath" {
+				t.Fatalf("%s: got %T %v, want 400 invalidPath", tc.name, err, err)
+			}
+		})
+	}
+
+	// Also verify valid filtered add with ASCII case-folded collection & filter still works cleanly.
+	uValid := makeSeededUser()
+	if err := ApplyPatchOperations(uValid, []map[string]any{
+		{"op": "add", "path": `EMAILS[TYPE eq "work"].DISPLAY`, "value": "Work Primary"},
+		{"op": "add", "path": `EMAILS[TYPE eq "work"]`, "value": map[string]any{"value": "second@example.com", "type": "home"}},
+	}); err != nil {
+		t.Fatalf("expected valid ASCII case-folded filtered add to succeed, got %v", err)
+	}
+}
+
 

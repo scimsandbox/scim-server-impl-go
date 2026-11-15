@@ -861,34 +861,52 @@ func TestParseFilter_LengthTokenAndDepthLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("LIKE operators include explicit ESCAPE clause across all filter builders", func(t *testing.T) {
-		userFilters := []string{
-			`schemas co "core"`,
-			`schemas sw "urn:"`,
-			`schemas ew ":User"`,
-			`externalId co "ext_1"`,
-			`externalId sw "ext_"`,
-			`externalId ew "_1"`,
-			`emails.value co "@example.com"`,
-			`emails.value sw "alice@"`,
-			`emails.value ew ".com"`,
+	t.Run("LIKE operators omit literal ESCAPE clause for standard_conforming_strings=off compatibility while escaping wildcards in bind args", func(t *testing.T) {
+		userCases := []struct {
+			filter  string
+			wantArg string
+		}{
+			{`schemas co "core"`, `%core%`},
+			{`schemas sw "urn:"`, `urn:%`},
+			{`schemas ew ":User"`, `%:User`},
+			{`externalId co "ext_1%2\3"`, `%ext\_1\%2\\3%`},
+			{`externalId sw "ext_%"`, `ext\_\%%`},
+			{`externalId ew "_1\"`, `%\_1\\`},
+			{`emails.value co "a_b%c\@example.com"`, `%a\_b\%c\\@example.com%`},
+			{`emails.value sw "alice_@"`, `alice\_@%`},
+			{`emails.value ew "%_\"`, `%\%\_\\`},
 		}
-		for _, f := range userFilters {
-			res, err := ParseUserFilter(f, 1)
-			if err != nil || res == nil || !strings.Contains(res.SQL, `ESCAPE '\'`) {
-				t.Fatalf("ParseUserFilter(%q) = (%v, %v), want SQL with ESCAPE '\\'", f, res, err)
+		for _, tc := range userCases {
+			res, err := ParseUserFilter(tc.filter, 1)
+			if err != nil || res == nil {
+				t.Fatalf("ParseUserFilter(%q) error = %v", tc.filter, err)
+			}
+			if !strings.Contains(res.SQL, "LIKE") || strings.Contains(res.SQL, "ESCAPE") {
+				t.Fatalf("ParseUserFilter(%q) SQL = %q, want LIKE without ESCAPE clause", tc.filter, res.SQL)
+			}
+			if len(res.Args) == 0 || res.Args[0] != tc.wantArg {
+				t.Fatalf("ParseUserFilter(%q) Args[0] = %v, want %q", tc.filter, res.Args, tc.wantArg)
 			}
 		}
 
-		groupFilters := []string{
-			`members.display co "admin"`,
-			`members.display sw "adm"`,
-			`members.display ew "min"`,
+		groupCases := []struct {
+			filter  string
+			wantArg string
+		}{
+			{`members.display co "adm_1%\"`, `%adm\_1\%\\%`},
+			{`members.display sw "adm_"`, `adm\_%`},
+			{`members.display ew "%min"`, `%\%min`},
 		}
-		for _, f := range groupFilters {
-			res, err := ParseGroupFilter(f, 1)
-			if err != nil || res == nil || !strings.Contains(res.SQL, `ESCAPE '\'`) {
-				t.Fatalf("ParseGroupFilter(%q) = (%v, %v), want SQL with ESCAPE '\\'", f, res, err)
+		for _, tc := range groupCases {
+			res, err := ParseGroupFilter(tc.filter, 1)
+			if err != nil || res == nil {
+				t.Fatalf("ParseGroupFilter(%q) error = %v", tc.filter, err)
+			}
+			if !strings.Contains(res.SQL, "LIKE") || strings.Contains(res.SQL, "ESCAPE") {
+				t.Fatalf("ParseGroupFilter(%q) SQL = %q, want LIKE without ESCAPE clause", tc.filter, res.SQL)
+			}
+			if len(res.Args) != 1 || res.Args[0] != tc.wantArg {
+				t.Fatalf("ParseGroupFilter(%q) Args = %v, want [%q]", tc.filter, res.Args, tc.wantArg)
 			}
 		}
 	})

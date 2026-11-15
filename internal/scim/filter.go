@@ -121,7 +121,6 @@ const (
 	sqlLowerPrefix             = "LOWER("
 	sqlLowerLikeSeparator      = ") LIKE LOWER("
 	sqlLike                    = " LIKE "
-	sqlLikeEscape              = ` ESCAPE '\'`
 	sqlTextCast                = "::text"
 	sqlIsNotNull               = " IS NOT NULL"
 	sqlIsNotNullAnd            = sqlIsNotNull + " AND "
@@ -1140,21 +1139,21 @@ func (p *filterParser) buildTextExprCondition(expr, operator, value string, case
 	case filterOpCo:
 		escaped := "%" + escapeLikeValue(value) + "%"
 		if caseInsensitive {
-			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)%s", expr, param, sqlLikeEscape), escaped, nil
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
 		}
-		return fmt.Sprintf("%s LIKE %s%s", expr, param, sqlLikeEscape), escaped, nil
+		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
 	case filterOpSw:
 		escaped := escapeLikeValue(value) + "%"
 		if caseInsensitive {
-			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)%s", expr, param, sqlLikeEscape), escaped, nil
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
 		}
-		return fmt.Sprintf("%s LIKE %s%s", expr, param, sqlLikeEscape), escaped, nil
+		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
 	case filterOpEw:
 		escaped := "%" + escapeLikeValue(value)
 		if caseInsensitive {
-			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)%s", expr, param, sqlLikeEscape), escaped, nil
+			return fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, param), escaped, nil
 		}
-		return fmt.Sprintf("%s LIKE %s%s", expr, param, sqlLikeEscape), escaped, nil
+		return fmt.Sprintf("%s LIKE %s", expr, param), escaped, nil
 	case filterOpGt:
 		return fmt.Sprintf("%s > %s", expr, param), value, nil
 	case filterOpGe:
@@ -1386,25 +1385,25 @@ func (p *filterParser) buildComparisonWithRaw(rawAttr, attr, operator, value str
 		param := p.nextParam()
 		escaped := escapeLikeValue(value)
 		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")" + sqlLikeEscape, Args: []any{"%" + escaped + "%"}}, nil
+			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")", Args: []any{"%" + escaped + "%"}}, nil
 		}
-		return &FilterResult{SQL: col + sqlLike + param + sqlLikeEscape, Args: []any{"%" + escaped + "%"}}, nil
+		return &FilterResult{SQL: col + sqlLike + param, Args: []any{"%" + escaped + "%"}}, nil
 
 	case filterOpSw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(value)
 		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")" + sqlLikeEscape, Args: []any{escaped + "%"}}, nil
+			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")", Args: []any{escaped + "%"}}, nil
 		}
-		return &FilterResult{SQL: col + sqlLike + param + sqlLikeEscape, Args: []any{escaped + "%"}}, nil
+		return &FilterResult{SQL: col + sqlLike + param, Args: []any{escaped + "%"}}, nil
 
 	case filterOpEw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(value)
 		if isCaseInsensitive {
-			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")" + sqlLikeEscape, Args: []any{"%" + escaped}}, nil
+			return &FilterResult{SQL: sqlLowerPrefix + col + sqlLowerLikeSeparator + param + ")", Args: []any{"%" + escaped}}, nil
 		}
-		return &FilterResult{SQL: col + sqlLike + param + sqlLikeEscape, Args: []any{"%" + escaped}}, nil
+		return &FilterResult{SQL: col + sqlLike + param, Args: []any{"%" + escaped}}, nil
 
 	case filterOpGt:
 		param := p.nextParam()
@@ -1560,15 +1559,15 @@ func (p *filterParser) buildElemCondition(collectionAttr, attr, op, val string) 
 	case filterOpCo:
 		param := p.nextParam()
 		escaped := escapeLikeValue(val)
-		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)%s", jsonKey, param, sqlLikeEscape), []any{"%" + escaped + "%"}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{"%" + escaped + "%"}, nil
 	case filterOpSw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(val)
-		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)%s", jsonKey, param, sqlLikeEscape), []any{escaped + "%"}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{escaped + "%"}, nil
 	case filterOpEw:
 		param := p.nextParam()
 		escaped := escapeLikeValue(val)
-		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)%s", jsonKey, param, sqlLikeEscape), []any{"%" + escaped}, nil
+		return fmt.Sprintf("LOWER(elem->>'%s') LIKE LOWER(%s)", jsonKey, param), []any{"%" + escaped}, nil
 	case filterOpGt:
 		param := p.nextParam()
 		return fmt.Sprintf("LOWER(elem->>'%s') > LOWER(%s)", jsonKey, param), []any{val}, nil

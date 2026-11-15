@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,8 +23,8 @@ import (
 )
 
 var (
-	memberValueFilterRe = regexp.MustCompile(`(?i)\bvalue\s+eq\s+"([^"]+)"`)
-	memberRefFilterRe   = regexp.MustCompile(`(?i)\$ref\s+eq\s+"([^"]+)"`)
+	memberValueFilterRe = regexp.MustCompile(`\b[vV][aA][lL][uU][eE]\s+[eE][qQ]\s+"([^"]+)"`)
+	memberRefFilterRe   = regexp.MustCompile(`\$[rR][eE][fF]\s+[eE][qQ]\s+"([^"]+)"`)
 )
 
 // resolveMemberID extracts a canonical member identifier from a Group.members object,
@@ -32,6 +33,7 @@ func resolveMemberID(memberMap map[string]any) string {
 	if memberMap == nil {
 		return ""
 	}
+	memberMap = scim.NormalizeGroupMemberMap(memberMap)
 	if mv, ok := memberMap["value"].(string); ok && strings.TrimSpace(mv) != "" {
 		trimmed := strings.TrimSpace(mv)
 		if mu, err := uuid.Parse(trimmed); err == nil {
@@ -51,6 +53,7 @@ func checkMemberValueRefConflict(memberMap map[string]any) error {
 	if memberMap == nil {
 		return nil
 	}
+	memberMap = scim.NormalizeGroupMemberMap(memberMap)
 	var memberValue string
 	if rawVal, exists := memberMap["value"]; exists && rawVal != nil {
 		s, ok := rawVal.(string)
@@ -183,6 +186,7 @@ func (h *GroupHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 		writeReadJSONError(w, err)
 		return
 	}
+	input = scim.NormalizeGroupInput(input)
 
 	rawDN, hasDN := input["displayName"]
 	displayName, okDN := rawDN.(string)
@@ -239,6 +243,7 @@ func (h *GroupHandler) executeCreateGroup(ctx context.Context, wsID uuid.UUID, i
 	if h.groupRepo == nil {
 		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
 	}
+	input = scim.NormalizeGroupInput(input)
 
 	rawDN, hasDN := input["displayName"]
 	displayName, okDN := rawDN.(string)
@@ -462,6 +467,7 @@ func (h *GroupHandler) ReplaceGroup(w http.ResponseWriter, r *http.Request) {
 		writeReadJSONError(w, err)
 		return
 	}
+	input = scim.NormalizeGroupInput(input)
 
 	rawDN, hasDN := input["displayName"]
 	displayName, okDN := rawDN.(string)
@@ -517,6 +523,7 @@ func (h *GroupHandler) executeReplaceGroup(ctx context.Context, wsID, groupID uu
 	if h.groupRepo == nil {
 		return nil, scim.NewScimError(http.StatusInternalServerError, "", "Internal error")
 	}
+	input = scim.NormalizeGroupInput(input)
 
 	var displayName string
 	var updatedGroup *model.ScimGroup
@@ -646,12 +653,13 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 		writeReadJSONError(w, err)
 		return
 	}
+	patchReq = scim.NormalizePatchRequest(patchReq)
 
 	// Validate PatchOp schema
 	schemas, _ := patchReq["schemas"].([]any)
 	validSchema := false
 	for _, s := range schemas {
-		if s == "urn:ietf:params:scim:api:messages:2.0:PatchOp" {
+		if str, ok := s.(string); ok && scim.ASCIIEqualFold(str, "urn:ietf:params:scim:api:messages:2.0:PatchOp") {
 			validSchema = true
 			break
 		}
@@ -668,18 +676,20 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	opMaps := make([]map[string]any, 0, len(ops))
+	for _, op := range ops {
+		m, ok := op.(map[string]any)
+		if !ok {
+			scim.WriteScimError(w, &scim.ScimError{Status: http.StatusBadRequest, ScimType: "invalidSyntax", Detail: "Invalid PATCH operation"})
+			return
+		}
+		opMaps = append(opMaps, scim.NormalizePatchOperation(m))
+	}
+
 	if execAsync, prefHeader := shouldExecuteAsync(r); execAsync && h.asyncEventRepo != nil {
 		baseURL := buildBaseURL(r)
 		ifMatchHdr := r.Header.Get("If-Match")
 		dispatchAsyncOperation(w, r, h.asyncEventRepo, wsID, baseURL, prefHeader, "PATCH", "Group", &groupID, func(workerCtx context.Context, txnID uuid.UUID) (*uuid.UUID, string, error) {
-			opMaps := make([]map[string]any, 0, len(ops))
-			for _, op := range ops {
-				m, ok := op.(map[string]any)
-				if !ok {
-					return &groupID, "", &scim.ScimError{Status: http.StatusBadRequest, ScimType: "invalidSyntax", Detail: "Invalid PATCH operation"}
-				}
-				opMaps = append(opMaps, m)
-			}
 			updatedGroup, err := h.executePatchGroup(workerCtx, wsID, groupID, opMaps, ifMatchHdr)
 			if err != nil {
 				return &groupID, "", err
@@ -693,16 +703,6 @@ func (h *GroupHandler) PatchGroup(w http.ResponseWriter, r *http.Request) {
 			return &groupID, setStr, nil
 		})
 		return
-	}
-
-	opMaps := make([]map[string]any, 0, len(ops))
-	for _, op := range ops {
-		m, ok := op.(map[string]any)
-		if !ok {
-			scim.WriteScimError(w, &scim.ScimError{Status: http.StatusBadRequest, ScimType: "invalidSyntax", Detail: "Invalid PATCH operation"})
-			return
-		}
-		opMaps = append(opMaps, m)
 	}
 
 	updatedGroup, err := h.executePatchGroup(r.Context(), wsID, groupID, opMaps, r.Header.Get("If-Match"))
@@ -938,15 +938,14 @@ func (h *GroupHandler) SearchGroups(w http.ResponseWriter, r *http.Request) {
 
 func cleanGroupPatchPath(rawPath string) string {
 	p := strings.TrimSpace(rawPath)
-	prefix := strings.ToLower(scim.GroupSchemaURN) + ":"
-	if strings.HasPrefix(strings.ToLower(p), prefix) {
-		p = strings.TrimSpace(p[len(prefix):])
+	if stripped, ok := scim.StripGroupURNPrefix(p); ok {
+		return strings.TrimSpace(stripped)
 	}
 	return p
 }
 
 func isGroupReadOnlyAttr(cleanPath string) bool {
-	lp := strings.ToLower(strings.TrimSpace(cleanPath))
+	lp := scim.ASCIILower(strings.TrimSpace(cleanPath))
 	return lp == "id" || lp == "meta" || strings.HasPrefix(lp, "meta.")
 }
 
@@ -979,7 +978,8 @@ func validateMemberTypeImmutability(existingMemberships []model.ScimGroupMembers
 		memberMaps = v
 	}
 
-	for _, memberMap := range memberMaps {
+	for _, rawMemberMap := range memberMaps {
+		memberMap := scim.NormalizeGroupMemberMap(rawMemberMap)
 		valStr := resolveMemberID(memberMap)
 		if valStr == "" {
 			continue
@@ -1021,6 +1021,7 @@ func (h *GroupHandler) checkMemberTypeImmutabilityTx(ctx context.Context, tx jdb
 // -- Transactional variants --
 
 func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupID, wsID uuid.UUID, memberMap map[string]any) error {
+	memberMap = scim.NormalizeGroupMemberMap(memberMap)
 	if err := checkMemberValueRefConflict(memberMap); err != nil {
 		return err
 	}
@@ -1111,6 +1112,12 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 		}
 	}
 
+	if memberType == "Group" {
+		if err := h.validateGroupMemberNoCycleTx(ctx, tx, wsID, groupID, memberUUID); err != nil {
+			return err
+		}
+	}
+
 	membership := model.ScimGroupMembership{
 		ID:          uuid.New(),
 		GroupID:     groupID,
@@ -1121,6 +1128,22 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 	}
 
 	return h.membershipRepo.CreateBatchTx(ctx, tx, []model.ScimGroupMembership{membership})
+}
+
+func (h *GroupHandler) validateGroupMemberNoCycleTx(ctx context.Context, tx jdbc.Executor, wsID, groupID, memberUUID uuid.UUID) error {
+	if groupID != uuid.Nil && memberUUID == groupID {
+		return scim.NewInvalidValue("Group cannot include itself as a member")
+	}
+	if h.membershipRepo != nil && groupID != uuid.Nil {
+		createsCycle, err := h.membershipRepo.CreatesGroupCycleTx(ctx, tx, wsID, groupID, memberUUID)
+		if err != nil {
+			return err
+		}
+		if createsCycle {
+			return scim.NewInvalidValue("Circular group membership is not allowed")
+		}
+	}
+	return nil
 }
 
 func (h *GroupHandler) replaceMembersTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, members []map[string]any) error {
@@ -1155,7 +1178,8 @@ func (h *GroupHandler) replaceMembersTx(ctx context.Context, tx jdbc.Executor, g
 }
 
 func (h *GroupHandler) applyGroupPatchOpTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, op map[string]any) error {
-	opType := strings.ToLower(fmt.Sprintf("%v", op["op"]))
+	op = scim.NormalizePatchOperation(op)
+	opType := scim.ASCIILower(fmt.Sprintf("%v", op["op"]))
 	rawPath, _ := op["path"].(string)
 	path := cleanGroupPatchPath(rawPath)
 	value := op["value"]
@@ -1180,7 +1204,7 @@ func (h *GroupHandler) applyGroupPatchOpTx(ctx context.Context, tx jdbc.Executor
 }
 
 func (h *GroupHandler) applyGroupAddTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, path string, value any) error {
-	lp := strings.ToLower(path)
+	lp := scim.ASCIILower(path)
 	if lp == "members" {
 		members := extractMembersPayload(value, true)
 		return h.addMissingMembersTx(ctx, tx, group, wsID, members)
@@ -1204,12 +1228,14 @@ func (h *GroupHandler) applyGroupAddTx(ctx context.Context, tx jdbc.Executor, gr
 	}
 	if path == "" {
 		if valueMap, ok := value.(map[string]any); ok {
-			_, hasMemberValue := valueMap["value"]
-			_, hasMemberRef := valueMap["$ref"]
+			normMemberCandidate := scim.NormalizeGroupMemberMap(valueMap)
+			normGroupCandidate := scim.NormalizeGroupInput(valueMap)
+			_, hasMemberValue := normMemberCandidate["value"]
+			_, hasMemberRef := normMemberCandidate["$ref"]
 			if (hasMemberValue || hasMemberRef) && len(valueMap) <= 4 {
-				if _, hasDN := valueMap["displayName"]; !hasDN {
-					if _, hasMembers := valueMap["members"]; !hasMembers {
-						return h.addMissingMembersTx(ctx, tx, group, wsID, []map[string]any{valueMap})
+				if _, hasDN := normGroupCandidate["displayName"]; !hasDN {
+					if _, hasMembers := normGroupCandidate["members"]; !hasMembers {
+						return h.addMissingMembersTx(ctx, tx, group, wsID, []map[string]any{normMemberCandidate})
 					}
 				}
 			}
@@ -1228,7 +1254,7 @@ func (h *GroupHandler) applyGroupAddTx(ctx context.Context, tx jdbc.Executor, gr
 }
 
 func (h *GroupHandler) applyGroupReplaceTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, path string, value any) error {
-	lp := strings.ToLower(path)
+	lp := scim.ASCIILower(path)
 	if lp == "members" {
 		members := extractMembersPayload(value, false)
 		return h.replaceMembersTx(ctx, tx, group, wsID, members)
@@ -1273,7 +1299,7 @@ func (h *GroupHandler) applyGroupReplaceTx(ctx context.Context, tx jdbc.Executor
 }
 
 func (h *GroupHandler) applyGroupRemoveTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, path string, value any) error {
-	lp := strings.ToLower(path)
+	lp := scim.ASCIILower(path)
 	if lp == "displayname" {
 		return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Required attribute 'displayName' cannot be removed"}
 	}
@@ -1302,9 +1328,15 @@ func (h *GroupHandler) applyGroupRemoveTx(ctx context.Context, tx jdbc.Executor,
 		if filterExpr == "" {
 			return &scim.ScimError{Status: 400, ScimType: "invalidFilter", Detail: "Empty valuePath filter in path: " + path}
 		}
-		rest := strings.ToLower(strings.TrimSpace(path[closeIdx+1:]))
+		rest := scim.ASCIILower(strings.TrimSpace(path[closeIdx+1:]))
 		if rest == ".value" || rest == ".type" || rest == ".$ref" {
 			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Group member attribute is immutable and cannot be removed"}
+		}
+		if rest == ".display" {
+			return nil
+		}
+		if rest != "" {
+			return &scim.ScimError{Status: 400, ScimType: "invalidPath", Detail: "Unsupported PATCH remove path: " + path}
 		}
 		targetValue := extractFilterValue(filterExpr)
 		if targetValue != "" {
@@ -1365,15 +1397,25 @@ func (h *GroupHandler) removeMembersByValueListTx(ctx context.Context, tx jdbc.E
 }
 
 func (h *GroupHandler) applyAddValueMapTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, valueMap map[string]any) error {
-	for rawKey, v := range valueMap {
-		if strings.EqualFold(rawKey, "schemas") {
+	normMap := scim.NormalizeGroupInput(valueMap)
+	keys := make([]string, 0, len(normMap))
+	for k := range normMap {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, rawKey := range keys {
+		v := normMap[rawKey]
+		if scim.ASCIIEqualFold(rawKey, "schemas") {
 			continue
+		}
+		if rawKey == scim.GroupSchemaURN {
+			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Core group schema value must be an object"}
 		}
 		cleanKey := cleanGroupPatchPath(rawKey)
 		if isGroupReadOnlyAttr(cleanKey) {
 			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Attribute '" + cleanKey + "' is readOnly and cannot be modified"}
 		}
-		switch strings.ToLower(cleanKey) {
+		switch scim.ASCIILower(cleanKey) {
 		case "displayname":
 			s, ok := v.(string)
 			s = scim.NormalizeNFC(s)
@@ -1406,15 +1448,25 @@ func (h *GroupHandler) applyAddValueMapTx(ctx context.Context, tx jdbc.Executor,
 }
 
 func (h *GroupHandler) applyReplaceValueMapTx(ctx context.Context, tx jdbc.Executor, group *model.ScimGroup, wsID uuid.UUID, valueMap map[string]any) error {
-	for rawKey, v := range valueMap {
-		if strings.EqualFold(rawKey, "schemas") {
+	normMap := scim.NormalizeGroupInput(valueMap)
+	keys := make([]string, 0, len(normMap))
+	for k := range normMap {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, rawKey := range keys {
+		v := normMap[rawKey]
+		if scim.ASCIIEqualFold(rawKey, "schemas") {
 			continue
+		}
+		if rawKey == scim.GroupSchemaURN {
+			return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "Core group schema value must be an object"}
 		}
 		cleanKey := cleanGroupPatchPath(rawKey)
 		if isGroupReadOnlyAttr(cleanKey) {
 			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Attribute '" + cleanKey + "' is readOnly and cannot be modified"}
 		}
-		switch strings.ToLower(cleanKey) {
+		switch scim.ASCIILower(cleanKey) {
 		case "displayname":
 			s, ok := v.(string)
 			s = scim.NormalizeNFC(s)
@@ -1518,22 +1570,29 @@ func (h *GroupHandler) touchWorkspace(ctx context.Context, wsID uuid.UUID) {
 }
 
 func extractMembersPayload(value any, allowEnvelope bool) []map[string]any {
-	if rawList, ok := value.([]any); ok {
+	switch rawList := value.(type) {
+	case []any:
 		result := make([]map[string]any, 0, len(rawList))
 		for _, item := range rawList {
 			if m, ok := item.(map[string]any); ok {
-				result = append(result, m)
+				result = append(result, scim.NormalizeGroupMemberMap(m))
 			}
 		}
 		return result
-	}
-	if rawMap, ok := value.(map[string]any); ok {
+	case []map[string]any:
+		result := make([]map[string]any, len(rawList))
+		for i, m := range rawList {
+			result[i] = scim.NormalizeGroupMemberMap(m)
+		}
+		return result
+	case map[string]any:
 		if allowEnvelope {
-			if members, ok := rawMap["members"]; ok {
+			normEnv := scim.NormalizeGroupInput(rawList)
+			if members, ok := normEnv["members"]; ok {
 				return extractMembersPayload(members, false)
 			}
 		}
-		return []map[string]any{rawMap}
+		return []map[string]any{scim.NormalizeGroupMemberMap(rawList)}
 	}
 	return nil
 }
@@ -1568,7 +1627,7 @@ func (h *GroupHandler) applyMemberSubAttrAdd(
 	if filterExpr == "" {
 		return &scim.ScimError{Status: 400, ScimType: "invalidFilter", Detail: "Empty valuePath filter in path: " + path}
 	}
-	rest := strings.ToLower(strings.TrimSpace(path[closeIdx+1:]))
+	rest := scim.ASCIILower(strings.TrimSpace(path[closeIdx+1:]))
 	if rest == ".value" || rest == ".$ref" {
 		return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Group member attribute is immutable"}
 	}
@@ -1596,10 +1655,7 @@ func (h *GroupHandler) applyMemberSubAttrAdd(
 	targetValue := extractFilterValue(filterExpr)
 	targetUUID, err := uuid.Parse(targetValue)
 	if targetValue == "" || err != nil {
-		return &scim.ScimError{Status: 400, ScimType: "noTarget", Detail: "No matching member found for path: " + path}
-	}
-	if group != nil && group.ID != uuid.Nil && targetUUID == group.ID {
-		return &scim.ScimError{Status: 400, ScimType: "invalidValue", Detail: "A group cannot be a member of itself"}
+		return scim.NewNoTarget("No matching member found for path: " + path)
 	}
 
 	matchIdx := -1
@@ -1610,7 +1666,7 @@ func (h *GroupHandler) applyMemberSubAttrAdd(
 		}
 	}
 	if matchIdx < 0 {
-		return &scim.ScimError{Status: 400, ScimType: "noTarget", Detail: "No matching member found for path: " + path}
+		return scim.NewNoTarget("No matching member found for path: " + path)
 	}
 
 	existing := group.Members[matchIdx].MemberType
@@ -1619,6 +1675,12 @@ func (h *GroupHandler) applyMemberSubAttrAdd(
 			return &scim.ScimError{Status: 400, ScimType: "mutability", Detail: "Group member attribute is immutable"}
 		}
 		return nil
+	}
+
+	if canonicalType == "Group" {
+		if err := h.validateGroupMemberNoCycleTx(ctx, tx, wsID, group.ID, targetUUID); err != nil {
+			return err
+		}
 	}
 
 	// Verify target resource exists with matching type when repositories are wired.

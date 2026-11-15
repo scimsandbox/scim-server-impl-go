@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
@@ -860,4 +862,215 @@ func TestRedactSensitiveBody_Round2EdgeCases(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestRequestResponseLogging_UTF8SafeTruncationAtBoundaries(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+
+	// 1. Exact reviewer probe: {"displayName":" + 19,983*'x' + "é"} (splits 2-byte 'é' right at byte 20,000).
+	reviewerProbe := `{"displayName":"` + strings.Repeat("x", 19983) + `é"}`
+	storeProbe := &stubRequestLogCreator{}
+	mwProbe := RequestResponseLogging(storeProbe)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(reviewerProbe))
+	}))
+	mwProbe.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", strings.NewReader(reviewerProbe)))
+	if len(storeProbe.logs) != 1 || storeProbe.logs[0].RequestBody == nil || storeProbe.logs[0].ResponseBody == nil {
+		t.Fatal("expected saved log for reviewer probe")
+	}
+	for label, out := range map[string]string{
+		"RequestBody":  *storeProbe.logs[0].RequestBody,
+		"ResponseBody": *storeProbe.logs[0].ResponseBody,
+	} {
+		if !utf8.ValidString(out) {
+			t.Fatalf("reviewer probe %s produced invalid UTF-8", label)
+		}
+		if !strings.HasSuffix(out, "...[truncated]") {
+			t.Fatalf("reviewer probe %s missing ...[truncated] suffix", label)
+		}
+	}
+
+	// 2. 2-byte ('é'), 3-byte ('€'), and 4-byte ('😀') runes split at every offset around maxBodyLog (20,000) and maxBodyCapture (21,024).
+	runes := []string{"é", "€", "😀"}
+	boundaries := []int{maxBodyLog, maxBodyCapture}
+	for _, rStr := range runes {
+		for _, boundary := range boundaries {
+			for delta := -5; delta <= 5; delta++ {
+				prefix := `{"displayName":"`
+				padLen := boundary - len(prefix) + delta
+				if padLen < 0 {
+					continue
+				}
+				payload := prefix + strings.Repeat("a", padLen) + rStr + strings.Repeat("z", 32) + `"}`
+
+				store := &stubRequestLogCreator{}
+				mw := RequestResponseLogging(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = io.ReadAll(r.Body)
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(payload))
+				}))
+				mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", strings.NewReader(payload)))
+				if len(store.logs) != 1 || store.logs[0].RequestBody == nil || store.logs[0].ResponseBody == nil {
+					t.Fatalf("missing log for rune=%q boundary=%d delta=%d", rStr, boundary, delta)
+				}
+				reqOut := *store.logs[0].RequestBody
+				respOut := *store.logs[0].ResponseBody
+				if !utf8.ValidString(reqOut) {
+					t.Fatalf("invalid UTF-8 in RequestBody for rune=%q boundary=%d delta=%d", rStr, boundary, delta)
+				}
+				if !utf8.ValidString(respOut) {
+					t.Fatalf("invalid UTF-8 in ResponseBody for rune=%q boundary=%d delta=%d", rStr, boundary, delta)
+				}
+			}
+		}
+	}
+
+	// 3. Shrinking 21,024-byte capture path: redacting a 2,000-byte password shrinks len(redacted) < maxBodyLog (20,000),
+	// while maxBodyCapture (21,024) split a multi-byte rune right at the capture boundary!
+	longSecret := "LongSecret_" + strings.Repeat("P", 1980)
+	for _, rStr := range runes {
+		for delta := -4; delta <= 4; delta++ {
+			head := `{"password":"` + longSecret + `","displayName":"`
+			padLen := maxBodyCapture - len(head) + delta
+			payload := head + strings.Repeat("b", padLen) + rStr + `trailing"}`
+			if len(payload) <= maxBodyCapture {
+				payload += strings.Repeat("c", 20)
+			}
+
+			store := &stubRequestLogCreator{}
+			mw := RequestResponseLogging(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(payload))
+			}))
+			mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", strings.NewReader(payload)))
+			reqOut := *store.logs[0].RequestBody
+			respOut := *store.logs[0].ResponseBody
+			if !utf8.ValidString(reqOut) || !utf8.ValidString(respOut) {
+				t.Fatalf("shrinking capture split produced invalid UTF-8 for rune=%q delta=%d", rStr, delta)
+			}
+			if strings.Contains(reqOut, longSecret) || strings.Contains(respOut, longSecret) {
+				t.Fatalf("shrinking capture leaked password for rune=%q delta=%d", rStr, delta)
+			}
+			if !strings.HasSuffix(reqOut, "...[truncated]") {
+				t.Fatalf("shrinking capture missing ...[truncated] suffix for rune=%q delta=%d", rStr, delta)
+			}
+		}
+	}
+
+	// 4. Arbitrary invalid raw UTF-8 bytes in client request & response bodies (both short and >maxBodyLog) NEVER produce invalid UTF-8.
+	invalidPayloads := []string{
+		"{\"userName\":\"bad\xff\xfebytes\",\"password\":\"Secret!123\"}",
+		"\x80\x81\x82\x83\x84",
+		"{\"bio\":\"surrogate\xed\xa0\x80andincomplete\xf0\x9f\"}",
+		strings.Repeat("x", maxBodyLog-1) + "\xff\xfe\xfd" + strings.Repeat("y", 100),
+	}
+	for idx, rawBad := range invalidPayloads {
+		store := &stubRequestLogCreator{}
+		mw := RequestResponseLogging(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(rawBad))
+		}))
+		mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/ws/"+wsID.String()+"/scim/v2/Users", strings.NewReader(rawBad)))
+		reqOut := *store.logs[0].RequestBody
+		respOut := *store.logs[0].ResponseBody
+		if !utf8.ValidString(reqOut) {
+			t.Fatalf("invalid payload %d produced invalid UTF-8 RequestBody", idx)
+		}
+		if !utf8.ValidString(respOut) {
+			t.Fatalf("invalid payload %d produced invalid UTF-8 ResponseBody", idx)
+		}
+		if strings.Contains(reqOut, "Secret!123") {
+			t.Fatalf("invalid payload %d failed to redact password", idx)
+		}
+	}
+}
+
+func build21KBSCIMListResponse() string {
+	var sb strings.Builder
+	sb.WriteString(`{"schemas":["urn:ietf:params:scim:api:messages:2.0:ListResponse"],"totalResults":45,"startIndex":1,"itemsPerPage":45,"Resources":[`)
+	for i := 0; i < 45; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb,
+			`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"550e8400-e29b-41d4-a716-%012d","externalId":"ext-%04d","userName":"user%04d@example.com","name":{"formatted":"User %04d \"Nickname\"\nLine2","familyName":"Example","givenName":"User%04d"},"displayName":"User %04d","active":true,"emails":[{"value":"user%04d@example.com","type":"work","primary":true}],"phoneNumbers":[{"value":"+1-555-010-%04d","type":"work"}],"meta":{"resourceType":"User","created":"2026-11-14T12:00:00Z","lastModified":"2026-11-14T12:00:00Z"}}`,
+			i, i, i, i, i, i, i, i,
+		)
+	}
+	sb.WriteString(`]}`)
+	return sb.String()
+}
+
+func TestRedactSensitiveBody_ZeroAllocsOn21KBListResponseAndResponseSeparation(t *testing.T) {
+	payload := build21KBSCIMListResponse()
+	if len(payload) < 20000 {
+		t.Fatalf("expected >=20KB ListResponse, got %d bytes", len(payload))
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		out := RedactSensitiveBody(payload)
+		if out != payload {
+			t.Fatal("unexpected mutation on non-sensitive ListResponse")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("RedactSensitiveBody(21KB ListResponse) allocs = %v, want 0", allocs)
+	}
+
+	respAllocs := testing.AllocsPerRun(100, func() {
+		out := redactResponseBody(payload)
+		if out != payload {
+			t.Fatal("unexpected mutation on redactResponseBody(21KB ListResponse)")
+		}
+	})
+	if respAllocs != 0 {
+		t.Fatalf("redactResponseBody(21KB ListResponse) allocs = %v, want 0", respAllocs)
+	}
+
+	// Closed PatchOp without password or \u also fast-paths with 0 allocations.
+	closedSafePatch := `{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"replace","path":"displayName","value":"Alice"}]}`
+	patchAllocs := testing.AllocsPerRun(100, func() {
+		if got := RedactSensitiveBody(closedSafePatch); got != closedSafePatch {
+			t.Fatal("unexpected mutation on closed non-password PatchOp")
+		}
+	})
+	if patchAllocs != 0 {
+		t.Fatalf("RedactSensitiveBody(closedSafePatch) allocs = %v, want 0", patchAllocs)
+	}
+
+	// Escaped inline Bearer token still maps offsets lazily and redacts accurately.
+	escapedBearer := `{"note":"prefix\nBearer eyJhbGciOiJIUzI1NiJ9.e30.sig!"}`
+	if got := RedactSensitiveBody(escapedBearer); got != `{"note":"prefix\nBearer [REDACTED]!"}` {
+		t.Fatalf("escaped inline Bearer got %s", got)
+	}
+}
+
+func BenchmarkRedactSensitiveBody_21KBListResponse(b *testing.B) {
+	payload := build21KBSCIMListResponse()
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := RedactSensitiveBody(payload); len(got) != len(payload) {
+			b.Fatal("unexpected length change")
+		}
+	}
+}
+
+func BenchmarkRedactSensitiveBody_CreateUserWithPassword(b *testing.B) {
+	payload := `{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User","urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"],"userName":"alice.smith@example.com","externalId":"emp-98765","name":{"givenName":"Alice","familyName":"Smith","formatted":"Alice Smith"},"displayName":"Alice Smith","active":true,"password":"SuperSecretPassword!2026","emails":[{"value":"alice.smith@example.com","type":"work","primary":true}],"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User":{"department":"Engineering","costCenter":"CC-42"}}`
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got := RedactSensitiveBody(payload)
+		if len(got) == 0 {
+			b.Fatal("empty output")
+		}
+	}
 }

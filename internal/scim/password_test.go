@@ -121,20 +121,43 @@ func TestPassword_RejectsOver72UTF8BytesWith400InvalidValue(t *testing.T) {
 			t.Fatalf("bcrypt verification failed for $2a$hello: %v", err)
 		}
 
-		// URN-qualified keys on create/replace are NOT treated as top-level core attributes,
-		// while PATCH URN paths continue to work via stripPatchURNPrefix.
-		uIgnored := &model.ScimUser{}
-		if err := ApplyFromScimInput(uIgnored, map[string]any{
+		// Core-URN-qualified keys (flat and nested) on create/replace are normalized and validated
+		// with deterministic 4-tier precedence:
+		// exact "password" > unprefixed case variant > core-URN-prefixed > nested core-URN object.
+		uFlatURN := &model.ScimUser{}
+		if err := ApplyFromScimInput(uFlatURN, map[string]any{
 			"userName":                  "alice",
-			UserSchemaURN + ":password": "IgnoredOnCreate!1",
+			UserSchemaURN + ":password": "FlatURNPassword!1",
 			UserSchemaURN: map[string]any{
-				"password": "AlsoIgnoredOnCreate!1",
+				"password": "NestedURNLoser!1",
 			},
-		}); err != nil {
-			t.Fatalf("unexpected error ignoring URN keys on create/replace: %v", err)
+		}); err != nil || uFlatURN.Password == nil {
+			t.Fatalf("expected flat URN password on create/replace to succeed, err=%v", err)
 		}
-		if uIgnored.Password != nil {
-			t.Fatalf("expected URN keys on create/replace to be ignored, got Password=%v", *uIgnored.Password)
+		if err := bcrypt.CompareHashAndPassword([]byte(*uFlatURN.Password), []byte("FlatURNPassword!1")); err != nil {
+			t.Fatalf("expected FlatURNPassword!1 to win over nested URN password: %v", err)
+		}
+
+		uNestedURN := &model.ScimUser{}
+		if err := ApplyFromScimInput(uNestedURN, map[string]any{
+			"userName": "alice",
+			UserSchemaURN: map[string]any{
+				"Password": "NestedCaseVariant!1",
+			},
+		}); err != nil || uNestedURN.Password == nil {
+			t.Fatalf("expected nested core-URN password on create/replace to succeed, err=%v", err)
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(*uNestedURN.Password), []byte("NestedCaseVariant!1")); err != nil {
+			t.Fatalf("expected NestedCaseVariant!1 hash match: %v", err)
+		}
+
+		// Whitespace-only passwords must also fail with 400 invalidValue everywhere.
+		wsPw := "   \t\n  "
+		if _, err := HashPassword(&wsPw); err == nil {
+			t.Fatal("HashPassword(whitespace) should fail with 400 invalidValue")
+		}
+		if err := ValidatePasswordInput(map[string]any{"userName": "alice", "password": wsPw}); err == nil {
+			t.Fatal("ValidatePasswordInput(whitespace) should fail with 400 invalidValue")
 		}
 
 		uPatched := &model.ScimUser{UserName: "alice"}
@@ -162,14 +185,26 @@ func TestPassword_RejectsOver72UTF8BytesWith400InvalidValue(t *testing.T) {
 		if uLongS.Password != nil {
 			t.Fatalf("expected 'pa\\u017fsword' NOT to populate user.Password, got %v", *uLongS.Password)
 		}
+		for _, nonASCIIOp := range []map[string]any{
+			{"op": "replace", "path": "pa\u017fsword", "value": "ShouldFailInvalidPath"},
+			{"op": "replace", "value": map[string]any{"pa\u017fsword": "ShouldFailInvalidPath"}},
+		} {
+			uPatchLongS := &model.ScimUser{UserName: "alice"}
+			err := ApplyPatchOperations(uPatchLongS, []map[string]any{nonASCIIOp})
+			if scimErr, ok := err.(*ScimError); !ok || scimErr.Status != 400 || scimErr.ScimType != "invalidPath" {
+				t.Fatalf("ApplyPatchOperations(%v) = %T %v, want 400 invalidPath", nonASCIIOp, err, err)
+			}
+		}
 
-		// Mixed valid + invalid ASCII case variants MUST fail validation (400 invalidValue)
+		// Mixed valid + invalid ASCII case or core-URN variants MUST fail validation (400 invalidValue)
 		// rather than silently ignoring the invalid sibling key.
 		for _, mixed := range []map[string]any{
 			{"userName": "alice", "password": "ValidPassword!1", "Password": 123},
 			{"userName": "alice", "Password": "ValidPassword!1", "password": 123},
 			{"userName": "alice", "password": "ValidPassword!1", "Password": ""},
 			{"userName": "alice", "password": "ValidPassword!1", "PASSWORD": strings.Repeat("b", 73)},
+			{"userName": "alice", "password": "ValidPassword!1", UserSchemaURN + ":password": ""},
+			{"userName": "alice", "password": "ValidPassword!1", UserSchemaURN: map[string]any{"Password": 123}},
 		} {
 			if err := ValidatePasswordInput(mixed); err == nil {
 				t.Fatalf("ValidatePasswordInput(%v) = nil, want 400 invalidValue", mixed)
@@ -234,19 +269,22 @@ func TestPassword_RejectsOver72UTF8BytesWith400InvalidValue(t *testing.T) {
 				{
 					"op": "replace",
 					"value": map[string]any{
-						"PASSWORD":       "UpperCaseLoser",
-						"Password":       "MixedCaseLoser",
-						"password":       "ExactLowerWinner",
-						"DISPLAYNAME":    "UpperDisplayLoser",
-						"displayName":    "MixedDisplayLoser",
-						"displayname":    "ExactLowerDisplayWinner",
+						"PASSWORD":    "UpperCaseLoser",
+						"Password":    "MixedCaseLoser",
+						"password":    "ExactLowerWinner",
+						"DISPLAYNAME": "UpperDisplayLoser",
+						"displayname": "LowerDisplayLoser",
+						"displayName": "ExactCamelDisplayWinner",
 					},
 				},
-			}); err != nil || uExactPatch.Password == nil {
+			}); err != nil || uExactPatch.Password == nil || uExactPatch.DisplayName == nil {
 				t.Fatalf("iter %d: ApplyPatchOperations exact winner failed: %v", i, err)
 			}
 			if err := bcrypt.CompareHashAndPassword([]byte(*uExactPatch.Password), []byte("ExactLowerWinner")); err != nil {
 				t.Fatalf("iter %d: expected ExactLowerWinner in pathless PATCH: %v", i, err)
+			}
+			if *uExactPatch.DisplayName != "ExactCamelDisplayWinner" {
+				t.Fatalf("iter %d: DisplayName = %q, want ExactCamelDisplayWinner", i, *uExactPatch.DisplayName)
 			}
 
 			uLexPatch := &model.ScimUser{UserName: "alice"}

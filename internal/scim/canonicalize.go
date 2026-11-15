@@ -165,7 +165,8 @@ func isDERCertificateStructure(b []byte) bool {
 // specifies primary=true, and that any present primary attribute is a strict boolean.
 func ValidateSinglePrimary(items []map[string]any) error {
 	primaryCount := 0
-	for _, m := range items {
+	for _, rawItem := range items {
+		m := NormalizeMultiValuedItemMap(rawItem)
 		if pRaw, exists := m["primary"]; exists && pRaw != nil {
 			b, ok := pRaw.(bool)
 			if !ok {

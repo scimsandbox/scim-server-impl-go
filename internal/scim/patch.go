@@ -19,7 +19,8 @@ var readOnlyAttrs = map[string]bool{
 	"groups": true, "manager.displayname": true,
 }
 
-var filteredPathRegex = regexp.MustCompile(`^(\w+)\[(.+)\](?:\.(\w+))?$`)
+var filteredPathRegex = regexp.MustCompile(`^([^\[\].\s]+)\[(.+)\](?:\.([^\[\].\s]+))?$`)
+var eqFilterRegex = regexp.MustCompile(`^\s*([^\s"]+)\s+[eE][qQ]\s+"([^"]*)"\s*$`)
 
 var multiValuedAttrs = map[string]bool{
 	"emails": true, "phonenumbers": true, "addresses": true, "ims": true,
@@ -36,22 +37,62 @@ const (
 	enterpriseSchemaURN = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
 )
 
+// ValidatePatchOperationsPasswords pre-validates any password-bearing add or replace
+// operations in a SCIM PatchOp request (including before asynchronous dispatch via Prefer: respond-async).
+// Missing/nil, non-string, empty/whitespace, or >72-byte UTF-8 passwords return 400 invalidValue.
+func ValidatePatchOperationsPasswords(operations []map[string]any) error {
+	for _, rawOp := range operations {
+		if rawOp == nil {
+			continue
+		}
+		op := NormalizePatchOperation(rawOp)
+		rawOpType, _ := op["op"].(string)
+		opType := asciiLowerString(strings.TrimSpace(rawOpType))
+		if opType != "" && opType != "add" && opType != "replace" {
+			continue
+		}
+		rawPath, _ := op["path"].(string)
+		strippedPath := stripPatchURNPrefix(strings.TrimSpace(rawPath))
+		val, hasVal := op["value"]
+		if strippedPath != "" {
+			if isASCIIPasswordAttr(strippedPath) {
+				if !hasVal || val == nil {
+					return NewInvalidValue("password cannot be empty")
+				}
+				if _, err := parsePasswordValue(val); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if valMap, ok := val.(map[string]any); ok {
+			if err := validatePatchValueMapPasswords(valMap); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func ApplyPatchOperations(user *model.ScimUser, operations []map[string]any) error {
 	if len(operations) == 0 {
 		return NewScimError(400, "invalidValue", "PATCH operations required")
 	}
-	for _, op := range operations {
+	for _, rawOpMap := range operations {
+		op := NormalizePatchOperation(rawOpMap)
 		rawOp, _ := op["op"].(string)
+		rawOp = strings.TrimSpace(rawOp)
 		if rawOp == "" {
 			return NewScimError(400, "invalidValue", "PATCH op is required")
 		}
-		opType := strings.ToLower(rawOp)
+		opType := asciiLowerString(rawOp)
 		path, _ := op["path"].(string)
+		path = strings.TrimSpace(path)
 		value := op["value"]
 
 		path = stripPatchURNPrefix(path)
 
-		if path != "" && readOnlyAttrs[strings.ToLower(path)] {
+		if path != "" && readOnlyAttrs[asciiLowerString(path)] {
 			return NewScimError(400, "mutability", "Attribute '"+path+"' is read-only")
 		}
 
@@ -82,16 +123,10 @@ func stripPatchURNPrefix(path string) string {
 	if path == "" {
 		return path
 	}
-	lower := strings.ToLower(path)
-	coreUser := strings.ToLower("urn:ietf:params:scim:schemas:core:2.0:User:")
-	if strings.HasPrefix(lower, coreUser) {
-		return path[len(coreUser):]
+	if stripped, ok := StripCoreUserURNPrefix(path); ok {
+		return stripped
 	}
-	entUser := strings.ToLower(enterpriseSchemaURN + ":")
-	if strings.HasPrefix(lower, entUser) {
-		return path[len(entUser):]
-	}
-	if strings.EqualFold(path, enterpriseSchemaURN) {
+	if asciiEqualFold(path, enterpriseSchemaURN) {
 		return enterpriseSchemaURN
 	}
 	return path
@@ -105,11 +140,11 @@ func applyAdd(user *model.ScimUser, path string, value any) error {
 	if m != nil {
 		return applyFilteredAdd(user, m[1], m[2], m[3], value)
 	}
-	lower := strings.ToLower(path)
+	lower := asciiLowerString(path)
 	if lower == "name" {
 		return setNameAttribute(user, value)
 	}
-	if strings.EqualFold(path, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(path) {
+	if asciiEqualFold(path, enterpriseSchemaURN) || asciiHasPrefixFold(path, enterpriseSchemaURN+":") || isEnterpriseAttr(path) {
 		return setEnterpriseAttribute(user, path, value)
 	}
 	if strings.Contains(path, ".") {
@@ -129,11 +164,11 @@ func applyReplace(user *model.ScimUser, path string, value any) error {
 	if m != nil {
 		return applyFilteredReplace(user, m[1], m[2], m[3], value)
 	}
-	lower := strings.ToLower(path)
+	lower := asciiLowerString(path)
 	if lower == "name" {
 		return setNameAttribute(user, value)
 	}
-	if strings.EqualFold(path, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(path) {
+	if asciiEqualFold(path, enterpriseSchemaURN) || asciiHasPrefixFold(path, enterpriseSchemaURN+":") || isEnterpriseAttr(path) {
 		return setEnterpriseAttribute(user, path, value)
 	}
 	if strings.Contains(path, ".") {
@@ -153,11 +188,11 @@ func applyRemove(user *model.ScimUser, path string, _ any) error {
 	if m != nil {
 		return applyFilteredRemove(user, m[1], m[2])
 	}
-	lower := strings.ToLower(path)
+	lower := asciiLowerString(path)
 	if lower == "name" {
 		return setNameAttribute(user, nil)
 	}
-	if strings.EqualFold(path, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(path) {
+	if asciiEqualFold(path, enterpriseSchemaURN) || asciiHasPrefixFold(path, enterpriseSchemaURN+":") || isEnterpriseAttr(path) {
 		return clearEnterpriseAttribute(user, path)
 	}
 	if strings.Contains(path, ".") {
@@ -167,7 +202,7 @@ func applyRemove(user *model.ScimUser, path string, _ any) error {
 }
 
 func isEnterpriseAttr(path string) bool {
-	lower := strings.ToLower(path)
+	lower := asciiLowerString(path)
 	switch {
 	case lower == "employeenumber", lower == "costcenter", lower == "organization",
 		lower == "division", lower == "department", lower == "manager":
@@ -179,7 +214,7 @@ func isEnterpriseAttr(path string) bool {
 }
 
 func setSingleAttribute(user *model.ScimUser, path string, value any) error {
-	lower := strings.ToLower(path)
+	lower := asciiLowerString(path)
 	if readOnlyAttrs[lower] || strings.HasPrefix(lower, "meta.") {
 		return NewScimError(400, "mutability", "Attribute '"+path+"' is read-only")
 	}
@@ -265,6 +300,9 @@ func setSingleAttribute(user *model.ScimUser, path string, value any) error {
 		}
 		user.Active = b
 	case "password":
+		if value == nil {
+			return NewInvalidValue("password cannot be empty")
+		}
 		rawPw, err := parsePasswordValue(value)
 		if err != nil {
 			return err
@@ -288,8 +326,8 @@ func setSubAttribute(user *model.ScimUser, path string, value any) error {
 	if len(parts) != 2 {
 		return NewScimError(400, "invalidPath", "Invalid sub-attribute path: "+path)
 	}
-	parent := strings.ToLower(parts[0])
-	sub := strings.ToLower(parts[1])
+	parent := asciiLowerString(parts[0])
+	sub := asciiLowerString(parts[1])
 
 	if parent == "meta" {
 		return NewScimError(400, "mutability", "Attribute '"+path+"' is read-only")
@@ -335,12 +373,19 @@ func setNameAttribute(user *model.ScimUser, value any) error {
 	if !ok {
 		return NewScimError(400, "invalidValue", "Attribute 'name' must be an object")
 	}
-	for subAttr, subVal := range m {
+	normM := NormalizeNameMap(m)
+	keys := make([]string, 0, len(normM))
+	for k := range normM {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, subAttr := range keys {
+		subVal := normM[subAttr]
 		s, err := parseStrictStringPtr(subVal, "name."+subAttr)
 		if err != nil {
 			return err
 		}
-		switch strings.ToLower(subAttr) {
+		switch asciiLowerString(subAttr) {
 		case "formatted":
 			user.NameFormatted = s
 		case "familyname":
@@ -362,15 +407,13 @@ func setNameAttribute(user *model.ScimUser, value any) error {
 
 func setEnterpriseAttribute(user *model.ScimUser, path string, value any) error {
 	attr := path
-	lowerPath := strings.ToLower(path)
-	lowerEnt := strings.ToLower(enterpriseSchemaURN)
-	if strings.HasPrefix(lowerPath, lowerEnt+":") {
+	if asciiHasPrefixFold(path, enterpriseSchemaURN+":") {
 		attr = path[len(enterpriseSchemaURN)+1:]
-	} else if lowerPath == lowerEnt {
+	} else if asciiEqualFold(path, enterpriseSchemaURN) {
 		return applyEnterpriseValueMap(user, value)
 	}
 
-	switch strings.ToLower(attr) {
+	switch asciiLowerString(attr) {
 	case "employeenumber":
 		s, err := parseStrictStringPtr(value, "employeeNumber")
 		if err != nil {
@@ -443,6 +486,7 @@ func setEnterpriseManager(user *model.ScimUser, value any) error {
 		user.EnterpriseManagerValue = &normStr
 		user.EnterpriseManagerDisplay = nil
 	case map[string]any:
+		v = NormalizeManagerMap(v)
 		var parsedVal *string
 		valProvided := false
 		if val, ok := v["value"]; ok {
@@ -495,8 +539,14 @@ func applyEnterpriseValueMap(user *model.ScimUser, value any) error {
 	if !ok {
 		return NewScimError(400, "invalidValue", "Enterprise extension value must be an object")
 	}
-	for k, v := range m {
-		if err := setEnterpriseAttribute(user, k, v); err != nil {
+	normM := NormalizeEnterpriseMap(m)
+	keys := make([]string, 0, len(normM))
+	for k := range normM {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		if err := setEnterpriseAttribute(user, k, normM[k]); err != nil {
 			return err
 		}
 	}
@@ -505,11 +555,9 @@ func applyEnterpriseValueMap(user *model.ScimUser, value any) error {
 
 func clearEnterpriseAttribute(user *model.ScimUser, path string) error {
 	attr := path
-	lowerPath := strings.ToLower(path)
-	lowerEnt := strings.ToLower(enterpriseSchemaURN)
-	if strings.HasPrefix(lowerPath, lowerEnt+":") {
+	if asciiHasPrefixFold(path, enterpriseSchemaURN+":") {
 		attr = path[len(enterpriseSchemaURN)+1:]
-	} else if lowerPath == lowerEnt {
+	} else if asciiEqualFold(path, enterpriseSchemaURN) {
 		user.EnterpriseEmployeeNumber = nil
 		user.EnterpriseCostCenter = nil
 		user.EnterpriseOrganization = nil
@@ -523,82 +571,182 @@ func clearEnterpriseAttribute(user *model.ScimUser, path string) error {
 	return setEnterpriseAttribute(user, attr, nil)
 }
 
+func applySingleValueMapEntry(user *model.ScimUser, rawKey, key, lower string, v any, isReplace bool) error {
+	if readOnlyAttrs[lower] || strings.HasPrefix(lower, "meta.") {
+		return NewScimError(400, "mutability", "Attribute '"+rawKey+"' is read-only")
+	}
+	if lower == "name" {
+		return setNameAttribute(user, v)
+	}
+	if asciiEqualFold(key, enterpriseSchemaURN) || asciiHasPrefixFold(key, enterpriseSchemaURN+":") || isEnterpriseAttr(key) {
+		return setEnterpriseAttribute(user, key, v)
+	}
+	if strings.Contains(key, ".") {
+		return setSubAttribute(user, key, v)
+	}
+	if multiValuedAttrs[lower] {
+		if isReplace {
+			return replaceMultiValued(user, lower, v)
+		}
+		return addToMultiValued(user, lower, v)
+	}
+	return setSingleAttribute(user, key, v)
+}
+
 func applyValueMap(user *model.ScimUser, value any, isReplace bool) error {
 	m, ok := value.(map[string]any)
 	if !ok {
 		return NewScimError(400, "invalidValue", "PATCH add/replace without path requires a value object")
 	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	if err := validatePatchValueMapPasswords(m); err != nil {
+		return err
 	}
-	slices.SortFunc(keys, func(a, b string) int {
-		sa := stripPatchURNPrefix(a)
-		sb := stripPatchURNPrefix(b)
-		la := strings.ToLower(sa)
-		lb := strings.ToLower(sb)
-		if cmp := strings.Compare(la, lb); cmp != 0 {
+
+	outerKeys := make([]string, 0, len(m))
+	for k := range m {
+		outerKeys = append(outerKeys, k)
+	}
+	slices.Sort(outerKeys)
+
+	canonicalForAttr := func(lower string) (string, bool) {
+		if c, ok := userTopLevelCanonical[lower]; ok {
+			return c, true
+		}
+		if c, ok := enterpriseSubAttrCanonical[lower]; ok {
+			return c, true
+		}
+		return "", false
+	}
+
+	candidates := make([]normCandidate, 0, len(m))
+	for _, outerKey := range outerKeys {
+		val := m[outerKey]
+		if asciiEqualFold(outerKey, "schemas") {
+			continue
+		}
+		if asciiEqualFold(outerKey, UserSchemaURN) {
+			if val == nil {
+				continue
+			}
+			subMap, ok := val.(map[string]any)
+			if !ok {
+				return NewScimError(400, "invalidValue", "Core user schema value must be an object")
+			}
+			innerKeys := make([]string, 0, len(subMap))
+			for ik := range subMap {
+				innerKeys = append(innerKeys, ik)
+			}
+			slices.Sort(innerKeys)
+			for _, innerKey := range innerKeys {
+				lowerInner := asciiLowerString(innerKey)
+				targetKey := innerKey
+				subTier := 0
+				if canon, known := canonicalForAttr(lowerInner); known {
+					targetKey = canon
+					if innerKey == canon {
+						subTier = 1
+					}
+				} else if innerKey == lowerInner {
+					subTier = 1
+				}
+				candidates = append(candidates, normCandidate{
+					groupKey:  lowerInner,
+					targetKey: targetKey,
+					tier:      0,
+					subTier:   subTier,
+					outerKey:  outerKey,
+					innerKey:  innerKey,
+					val:       subMap[innerKey],
+				})
+			}
+			continue
+		}
+		if suffix, ok := StripCoreUserURNPrefix(outerKey); ok {
+			lowerSuffix := asciiLowerString(suffix)
+			targetKey := suffix
+			if canon, known := canonicalForAttr(lowerSuffix); known {
+				targetKey = canon
+			}
+			candidates = append(candidates, normCandidate{
+				groupKey:  lowerSuffix,
+				targetKey: targetKey,
+				tier:      1,
+				outerKey:  outerKey,
+				val:       val,
+			})
+			continue
+		}
+		if asciiHasPrefixFold(outerKey, enterpriseSchemaURN+":") {
+			suffix := outerKey[len(enterpriseSchemaURN)+1:]
+			lowerSuffix := asciiLowerString(suffix)
+			candidates = append(candidates, normCandidate{
+				groupKey:  lowerSuffix,
+				targetKey: outerKey,
+				tier:      1,
+				outerKey:  outerKey,
+				val:       val,
+			})
+			continue
+		}
+
+		lowerKey := asciiLowerString(outerKey)
+		targetKey := outerKey
+		tier := 2
+		if canon, known := canonicalForAttr(lowerKey); known {
+			targetKey = canon
+			if outerKey == canon {
+				tier = 3
+			}
+		} else if outerKey == lowerKey {
+			tier = 3
+		}
+		candidates = append(candidates, normCandidate{
+			groupKey:  lowerKey,
+			targetKey: targetKey,
+			tier:      tier,
+			outerKey:  outerKey,
+			val:       val,
+		})
+	}
+
+	// Sort by groupKey ascending, and within the same groupKey put lower-precedence
+	// candidates first so every candidate is validated while the winning candidate runs last.
+	slices.SortFunc(candidates, func(a, b normCandidate) int {
+		if cmp := strings.Compare(a.groupKey, b.groupKey); cmp != 0 {
 			return cmp
 		}
-		// Within duplicate case-variants of the same attribute, order lower-precedence
-		// variants first (validating every variant) so the winning key executes last:
-		// exact canonical lowercase wins (unprefixed "password" > URN-prefixed ":password"),
-		// otherwise the lexically smallest key wins.
-		rank := func(raw, stripped, lower string) int {
-			if raw == lower {
-				return 2
-			}
-			if stripped == lower {
-				return 1
-			}
-			return 0
+		if candBetter(a, b) {
+			return 1
 		}
-		ra, rb := rank(a, sa, la), rank(b, sb, lb)
-		if ra != rb {
-			return ra - rb
+		if candBetter(b, a) {
+			return -1
 		}
-		return strings.Compare(b, a)
+		return 0
 	})
 
-	for i, k := range keys {
-		v := m[k]
-		key := stripPatchURNPrefix(k)
-		lower := strings.ToLower(key)
-		if readOnlyAttrs[lower] || strings.HasPrefix(lower, "meta.") {
-			return NewScimError(400, "mutability", "Attribute '"+k+"' is read-only")
+	for i, cand := range candidates {
+		isLoser := i+1 < len(candidates) && candidates[i+1].groupKey == cand.groupKey
+		rawDisplayKey := cand.outerKey
+		if cand.innerKey != "" {
+			rawDisplayKey = cand.innerKey
 		}
-		if lower == "password" && i+1 < len(keys) && strings.EqualFold(stripPatchURNPrefix(keys[i+1]), "password") {
-			if _, err := parsePasswordValue(v); err != nil {
+		lower := asciiLowerString(cand.targetKey)
+		if asciiHasPrefixFold(cand.targetKey, enterpriseSchemaURN+":") {
+			lower = asciiLowerString(cand.targetKey[len(enterpriseSchemaURN)+1:])
+		}
+		if isLoser {
+			if lower == passwordAttrName {
+				// Already validated via validatePatchValueMapPasswords(m).
+				continue
+			}
+			tmpUser := CloneScimUser(user)
+			if err := applySingleValueMapEntry(tmpUser, rawDisplayKey, cand.targetKey, lower, cand.val, isReplace); err != nil {
 				return err
 			}
 			continue
 		}
-		if lower == "name" {
-			if err := setNameAttribute(user, v); err != nil {
-				return err
-			}
-		} else if strings.EqualFold(key, enterpriseSchemaURN) || strings.HasPrefix(lower, strings.ToLower(enterpriseSchemaURN)+":") || isEnterpriseAttr(key) {
-			if err := setEnterpriseAttribute(user, key, v); err != nil {
-				return err
-			}
-		} else if strings.Contains(key, ".") {
-			if err := setSubAttribute(user, key, v); err != nil {
-				return err
-			}
-		} else if multiValuedAttrs[lower] {
-			if isReplace {
-				if err := replaceMultiValued(user, lower, v); err != nil {
-					return err
-				}
-			} else {
-				if err := addToMultiValued(user, lower, v); err != nil {
-					return err
-				}
-			}
-		} else {
-			if err := setSingleAttribute(user, key, v); err != nil {
-				return err
-			}
+		if err := applySingleValueMapEntry(user, rawDisplayKey, cand.targetKey, lower, cand.val, isReplace); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -912,7 +1060,7 @@ func DeduplicateAddresses(addrs []model.ScimUserAddress) []model.ScimUserAddress
 }
 
 func clearAttribute(user *model.ScimUser, attr string) error {
-	switch strings.ToLower(attr) {
+	switch ASCIILower(attr) {
 	case "username":
 		return NewScimError(400, "mutability", "Required attribute 'userName' cannot be removed")
 	case "id", "meta", "groups":
@@ -965,8 +1113,35 @@ func clearAttribute(user *model.ScimUser, attr string) error {
 
 // Filtered operations
 
+func validateCollectionFilter(rawCollection, lowerCollection, filterExpr string) error {
+	if !multiValuedAttrs[lowerCollection] {
+		return NewScimError(400, "invalidPath", "Unknown collection: "+rawCollection)
+	}
+	fc := parseEqFilter(filterExpr)
+	if fc == nil {
+		return NewScimError(400, "invalidFilter", "Cannot parse filter: "+filterExpr)
+	}
+	if lowerCollection == "addresses" {
+		switch fc.attr {
+		case "type", "formatted", "streetaddress", "locality", "region", "postalcode", "country", "primary":
+			return nil
+		default:
+			return NewScimError(400, "invalidPath", "Unknown addresses filter attribute: "+fc.attr)
+		}
+	}
+	switch fc.attr {
+	case "value", "type", "display", "primary":
+		return nil
+	default:
+		return NewScimError(400, "invalidPath", "Unknown "+rawCollection+" filter attribute: "+fc.attr)
+	}
+}
+
 func applyFilteredAdd(user *model.ScimUser, collection, filterExpr, subAttr string, value any) error {
-	lower := strings.ToLower(collection)
+	lower := ASCIILower(collection)
+	if err := validateCollectionFilter(collection, lower, filterExpr); err != nil {
+		return err
+	}
 	if subAttr == "" {
 		return addToMultiValued(user, lower, value)
 	}
@@ -974,12 +1149,18 @@ func applyFilteredAdd(user *model.ScimUser, collection, filterExpr, subAttr stri
 }
 
 func applyFilteredReplace(user *model.ScimUser, collection, filterExpr, subAttr string, value any) error {
-	lower := strings.ToLower(collection)
+	lower := ASCIILower(collection)
+	if err := validateCollectionFilter(collection, lower, filterExpr); err != nil {
+		return err
+	}
 	return applyFilteredUpdate(user, lower, filterExpr, subAttr, value)
 }
 
 func applyFilteredRemove(user *model.ScimUser, collection, filterExpr string) error {
-	lower := strings.ToLower(collection)
+	lower := ASCIILower(collection)
+	if err := validateCollectionFilter(collection, lower, filterExpr); err != nil {
+		return err
+	}
 	switch lower {
 	case "emails":
 		user.Emails = removeMatching(user.Emails, filterExpr, matchesEmailFilter)
@@ -1004,14 +1185,14 @@ func applyFilteredRemove(user *model.ScimUser, collection, filterExpr string) er
 }
 
 func setsPrimaryTrue(subAttr string, value any) bool {
-	if strings.EqualFold(subAttr, "primary") {
+	if ASCIIEqualFold(subAttr, "primary") {
 		b, ok := value.(bool)
 		return ok && b
 	}
 	if subAttr == "" {
 		if m, ok := value.(map[string]any); ok {
 			for k, v := range m {
-				if strings.EqualFold(k, "primary") {
+				if ASCIIEqualFold(k, "primary") {
 					if b, ok := v.(bool); ok && b {
 						return true
 					}
@@ -1201,12 +1382,11 @@ type filterClause struct {
 }
 
 func parseEqFilter(expr string) *filterClause {
-	re := regexp.MustCompile(`(?i)(\w+)\s+eq\s+"([^"]*)"`)
-	m := re.FindStringSubmatch(expr)
+	m := eqFilterRegex.FindStringSubmatch(expr)
 	if m == nil {
 		return nil
 	}
-	return &filterClause{attr: strings.ToLower(m[1]), value: NormalizeNFC(m[2])}
+	return &filterClause{attr: ASCIILower(m[1]), value: NormalizeNFC(m[2])}
 }
 
 func matchesGenericFilter(filterExpr string, value, typ, display string, primary bool) bool {
@@ -1306,7 +1486,7 @@ func setEmailSubAttribute(e *model.ScimUserEmail, subAttr string, value any) err
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "value":
 		s, err := parseStrictString(value, "emails.value")
 		if err != nil {
@@ -1354,7 +1534,7 @@ func setPhoneSubAttribute(p *model.ScimUserPhoneNumber, subAttr string, value an
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "value":
 		s, err := parseStrictString(value, "phoneNumbers.value")
 		if err != nil {
@@ -1398,7 +1578,7 @@ func setAddressSubAttribute(a *model.ScimUserAddress, subAttr string, value any)
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "formatted":
 		s, err := parseStrictString(value, "addresses.formatted")
 		if err != nil {
@@ -1466,7 +1646,7 @@ func setImSubAttribute(im *model.ScimUserIm, subAttr string, value any) error {
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "value":
 		s, err := parseStrictString(value, "ims.value")
 		if err != nil {
@@ -1510,7 +1690,7 @@ func setPhotoSubAttribute(p *model.ScimUserPhoto, subAttr string, value any) err
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "value":
 		s, err := parseStrictString(value, "photos.value")
 		if err != nil {
@@ -1559,7 +1739,7 @@ func setEntitlementSubAttribute(e *model.ScimUserEntitlement, subAttr string, va
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "value":
 		s, err := parseStrictString(value, "entitlements.value")
 		if err != nil {
@@ -1603,7 +1783,7 @@ func setRoleSubAttribute(r *model.ScimUserRole, subAttr string, value any) error
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "value":
 		s, err := parseStrictString(value, "roles.value")
 		if err != nil {
@@ -1647,7 +1827,7 @@ func setCertSubAttribute(c *model.ScimUserX509Certificate, subAttr string, value
 		}
 		return nil
 	}
-	switch strings.ToLower(subAttr) {
+	switch ASCIILower(subAttr) {
 	case "value":
 		rawPtr, err := parseRawStringPtr(value, "x509Certificates.value")
 		if err != nil {
@@ -1959,13 +2139,17 @@ func toItemList(value any) ([]map[string]any, error) {
 			if !ok {
 				return nil, NewScimError(400, "invalidValue", "Expected object elements in multi-valued attribute array")
 			}
-			result = append(result, m)
+			result = append(result, NormalizeMultiValuedItemMap(m))
 		}
 		return result, nil
 	case []map[string]any:
-		return v, nil
+		result := make([]map[string]any, len(v))
+		for i, m := range v {
+			result[i] = NormalizeMultiValuedItemMap(m)
+		}
+		return result, nil
 	case map[string]any:
-		return []map[string]any{v}, nil
+		return []map[string]any{NormalizeMultiValuedItemMap(v)}, nil
 	default:
 		return nil, NewScimError(400, "invalidValue", "Expected array or object for multi-valued attribute")
 	}

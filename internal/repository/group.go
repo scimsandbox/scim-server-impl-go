@@ -456,6 +456,61 @@ func (r *MembershipRepository) DeleteByGroupIDAndMemberValuesTx(ctx context.Cont
 	return err
 }
 
+const groupCycleRecursiveSQL = `
+WITH RECURSIVE reachable(member_value) AS (
+	SELECT m.member_value
+	FROM scim_group_memberships m
+	WHERE m.workspace_id = $1
+	  AND m.group_id = $2
+	  AND (
+		  LOWER(COALESCE(m.member_type, '')) = 'group'
+		  OR (
+			  COALESCE(TRIM(m.member_type), '') = ''
+			  AND EXISTS (
+				  SELECT 1 FROM scim_groups g
+				  WHERE g.id = m.member_value AND g.workspace_id = $1
+			  )
+		  )
+	  )
+	UNION
+	SELECT m.member_value
+	FROM scim_group_memberships m
+	JOIN reachable r ON m.group_id = r.member_value
+	WHERE m.workspace_id = $1
+	  AND (
+		  LOWER(COALESCE(m.member_type, '')) = 'group'
+		  OR (
+			  COALESCE(TRIM(m.member_type), '') = ''
+			  AND EXISTS (
+				  SELECT 1 FROM scim_groups g
+				  WHERE g.id = m.member_value AND g.workspace_id = $1
+			  )
+		  )
+	  )
+)
+SELECT EXISTS (SELECT 1 FROM reachable WHERE member_value = $3)`
+
+func (r *MembershipRepository) CreatesGroupCycle(ctx context.Context, wsID, groupID, candidateMemberGroupID uuid.UUID) (bool, error) {
+	if groupID != uuid.Nil && groupID == candidateMemberGroupID {
+		return true, nil
+	}
+	var createsCycle bool
+	err := jdbc.QueryRowContext(ctx, groupCycleRecursiveSQL, wsID, candidateMemberGroupID, groupID).Scan(&createsCycle)
+	return createsCycle, err
+}
+
+func (r *MembershipRepository) CreatesGroupCycleTx(ctx context.Context, tx jdbc.Executor, wsID, groupID, candidateMemberGroupID uuid.UUID) (bool, error) {
+	if groupID != uuid.Nil && groupID == candidateMemberGroupID {
+		return true, nil
+	}
+	if tx == nil {
+		return r.CreatesGroupCycle(ctx, wsID, groupID, candidateMemberGroupID)
+	}
+	var createsCycle bool
+	err := tx.QueryRowContext(ctx, groupCycleRecursiveSQL, wsID, candidateMemberGroupID, groupID).Scan(&createsCycle)
+	return createsCycle, err
+}
+
 func (r *MembershipRepository) UpdateMemberTypeTx(ctx context.Context, tx jdbc.Executor, membershipID, wsID uuid.UUID, memberType string) error {
 	if tx == nil {
 		return r.UpdateMemberType(ctx, membershipID, wsID, memberType)

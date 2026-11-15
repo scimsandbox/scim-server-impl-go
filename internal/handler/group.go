@@ -1035,9 +1035,8 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 		return &scim.ScimError{Status: 400, ScimType: "invalidValue",
 			Detail: "Invalid member value (must be UUID): " + memberValue}
 	}
-	if memberUUID == groupID {
-		return &scim.ScimError{Status: 400, ScimType: "invalidValue",
-			Detail: "Group cannot include itself as a member"}
+	if err := validateNotSelfGroupMember(groupID, memberUUID); err != nil {
+		return err
 	}
 
 	explicitType := ""
@@ -1112,12 +1111,6 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 		}
 	}
 
-	if memberType == "Group" {
-		if err := h.validateGroupMemberNoCycleTx(ctx, tx, wsID, groupID, memberUUID); err != nil {
-			return err
-		}
-	}
-
 	membership := model.ScimGroupMembership{
 		ID:          uuid.New(),
 		GroupID:     groupID,
@@ -1130,18 +1123,9 @@ func (h *GroupHandler) addMemberTx(ctx context.Context, tx jdbc.Executor, groupI
 	return h.membershipRepo.CreateBatchTx(ctx, tx, []model.ScimGroupMembership{membership})
 }
 
-func (h *GroupHandler) validateGroupMemberNoCycleTx(ctx context.Context, tx jdbc.Executor, wsID, groupID, memberUUID uuid.UUID) error {
+func validateNotSelfGroupMember(groupID, memberUUID uuid.UUID) error {
 	if groupID != uuid.Nil && memberUUID == groupID {
 		return scim.NewInvalidValue("Group cannot include itself as a member")
-	}
-	if h.membershipRepo != nil && groupID != uuid.Nil {
-		createsCycle, err := h.membershipRepo.CreatesGroupCycleTx(ctx, tx, wsID, groupID, memberUUID)
-		if err != nil {
-			return err
-		}
-		if createsCycle {
-			return scim.NewInvalidValue("Circular group membership is not allowed")
-		}
 	}
 	return nil
 }
@@ -1678,7 +1662,7 @@ func (h *GroupHandler) applyMemberSubAttrAdd(
 	}
 
 	if canonicalType == "Group" {
-		if err := h.validateGroupMemberNoCycleTx(ctx, tx, wsID, group.ID, targetUUID); err != nil {
+		if err := validateNotSelfGroupMember(group.ID, targetUUID); err != nil {
 			return err
 		}
 	}

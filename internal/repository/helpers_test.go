@@ -1,13 +1,8 @@
 package repository
 
 import (
-	"context"
-	"errors"
-	"strings"
 	"testing"
 
-	"github.com/google/uuid"
-	"github.com/scimsandbox/scim-server-impl-go/internal/jdbc"
 	"github.com/scimsandbox/scim-server-impl-go/internal/model"
 )
 
@@ -346,93 +341,5 @@ func TestReplaceCollectionEmails_Deduplication_USR22(t *testing.T) {
 			t.Fatalf("expected 2 emails with distinct types, got %d", len(res))
 		}
 	})
-}
-
-type stubBoolRow struct {
-	val bool
-	err error
-}
-
-func (r stubBoolRow) Scan(dest ...any) error {
-	if r.err != nil {
-		return r.err
-	}
-	if len(dest) > 0 {
-		if ptr, ok := dest[0].(*bool); ok {
-			*ptr = r.val
-		}
-	}
-	return nil
-}
-
-type stubCycleExecutor struct {
-	lastQuery string
-	lastArgs  []any
-	row       stubBoolRow
-}
-
-func (e *stubCycleExecutor) ExecContext(_ context.Context, _ string, _ ...any) (jdbc.Result, error) {
-	return nil, nil
-}
-
-func (e *stubCycleExecutor) QueryContext(_ context.Context, _ string, _ ...any) (jdbc.Rows, error) {
-	return nil, nil
-}
-
-func (e *stubCycleExecutor) QueryRowContext(_ context.Context, query string, args ...any) jdbc.Row {
-	e.lastQuery = query
-	e.lastArgs = args
-	return e.row
-}
-
-func TestMembershipRepository_CreatesGroupCycleTx(t *testing.T) {
-	t.Parallel()
-
-	repo := NewMembershipRepository()
-	wsID := uuid.New()
-	groupA := uuid.New()
-	groupB := uuid.New()
-
-	// 1. Self-membership short-circuits without hitting the executor.
-	txNever := &stubCycleExecutor{row: stubBoolRow{err: errors.New("should not query DB on self-membership")}}
-	cycle, err := repo.CreatesGroupCycleTx(context.Background(), txNever, wsID, groupA, groupA)
-	if err != nil || !cycle {
-		t.Fatalf("CreatesGroupCycleTx(self) = (%v, %v), want (true, nil)", cycle, err)
-	}
-	if txNever.lastQuery != "" {
-		t.Fatal("expected self-membership to return true before querying DB")
-	}
-
-	cycleNoTx, err := repo.CreatesGroupCycle(context.Background(), wsID, groupA, groupA)
-	if err != nil || !cycleNoTx {
-		t.Fatalf("CreatesGroupCycle(self) = (%v, %v), want (true, nil)", cycleNoTx, err)
-	}
-
-	// 2. Transitive cycle detected via recursive CTE.
-	txTrue := &stubCycleExecutor{row: stubBoolRow{val: true}}
-	cycle, err = repo.CreatesGroupCycleTx(context.Background(), txTrue, wsID, groupA, groupB)
-	if err != nil || !cycle {
-		t.Fatalf("CreatesGroupCycleTx(cycle) = (%v, %v), want (true, nil)", cycle, err)
-	}
-	if !strings.Contains(txTrue.lastQuery, "WITH RECURSIVE reachable") || !strings.Contains(txTrue.lastQuery, "UNION") {
-		t.Fatalf("expected deduplicated WITH RECURSIVE UNION query, got: %s", txTrue.lastQuery)
-	}
-	if len(txTrue.lastArgs) != 3 || txTrue.lastArgs[0] != wsID || txTrue.lastArgs[1] != groupB || txTrue.lastArgs[2] != groupA {
-		t.Fatalf("unexpected query args: %+v", txTrue.lastArgs)
-	}
-
-	// 3. Acyclic DAG returns false.
-	txFalse := &stubCycleExecutor{row: stubBoolRow{val: false}}
-	cycle, err = repo.CreatesGroupCycleTx(context.Background(), txFalse, wsID, groupA, groupB)
-	if err != nil || cycle {
-		t.Fatalf("CreatesGroupCycleTx(acyclic) = (%v, %v), want (false, nil)", cycle, err)
-	}
-
-	// 4. DB error propagates cleanly.
-	wantErr := errors.New("db failure")
-	txErr := &stubCycleExecutor{row: stubBoolRow{err: wantErr}}
-	if _, err := repo.CreatesGroupCycleTx(context.Background(), txErr, wsID, groupA, groupB); !errors.Is(err, wantErr) {
-		t.Fatalf("CreatesGroupCycleTx(err) = %v, want %v", err, wantErr)
-	}
 }
 

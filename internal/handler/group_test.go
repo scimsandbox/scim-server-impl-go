@@ -562,48 +562,8 @@ func (g *inMemoryGroupGraphExecutor) QueryContext(_ context.Context, _ string, _
 	return nil, nil
 }
 
-func (g *inMemoryGroupGraphExecutor) isReachable(wsID, startGroupID, targetGroupID uuid.UUID) bool {
-	visited := make(map[uuid.UUID]bool)
-	queue := []uuid.UUID{startGroupID}
-	for len(queue) > 0 {
-		curr := queue[0]
-		queue = queue[1:]
-		for _, m := range g.edges[curr] {
-			if m.WorkspaceID != wsID {
-				continue
-			}
-			mType := ""
-			if m.MemberType != nil {
-				mType = strings.TrimSpace(*m.MemberType)
-			}
-			isGroupEdge := strings.EqualFold(mType, "group") || (mType == "" && g.groups[m.MemberValue] != nil && g.groups[m.MemberValue].WorkspaceID == wsID)
-			if !isGroupEdge {
-				continue
-			}
-			if m.MemberValue == targetGroupID {
-				return true
-			}
-			if !visited[m.MemberValue] {
-				visited[m.MemberValue] = true
-				queue = append(queue, m.MemberValue)
-			}
-		}
-	}
-	return false
-}
-
 func (g *inMemoryGroupGraphExecutor) QueryRowContext(_ context.Context, query string, args ...any) jdbc.Row {
-	switch {
-	case strings.Contains(query, "WITH RECURSIVE reachable"):
-		wsID := args[0].(uuid.UUID)
-		candID := args[1].(uuid.UUID)
-		groupID := args[2].(uuid.UUID)
-		reachable := g.isReachable(wsID, candID, groupID)
-		return graphExecutorRow{scanFn: func(dest ...any) error {
-			*(dest[0].(*bool)) = reachable
-			return nil
-		}}
-	case strings.Contains(query, "FROM scim_groups WHERE id = $1 AND workspace_id = $2"):
+	if strings.Contains(query, "FROM scim_groups WHERE id = $1 AND workspace_id = $2") {
 		id := args[0].(uuid.UUID)
 		wsID := args[1].(uuid.UUID)
 		grp := g.groups[id]
@@ -620,13 +580,12 @@ func (g *inMemoryGroupGraphExecutor) QueryRowContext(_ context.Context, query st
 			*(dest[6].(*int64)) = grp.Version
 			return nil
 		}}
-	default:
-		// scim_users lookup returns ErrNoRows when member is a Group.
-		return graphExecutorRow{scanFn: func(_ ...any) error { return jdbc.ErrNoRows }}
 	}
+	// scim_users lookup returns ErrNoRows when member is a Group.
+	return graphExecutorRow{scanFn: func(_ ...any) error { return jdbc.ErrNoRows }}
 }
 
-func TestGroupHandler_TransitiveCycleDetectionAndDiamondDAG(t *testing.T) {
+func TestGroupHandler_IndirectGroupCyclesAllowedAndSelfMembershipRejected(t *testing.T) {
 	t.Parallel()
 
 	wsID := uuid.New()
@@ -664,38 +623,27 @@ func TestGroupHandler_TransitiveCycleDetectionAndDiamondDAG(t *testing.T) {
 	}
 
 	// 1. Direct self-membership (A -> A) rejected with 400 invalidValue.
-	if err := gh.addMemberTx(context.Background(), exec, groupA.ID, wsID, map[string]any{"value": groupA.ID.String(), "type": "Group"}); err == nil {
-		t.Fatal("expected self-membership A -> A to fail")
+	errSelf := gh.addMemberTx(context.Background(), exec, groupA.ID, wsID, map[string]any{"value": groupA.ID.String(), "type": "Group"})
+	scimSelf, ok := errSelf.(*scim.ScimError)
+	if !ok || scimSelf.Status != http.StatusBadRequest || scimSelf.ScimType != "invalidValue" {
+		t.Fatalf("self-membership A -> A got %T %v, want 400 invalidValue", errSelf, errSelf)
 	}
 
-	// 2. Build chain A -> B -> C (with B -> C added without explicit "type" to verify untyped group inference & cycle detection).
+	// 2. Mutual / indirect cycles (A -> B and B -> A, plus A -> B -> C -> A) are allowed per RFC 7644 §3.7.1.
 	if err := gh.addMemberTx(context.Background(), exec, groupA.ID, wsID, map[string]any{"value": groupB.ID.String(), "type": "Group"}); err != nil {
 		t.Fatalf("addMemberTx(A -> B) error = %v", err)
+	}
+	if err := gh.addMemberTx(context.Background(), exec, groupB.ID, wsID, map[string]any{"value": groupA.ID.String(), "type": "Group"}); err != nil {
+		t.Fatalf("mutual group membership B -> A should be allowed, got error = %v", err)
 	}
 	if err := gh.addMemberTx(context.Background(), exec, groupB.ID, wsID, map[string]any{"value": groupC.ID.String()}); err != nil {
 		t.Fatalf("addMemberTx(B -> C untyped) error = %v", err)
 	}
-
-	// 3. 2-hop cycle (B -> A) rejected with 400 invalidValue.
-	errBA := gh.addMemberTx(context.Background(), exec, groupB.ID, wsID, map[string]any{"value": groupA.ID.String(), "type": "Group"})
-	scimBA, ok := errBA.(*scim.ScimError)
-	if !ok || scimBA.Status != http.StatusBadRequest || scimBA.ScimType != "invalidValue" {
-		t.Fatalf("2-hop cycle B -> A got %T %v, want 400 invalidValue", errBA, errBA)
+	if err := gh.addMemberTx(context.Background(), exec, groupC.ID, wsID, map[string]any{"value": groupA.ID.String(), "type": "Group"}); err != nil {
+		t.Fatalf("3-hop group cycle C -> A should be allowed, got error = %v", err)
 	}
 
-	// 4. 3-hop cycle (C -> A, both typed and untyped) rejected with 400 invalidValue.
-	for _, m := range []map[string]any{
-		{"value": groupA.ID.String(), "type": "Group"},
-		{"value": groupA.ID.String()},
-	} {
-		errCA := gh.addMemberTx(context.Background(), exec, groupC.ID, wsID, m)
-		scimCA, ok := errCA.(*scim.ScimError)
-		if !ok || scimCA.Status != http.StatusBadRequest || scimCA.ScimType != "invalidValue" {
-			t.Fatalf("3-hop cycle C -> A (%v) got %T %v, want 400 invalidValue", m, errCA, errCA)
-		}
-	}
-
-	// 5. Diamond DAG (A -> B, A -> C, B -> D, C -> D) MUST be allowed!
+	// 3. Diamond DAG (A -> C, B -> D, C -> D) is allowed.
 	if err := gh.addMemberTx(context.Background(), exec, groupA.ID, wsID, map[string]any{"value": groupC.ID.String(), "type": "Group"}); err != nil {
 		t.Fatalf("diamond DAG A -> C error = %v", err)
 	}
@@ -706,35 +654,75 @@ func TestGroupHandler_TransitiveCycleDetectionAndDiamondDAG(t *testing.T) {
 		t.Fatalf("diamond DAG C -> D error = %v", err)
 	}
 
-	// Adding D -> A at the bottom of the diamond DAG creates a 3-hop cycle and MUST be rejected!
-	errDA := gh.addMemberTx(context.Background(), exec, groupD.ID, wsID, map[string]any{"value": groupA.ID.String(), "type": "Group"})
-	if scimDA, ok := errDA.(*scim.ScimError); !ok || scimDA.Status != http.StatusBadRequest || scimDA.ScimType != "invalidValue" {
-		t.Fatalf("diamond cycle D -> A got %T %v, want 400 invalidValue", errDA, errDA)
+	// 4. applyMemberSubAttrAdd:
+	// 4a. Missing member still returns 400 noTarget.
+	errMissing := gh.applyMemberSubAttrAdd(
+		context.Background(),
+		exec,
+		groupD,
+		wsID,
+		`members[value eq "`+uuid.New().String()+`"].type`,
+		"Group",
+	)
+	scimMissing, ok := errMissing.(*scim.ScimError)
+	if !ok || scimMissing.Status != http.StatusBadRequest || scimMissing.ScimType != "noTarget" {
+		t.Fatalf("applyMemberSubAttrAdd(missing) = %T %v, want 400 noTarget", errMissing, errMissing)
 	}
 
-	// 6. applyMemberSubAttrAdd retyping a legacy untyped member (D -> A) to "Group" rejects the indirect cycle without mutating groupD.Members!
+	// 4b. Retyping a legacy untyped indirect-cycle member (D -> A) to "Group" is allowed.
+	legacyEdgeID := uuid.New()
+	exec.edges[groupD.ID] = append(exec.edges[groupD.ID], model.ScimGroupMembership{
+		ID:          legacyEdgeID,
+		GroupID:     groupD.ID,
+		WorkspaceID: wsID,
+		MemberValue: groupA.ID,
+		MemberType:  nil,
+	})
 	groupDWithLegacyMember := &model.ScimGroup{
 		ID:          groupD.ID,
 		WorkspaceID: wsID,
 		DisplayName: "Group D",
 		Members: []model.ScimGroupMembership{
-			{ID: uuid.New(), GroupID: groupD.ID, WorkspaceID: wsID, MemberValue: groupA.ID, MemberType: nil},
+			{ID: legacyEdgeID, GroupID: groupD.ID, WorkspaceID: wsID, MemberValue: groupA.ID, MemberType: nil},
 		},
 	}
-	errSubAttrCycle := gh.applyMemberSubAttrAdd(
+	if err := gh.applyMemberSubAttrAdd(
 		context.Background(),
 		exec,
 		groupDWithLegacyMember,
 		wsID,
 		`members[value eq "`+groupA.ID.String()+`"].type`,
 		"Group",
-	)
-	scimSubAttr, ok := errSubAttrCycle.(*scim.ScimError)
-	if !ok || scimSubAttr.Status != http.StatusBadRequest || scimSubAttr.ScimType != "invalidValue" {
-		t.Fatalf("applyMemberSubAttrAdd indirect cycle = %T %v, want 400 invalidValue", errSubAttrCycle, errSubAttrCycle)
+	); err != nil {
+		t.Fatalf("applyMemberSubAttrAdd indirect cycle D -> A error = %v, want nil", err)
 	}
-	if groupDWithLegacyMember.Members[0].MemberType != nil {
-		t.Fatalf("expected groupD.Members[0].MemberType to remain nil on cycle error, got %v", *groupDWithLegacyMember.Members[0].MemberType)
+	if groupDWithLegacyMember.Members[0].MemberType == nil || *groupDWithLegacyMember.Members[0].MemberType != "Group" {
+		t.Fatalf("expected groupD.Members[0].MemberType = Group, got %v", groupDWithLegacyMember.Members[0].MemberType)
+	}
+
+	// 4c. Post-match applyMemberSubAttrAdd self-membership (D -> D) still returns 400 invalidValue without mutating MemberType.
+	groupDWithSelfMember := &model.ScimGroup{
+		ID:          groupD.ID,
+		WorkspaceID: wsID,
+		DisplayName: "Group D",
+		Members: []model.ScimGroupMembership{
+			{ID: uuid.New(), GroupID: groupD.ID, WorkspaceID: wsID, MemberValue: groupD.ID, MemberType: nil},
+		},
+	}
+	errSubAttrSelf := gh.applyMemberSubAttrAdd(
+		context.Background(),
+		exec,
+		groupDWithSelfMember,
+		wsID,
+		`members[value eq "`+groupD.ID.String()+`"].type`,
+		"Group",
+	)
+	scimSubAttrSelf, ok := errSubAttrSelf.(*scim.ScimError)
+	if !ok || scimSubAttrSelf.Status != http.StatusBadRequest || scimSubAttrSelf.ScimType != "invalidValue" {
+		t.Fatalf("applyMemberSubAttrAdd self-membership = %T %v, want 400 invalidValue", errSubAttrSelf, errSubAttrSelf)
+	}
+	if groupDWithSelfMember.Members[0].MemberType != nil {
+		t.Fatalf("expected groupDWithSelfMember.Members[0].MemberType to remain nil on error, got %v", *groupDWithSelfMember.Members[0].MemberType)
 	}
 }
 

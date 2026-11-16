@@ -11,6 +11,6 @@ permissions:
 
 jobs:
   security-pr:
-    uses: scimsandbox/.github/.github/workflows/reusable-security-pr.yml@c675580705cc902e5762261850f8e1b27ef641a8 # v1.0.0
+    uses: scimsandbox/.github/.github/workflows/reusable-security-pr.yml@645f5fafbdfccdaf904de1b5f3dc832b2c12cfd9 # v1.1.0
     with:
       dependency-review: true

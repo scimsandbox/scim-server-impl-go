@@ -1312,11 +1312,13 @@ func (c *ctxCapturingAsyncEventRepo) UpdateStatusAndPayload(
 	payload *string,
 	completedAt time.Time,
 ) error {
+	ctxErr := ctx.Err()
+	err := c.mockAsyncEventRepo.UpdateStatusAndPayload(ctx, txnID, status, resourceID, payload, completedAt)
 	select {
-	case c.updateCtxErr <- ctx.Err():
+	case c.updateCtxErr <- ctxErr:
 	default:
 	}
-	return c.mockAsyncEventRepo.UpdateStatusAndPayload(ctx, txnID, status, resourceID, payload, completedAt)
+	return err
 }
 
 func TestRunAsyncWorker_PanicRecovery_FreshStatusContext_And_PendingGuard(t *testing.T) {

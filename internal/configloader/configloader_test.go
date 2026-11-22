@@ -220,6 +220,70 @@ feature: false
 	}
 }
 
+func TestLoadWithDefaultsPreservesOmittedAndAllowsExplicitZero(t *testing.T) {
+	t.Parallel()
+
+	var defaults testConfig
+	defaults.Service.HTTP.ReadTimeout = 15 * time.Second
+	defaults.Service.Port = 8080
+
+	dir := t.TempDir()
+	omittedFile := writeTestFile(t, dir, "omitted.yaml", `
+service:
+  name: demo-service
+`)
+	cfgOmitted, err := LoadWithDefaults(defaults, LoadOptions{Files: []string{omittedFile}})
+	if err != nil {
+		t.Fatalf("LoadWithDefaults(omitted) error = %v", err)
+	}
+	if cfgOmitted.Service.HTTP.ReadTimeout != 15*time.Second {
+		t.Fatalf("ReadTimeout = %v, want 15s default", cfgOmitted.Service.HTTP.ReadTimeout)
+	}
+
+	zeroYAMLFile := writeTestFile(t, dir, "zero.yaml", `
+service:
+  name: demo-service
+  http:
+    read_timeout: 0s
+`)
+	cfgZeroYAML, err := LoadWithDefaults(defaults, LoadOptions{Files: []string{zeroYAMLFile}})
+	if err != nil {
+		t.Fatalf("LoadWithDefaults(zero YAML) error = %v", err)
+	}
+	if cfgZeroYAML.Service.HTTP.ReadTimeout != 0 {
+		t.Fatalf("ReadTimeout = %v, want explicit 0 from YAML", cfgZeroYAML.Service.HTTP.ReadTimeout)
+	}
+
+	cfgZeroEnv, err := LoadWithDefaults(defaults, LoadOptions{
+		Files:     []string{omittedFile},
+		EnvPrefix: "APP_",
+		LookupEnv: lookupFromMap(map[string]string{"APP_SERVICE_HTTP_READ_TIMEOUT": "0s"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadWithDefaults(zero env) error = %v", err)
+	}
+	if cfgZeroEnv.Service.HTTP.ReadTimeout != 0 {
+		t.Fatalf("ReadTimeout = %v, want explicit 0 from env", cfgZeroEnv.Service.HTTP.ReadTimeout)
+	}
+
+	if _, err := Load[string](LoadOptions{Files: []string{omittedFile}}); err == nil {
+		t.Fatal("expected error when config type is not a struct")
+	}
+	if _, err := Load[testConfig](LoadOptions{}); err == nil {
+		t.Fatal("expected error when Files is empty")
+	}
+	if _, err := Load[testConfig](LoadOptions{Files: []string{filepath.Join(dir, "missing.yaml")}}); err == nil {
+		t.Fatal("expected error when config file does not exist")
+	}
+	if _, err := Load[testConfig](LoadOptions{
+		Files:     []string{omittedFile},
+		EnvPrefix: "APP_",
+		LookupEnv: lookupFromMap(map[string]string{"APP_SERVICE_PORT": "not-an-int"}),
+	}); err == nil {
+		t.Fatal("expected error when env override fails to parse")
+	}
+}
+
 func writeTestFile(t *testing.T, dir, name, contents string) string {
 	t.Helper()
 

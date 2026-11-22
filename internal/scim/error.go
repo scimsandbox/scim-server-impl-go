@@ -21,6 +21,14 @@ func NewScimError(status int, scimType, detail string) *ScimError {
 	return &ScimError{Status: status, ScimType: scimType, Detail: detail}
 }
 
+func NewInvalidValue(detail string) *ScimError {
+	return &ScimError{Status: http.StatusBadRequest, ScimType: "invalidValue", Detail: detail}
+}
+
+func NewNoTarget(detail string) *ScimError {
+	return &ScimError{Status: http.StatusBadRequest, ScimType: "noTarget", Detail: detail}
+}
+
 // WriteScimError writes a SCIM error response.
 func WriteScimError(w http.ResponseWriter, err *ScimError) {
 	body := map[string]any{

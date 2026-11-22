@@ -51,6 +51,16 @@ func TestCreateAndGetUser(t *testing.T) {
 	if !strings.Contains(respBody, "testuser@example.com") {
 		t.Fatal("get response missing userName")
 	}
+
+	// POST /Users/.search with empty body returns 200 ListResponse (consistent with /Groups/.search and /.search)
+	searchResp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Users/.search"), token, "")
+	searchBody := readBody(t, searchResp)
+	if searchResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for empty POST /Users/.search, got %d: %s", searchResp.StatusCode, searchBody)
+	}
+	if !strings.Contains(searchBody, "testuser@example.com") {
+		t.Fatalf("empty POST /Users/.search response missing created user: %s", searchBody)
+	}
 }
 
 func TestListUsers(t *testing.T) {
@@ -487,5 +497,70 @@ func TestUserNameRequiredOnPatch(t *testing.T) {
 	}
 	if fetched["userName"] != "patch-bulk@example.com" {
 		t.Fatalf("bulk patch corrupted userName: got %q", fetched["userName"])
+	}
+}
+
+func TestV5PasswordConstraintsEmptyAndBcryptPrefix(t *testing.T) {
+	env := setupTestEnv(t)
+
+	wsID := uuid.New()
+	token := generateToken()
+	seedWorkspaceAndToken(t, env.ctx, wsID, token)
+
+	// 1. Empty password "" in POST returns 400 invalidValue (not 500 check_violation)
+	resp := doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Users"), token, `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+		"userName": "emptypw@example.com",
+		"password": ""
+	}`)
+	respBody := readBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(respBody, `"invalidValue"`) {
+		t.Fatalf("expected 400 invalidValue for empty password on POST, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	// 2. "$2a$hello" in POST hashes cleanly and satisfies V5 chk_scim_users_password_bcrypt
+	resp = doRequest(t, http.MethodPost, scimURL(env.server.URL, wsID, "/Users"), token, `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+		"userName": "bcryptprefix@example.com",
+		"password": "$2a$hello"
+	}`)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for $2a$hello password, got %d: %s", resp.StatusCode, respBody)
+	}
+	var created map[string]any
+	if err := json.Unmarshal([]byte(respBody), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	userID := created["id"].(string)
+
+	// 3. Empty password "" in PUT and PATCH returns 400 invalidValue
+	resp = doRequest(t, http.MethodPut, scimURL(env.server.URL, wsID, "/Users/"+userID), token, `{
+		"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+		"userName": "bcryptprefix@example.com",
+		"password": ""
+	}`)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(respBody, `"invalidValue"`) {
+		t.Fatalf("expected 400 invalidValue for empty password on PUT, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	resp = doRequest(t, http.MethodPatch, scimURL(env.server.URL, wsID, "/Users/"+userID), token, `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+		"Operations": [{"op": "replace", "path": "password", "value": ""}]
+	}`)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(respBody, `"invalidValue"`) {
+		t.Fatalf("expected 400 invalidValue for empty password on PATCH, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	// 4. PATCH remove password sets NULL cleanly (200 OK)
+	resp = doRequest(t, http.MethodPatch, scimURL(env.server.URL, wsID, "/Users/"+userID), token, `{
+		"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+		"Operations": [{"op": "remove", "path": "password"}]
+	}`)
+	respBody = readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for PATCH remove password, got %d: %s", resp.StatusCode, respBody)
 	}
 }

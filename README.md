@@ -1,7 +1,7 @@
 # SCIM Sandbox - Server Impl Go
 
 > [!WARNING]
-> **Data Privacy / PII**: This application is built as a sandbox. It stores SCIM request and response payloads in the database without redaction for debugging purposes. Treat it as a local or development sandbox service, not a hardened production deployment.
+> **Data Privacy / PII**: This application is built as a sandbox. While `password`, `Authorization`, and inline `Bearer` credential values are surgically redacted before persistence, all other SCIM request and response payload fields (including user PII) are stored verbatim in the database for debugging purposes. Treat it as a local or development sandbox service, not a hardened production deployment.
 
 This repository contains the standalone Go SCIM 2.0 service implementation
 for the SCIM Sandbox project. It provides the server-side SCIM API,
@@ -83,14 +83,14 @@ Prerequisites:
 - PostgreSQL if you want to point the app at a local database
 - Docker if you want to build the image or run container-backed tests
 
-The repository ships with local-development defaults in `config/app-conf.yaml`:
+The repository ships with local-development connection defaults in `config/app-conf.yaml`
+(and an empty `storage.password: ""` so no default database password is baked into release images):
 
 - `jdbc:postgresql://localhost:5432/scimplayground`
 - username `scim_playground`
-- password `scim_playground`
+- password `""` (must be supplied via `GO_DATASOURCE_PASSWORD` or an untracked local `config/app-secrets.yaml`)
 
-If your local database differs, override the defaults before starting the
-service:
+Before starting the service locally (outside Docker Compose), export the database password and cursor secret (plus any connection overrides if your local database differs):
 
 ```bash
 export GO_DATASOURCE_URL=jdbc:postgresql://localhost:5432/scimplayground
@@ -99,7 +99,7 @@ export GO_DATASOURCE_PASSWORD=scim_playground
 export GO_CURSOR_SECRET=local-dev-cursor-secret-change-me
 ```
 
-> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long. `GO_DATASOURCE_USERNAME` and `GO_DATASOURCE_PASSWORD` accept literal plaintext values and are URL-encoded automatically when injected into the DSN.
+> `GO_CURSOR_SECRET` (or `server.cursor_secret`) is required when running `serve` and must be at least 32 characters long. Supplying the database password via `GO_DATASOURCE_PASSWORD` (or an untracked `config/app-secrets.yaml`) is also required when PostgreSQL password authentication is enabled. `GO_DATASOURCE_USERNAME` and `GO_DATASOURCE_PASSWORD` accept literal plaintext values and are URL-encoded automatically when injected into the DSN.
 
 Start the service from the repository root:
 
@@ -193,6 +193,16 @@ Useful environment overrides:
 - `GO_SERVER_BASE_URL`
 - `GO_CURSOR_SECRET`
 - `GO_MANAGEMENT_PORT`
+- `GO_RATE_LIMIT_ENABLED`
+- `GO_RATE_LIMIT_REQUESTS_PER_SECOND`
+- `GO_RATE_LIMIT_BURST`
+- `GO_RATE_LIMIT_PER_IP_REQUESTS_PER_SECOND`
+- `GO_RATE_LIMIT_PER_IP_BURST`
+- `GO_RATE_LIMIT_PER_WORKSPACE_REQUESTS_PER_SECOND`
+- `GO_RATE_LIMIT_PER_WORKSPACE_BURST`
+- `GO_RATE_LIMIT_TRUSTED_PROXIES`
+- `GO_RATE_LIMIT_TRUSTED_CLOUDFLARE_PROXIES`
+- `GO_RATE_LIMIT_WAIT_TIMEOUT`
 - `GO_DATASOURCE_URL`
 - `GO_DATASOURCE_USERNAME`
 - `GO_DATASOURCE_PASSWORD`
@@ -228,6 +238,33 @@ ordered by `created_at DESC, id DESC`) and prunes excess records hourly (`1h`) i
 safe batches of `5000` rows. An initial cleanup cycle runs on startup. Disabling
 `GO_CLEANUP_ENABLED` acts as a master switch to disable all cleanup tasks, or request log
 pruning can be individually toggled via `GO_CLEANUP_REQUEST_LOGS_ENABLED`.
+
+### Rate Limiting
+
+When `rate_limit.enabled` (`GO_RATE_LIMIT_ENABLED`) is `true`, API traffic is
+enforced across three tiers, returning RFC 7644 `429 Too Many Requests`
+(`scimType: "tooMany"`, `Retry-After: 1`) when exceeded:
+
+1. **Pre-auth per-client-IP & shared-IdP tenant isolation** (`per_ip_requests_per_second`, `per_ip_burst`):
+   evaluated before authentication so abusive single-source floods cannot reach
+   database token lookups or consume global capacity. Client IPv6 addresses are
+   masked to `/64` prefixes so rotating interface identifiers within a `/64`
+   cannot bypass per-client limits. Requests with both a valid workspace UUID in
+   `/ws/{workspaceId}/...` and a well-formed `Authorization: Bearer <token>`
+   header are isolated per `(clientIP, urlWorkspaceId)` so shared IdP egress IPs
+   do not throttle unrelated tenants, while `401`/`403` auth failures charge the
+   per-IP unauthenticated bucket to block fake-token random-UUID sprays.
+   Proxy forwarding headers fail closed by default: when `trusted_proxies` and
+   `trusted_cloudflare_proxies` are unset, forwarding headers are ignored and
+   `RemoteAddr` is always used. Configure `trusted_proxies`
+   (`GO_RATE_LIMIT_TRUSTED_PROXIES`) to trust `X-Forwarded-For` (selecting the
+   rightmost untrusted hop) and `trusted_cloudflare_proxies`
+   (`GO_RATE_LIMIT_TRUSTED_CLOUDFLARE_PROXIES`) to trust `CF-Connecting-IP`.
+2. **Pre-auth server-wide global cap** (`requests_per_second`, `burst`): bounds
+   aggregate admitted request concurrency across all clients and workspaces.
+3. **Post-auth per-workspace** (`per_workspace_requests_per_second`,
+   `per_workspace_burst`): evaluated only after `BearerTokenAuth` verifies the
+   workspace token so unauthenticated callers cannot exhaust a tenant's bucket.
 
 ### Token Expiration
 

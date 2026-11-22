@@ -13,6 +13,13 @@ type FilterResult struct {
 	Args []any
 }
 
+// Limits enforced on incoming SCIM filter expressions to prevent CPU/stack exhaustion.
+const (
+	MaxFilterLength = 4096
+	MaxFilterTokens = 200
+	MaxFilterDepth  = 20
+)
+
 const (
 	entityTypeUser  = "user"
 	entityTypeGroup = "group"
@@ -147,14 +154,21 @@ func parseEntityFilter(filter string, startParam int, entityType string, crossRe
 	if filter == "" {
 		return nil, nil
 	}
+	if len(filter) > MaxFilterLength {
+		return nil, NewScimError(400, "invalidFilter", fmt.Sprintf("Invalid filter: filter length exceeds maximum of %d bytes", MaxFilterLength))
+	}
+	tokens, err := tokenize(filter)
+	if err != nil {
+		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
+	}
 	p := &filterParser{
-		tokens:        tokenize(filter),
+		tokens:        tokens,
 		pos:           0,
 		paramIdx:      startParam,
 		entityType:    entityType,
 		crossResource: crossResource,
 	}
-	result, err := p.parseOrExpression()
+	result, err := p.parseOrExpression(0)
 	if err != nil {
 		return nil, NewScimError(400, "invalidFilter", "Invalid filter: "+err.Error())
 	}
@@ -266,9 +280,12 @@ type token struct {
 
 var tokenRegex = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|[()]|[^\s()]+`)
 
-func tokenize(filter string) []token {
+func tokenize(filter string) ([]token, error) {
 	filter = NormalizeNFC(filter)
-	matches := tokenRegex.FindAllString(filter, -1)
+	matches := tokenRegex.FindAllString(filter, MaxFilterTokens+1)
+	if len(matches) > MaxFilterTokens {
+		return nil, fmt.Errorf("filter exceeds maximum token count (%d)", MaxFilterTokens)
+	}
 	tokens := make([]token, 0, len(matches))
 	for _, m := range matches {
 		if m == "(" {
@@ -281,7 +298,7 @@ func tokenize(filter string) []token {
 			tokens = append(tokens, token{typ: tokenWord, val: m})
 		}
 	}
-	return tokens
+	return tokens, nil
 }
 
 // ── Case-insensitive attribute set ──────────────────
@@ -401,8 +418,11 @@ func (p *filterParser) nextParam() string {
 	return s
 }
 
-func (p *filterParser) parseOrExpression() (*FilterResult, error) {
-	left, err := p.parseAndExpression()
+func (p *filterParser) parseOrExpression(depth int) (*FilterResult, error) {
+	if depth > MaxFilterDepth {
+		return nil, fmt.Errorf("filter exceeds maximum nesting depth (%d)", MaxFilterDepth)
+	}
+	left, err := p.parseAndExpression(depth)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +433,7 @@ func (p *filterParser) parseOrExpression() (*FilterResult, error) {
 			break
 		}
 		p.next() // consume "or"
-		right, err := p.parseAndExpression()
+		right, err := p.parseAndExpression(depth)
 		if err != nil {
 			return nil, err
 		}
@@ -425,8 +445,8 @@ func (p *filterParser) parseOrExpression() (*FilterResult, error) {
 	return left, nil
 }
 
-func (p *filterParser) parseAndExpression() (*FilterResult, error) {
-	left, err := p.parseNotExpression()
+func (p *filterParser) parseAndExpression(depth int) (*FilterResult, error) {
+	left, err := p.parseNotExpression(depth)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +457,7 @@ func (p *filterParser) parseAndExpression() (*FilterResult, error) {
 			break
 		}
 		p.next() // consume "and"
-		right, err := p.parseNotExpression()
+		right, err := p.parseNotExpression(depth)
 		if err != nil {
 			return nil, err
 		}
@@ -449,16 +469,19 @@ func (p *filterParser) parseAndExpression() (*FilterResult, error) {
 	return left, nil
 }
 
-func (p *filterParser) parseNotExpression() (*FilterResult, error) {
+func (p *filterParser) parseNotExpression(depth int) (*FilterResult, error) {
 	t := p.peek()
 	if t != nil && t.typ == tokenWord && strings.EqualFold(t.val, filterOpNot) {
+		if depth+1 > MaxFilterDepth {
+			return nil, fmt.Errorf("filter exceeds maximum nesting depth (%d)", MaxFilterDepth)
+		}
 		p.next() // consume "not"
 
 		// Expect opening paren after NOT
 		lp := p.peek()
 		if lp != nil && lp.typ == tokenLParen {
 			p.next() // consume "("
-			inner, err := p.parseOrExpression()
+			inner, err := p.parseOrExpression(depth + 1)
 			if err != nil {
 				return nil, err
 			}
@@ -472,7 +495,7 @@ func (p *filterParser) parseNotExpression() (*FilterResult, error) {
 			}, nil
 		}
 
-		inner, err := p.parseAtom()
+		inner, err := p.parseAtom(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -481,10 +504,10 @@ func (p *filterParser) parseNotExpression() (*FilterResult, error) {
 			Args: inner.Args,
 		}, nil
 	}
-	return p.parseAtom()
+	return p.parseAtom(depth)
 }
 
-func (p *filterParser) parseAtom() (*FilterResult, error) {
+func (p *filterParser) parseAtom(depth int) (*FilterResult, error) {
 	t := p.peek()
 	if t == nil {
 		return nil, fmt.Errorf("unexpected end of filter")
@@ -493,7 +516,7 @@ func (p *filterParser) parseAtom() (*FilterResult, error) {
 	// Grouped expression
 	if t.typ == tokenLParen {
 		p.next() // consume "("
-		inner, err := p.parseOrExpression()
+		inner, err := p.parseOrExpression(depth + 1)
 		if err != nil {
 			return nil, err
 		}

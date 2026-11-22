@@ -9,12 +9,23 @@ management:
   port: 9090
 rate_limit:
   enabled: true
+  # Server-wide global cap across all clients and workspaces
   requests_per_second: 1000
-  wait_timeout: 60s
+  burst: 100
+  # Pre-auth per-client-IP limit (protects DB auth lookups from unauthenticated floods)
+  per_ip_requests_per_second: 250
+  per_ip_burst: 50
+  # Post-auth per-workspace limit (isolates authenticated tenants)
+  per_workspace_requests_per_second: 250
+  per_workspace_burst: 50
+  # Proxy header trust fails closed by default (forwarding headers are ignored when unset).
+  # trusted_proxies: "" # Comma-separated IPs/CIDRs trusted to supply X-Forwarded-For
+  # trusted_cloudflare_proxies: "" # Comma-separated Cloudflare edge/tunnel IPs/CIDRs trusted to supply CF-Connecting-IP
+  wait_timeout: 0s
 storage:
   dsn: "jdbc:postgresql://localhost:5432/scimplayground"
   username: "scim_playground"
-  password: "scim_playground"
+  password: "" # Configure via GO_DATASOURCE_PASSWORD or an untracked local config/app-secrets.yaml
   max_conns: 50
   min_conns: 50
 cleanup:

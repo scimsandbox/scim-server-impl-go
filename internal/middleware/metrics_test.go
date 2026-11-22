@@ -132,3 +132,18 @@ func containsMetricLine(scrape string, metricName string, substrings ...string) 
 
 	return false
 }
+
+func TestScimMetrics_InfersThrottledOutcomeFrom429WithRetryAfter(t *testing.T) {
+	rw429 := httptest.NewRecorder()
+	rw429.Header().Set("Retry-After", "1")
+	rc429 := &statusCapture{ResponseWriter: rw429, statusCode: http.StatusTooManyRequests}
+	if got := resolveThrottledOutcome("", rc429); got != ThrottledYes {
+		t.Fatalf("resolveThrottledOutcome(429 + Retry-After) = %q, want %q", got, ThrottledYes)
+	}
+
+	rwNoHeader := httptest.NewRecorder()
+	rcNoHeader := &statusCapture{ResponseWriter: rwNoHeader, statusCode: http.StatusTooManyRequests}
+	if got := resolveThrottledOutcome("", rcNoHeader); got != ThrottledNo {
+		t.Fatalf("resolveThrottledOutcome(429 without Retry-After) = %q, want %q", got, ThrottledNo)
+	}
+}
